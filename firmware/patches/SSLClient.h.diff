@@ -1,0 +1,96 @@
+--- /workspace/SSLClient.h.orig	2026-10-11 17:30:11.073120730 -0400
++++ .pio/libdeps/tsim7672g/ESP_SSLClient/src/client/SSLClient.h	2026-10-11 17:30:11.093120730 -0400
+@@ -74,6 +74,12 @@
+ class BSSL_SSLClient : public Client
+ {
+ public:
++    // tsim patch: diagnostics
++    int tsimLastSSLError() const { return _eng ? br_ssl_engine_last_error(_eng) : -1; }
++    int tsimEngineState() const { return _eng ? (int)br_ssl_engine_current_state(_eng) : -1; }
++    int tsimStopLine() const { return _tsim_stop_line; }
++    int tsimWriteError() { return getWriteError(); }
++    int _tsim_stop_line = 0;
+     explicit BSSL_SSLClient(Client *client = nullptr)
+     {
+         setClient(client);
+@@ -907,7 +913,7 @@
+ 
+     BSSL_SSLClient &operator=(const BSSL_SSLClient &other)
+     {
+-        stop();
++        { _tsim_stop_line = __LINE__; stop(); }
+         setClient(other._basic_client);
+         _use_insecure = other._use_insecure;
+         _timeout_ms = other._timeout_ms;
+@@ -1762,7 +1768,7 @@
+                 }
+                 else
+                 {
+-                    stop();
++                    { _tsim_stop_line = __LINE__; stop(); }
+                     if (_connect_with_ip)
+                         ret = connectSSL(_ip, _port);
+                     else
+@@ -1808,7 +1814,7 @@
+                 esp_ssl_debug_print(PSTR("SSL internals timed out!"), _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                 setWriteError(esp_ssl_write_error);
+-                stop();
++                { _tsim_stop_line = __LINE__; stop(); }
+                 return -1;
+             }
+             // debug
+@@ -1869,7 +1875,7 @@
+                     esp_ssl_debug_print(PSTR("SSL engine state is RECVAPP, however the buffer was null! (This is a problem with BearSSL internals)."), _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                     setWriteError(esp_ssl_write_error);
+-                    stop();
++                    { _tsim_stop_line = __LINE__; stop(); }
+                     return -1;
+                 }
+             }
+@@ -1933,7 +1939,7 @@
+                         setWriteError(esp_ssl_write_error);
+                     }
+                     // else presumably the socket just closed itself, so just stop the engine
+-                    stop();
++                    { _tsim_stop_line = __LINE__; stop(); }
+                     return 0;
+                 }
+                 if (wlen > 0)
+@@ -1957,7 +1963,7 @@
+                     esp_ssl_debug_print(PSTR("Error _write_idx > 0 but the ssl engine is not ready for data."), _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                     setWriteError(esp_ssl_write_error);
+-                    stop();
++                    { _tsim_stop_line = __LINE__; stop(); }
+                     return 0;
+                 }
+                 // else time to send the application data
+@@ -1972,7 +1978,7 @@
+                         esp_ssl_debug_print(PSTR("Engine set write flag but returned null buffer."), _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                         setWriteError(esp_ssl_write_error);
+-                        stop();
++                        { _tsim_stop_line = __LINE__; stop(); }
+                         return 0;
+                     }
+                     // sanity check
+@@ -1982,7 +1988,7 @@
+                         esp_ssl_debug_print(PSTR("Alen is less than _write_idx."), _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                         setWriteError(esp_ssl_internal_error);
+-                        stop();
++                        { _tsim_stop_line = __LINE__; stop(); }
+                         return 0;
+                     }
+                     // all good? lets send the data
+@@ -2022,7 +2028,7 @@
+                         esp_ssl_debug_print(s_buffer, _debug_level, esp_ssl_debug_error, __func__);
+ #endif
+                         setWriteError(esp_ssl_write_error);
+-                        stop();
++                        { _tsim_stop_line = __LINE__; stop(); }
+                         return 0;
+                     }
+                     if (rlen > 0)
