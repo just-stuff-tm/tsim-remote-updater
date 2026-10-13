@@ -1,0 +1,16 @@
+name = "tsim-remote-updater"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+# OPTIONAL hourly cron (delete this [triggers] block to disable entirely): it only texts STATUS to devices whose optional scheduled check
+# (off by default, set per device on the dashboard) is due. With every schedule off it sends nothing.
+[triggers]
+crons = ["0 * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Secrets (never in this file):
+#   npx wrangler secret put HOLOGRAM_API_KEY
+#   npx wrangler secret put ADMIN_TOKEN       # e.g. openssl rand -hex 32
+#   npx wrangler secret put SESSION_SECRET    # e.g. openssl rand -hex 32
