@@ -1,0 +1,21 @@
+{
+  "name": "esp-serial-flasher",
+  "version": "1.8.0",
+  "description": "Vendored Espressif esp-serial-flasher v1.8.0 with Arduino port",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src",
+    "flags": [
+      "-Iinclude",
+      "-Iprivate_include",
+      "-I.",
+      "-DSERIAL_FLASHER_INTERFACE_UART=1",
+      "-DMD5_ENABLED=1",
+      "-DSERIAL_FLASHER_RESET_HOLD_TIME_MS=100",
+      "-DSERIAL_FLASHER_BOOT_HOLD_TIME_MS=50",
+      "-DSERIAL_FLASHER_WRITE_BLOCK_RETRIES=3",
+      "-DSERIAL_FLASHER_RESET_INVERT=0",
+      "-DSERIAL_FLASHER_BOOT_INVERT=0"
+    ]
+  }
+}
