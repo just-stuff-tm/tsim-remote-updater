@@ -1,0 +1,9 @@
+firmware/include/config.h
+config.h
+.local-secrets.txt
+.run_token
+.ingest_token
+.pio
+node_modules
+.wrangler
+.dev.vars

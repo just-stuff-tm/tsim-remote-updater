@@ -1,0 +1,185 @@
+# T-SIM Remote Updater
+
+A **solar-powered MeshCore repeater you can manage from anywhere**. A Heltec WiFi LoRa 32 V3 runs the repeater; a LilyGO T-SIM7670G / T-SIM7672G (ESP32-S3 + LTE modem) sits next to it in deep sleep and wakes only when it receives a text message. From a password-protected web dashboard (a free Cloudflare Worker) you can:
+
+- request status (T-SIM battery/solar/signal plus a MeshCore mesh snapshot),
+- reboot the Heltec,
+- **reflash the Heltec over LTE** with the latest repeater firmware,
+- optionally run repeater CLI commands,
+- manage **many repeaters** from one fleet dashboard.
+
+Nothing runs on a schedule unless you turn it on. Step-by-step setup: **[docs/SETUP.md](docs/SETUP.md)**. Using an AI agent to build it for someone? See **[docs/FOR-AI-AGENTS.md](docs/FOR-AI-AGENTS.md)**.
+
+## How it works
+
+```mermaid
+flowchart LR
+  U[You / browser] -->|login + button| W[Cloudflare Worker<br/>dashboard + KV]
+  W -->|SMS via Hologram API| H[(Hologram)]
+  H -->|text: STATUS / REBOOT / UPDATE / CMD| T[T-SIM7670G/7672G<br/>deep sleep, wakes on SMS]
+  T -->|HTTPS POST telemetry + CLI output| W
+  T -->|download .bin over LTE| G[GitHub release / your URL]
+  T -->|UART flash + RST/BOOT + CLI| R[Heltec V3<br/>MeshCore repeater]
+  R <-->|LoRa| M((Mesh))
+```
+
+1. You press a button; the Worker texts a short command to the SIM via the Hologram API.
+2. The incoming SMS wakes the T-SIM (modem RI pin). It does the job, posts results to the Worker over HTTPS, then goes back to deep sleep.
+3. The Heltec stays a normal standalone repeater; the T-SIM only touches it when asked.
+
+## Parts list
+
+| Part | Notes | Link |
+|---|---|---|
+| LilyGO T-SIM7670G-S3 (or T-SIM7672G V1.1, same pinout) | ESP32-S3 + LTE Cat-1, 18650 holder, solar input | [Amazon](https://link.amazon/B0declSh7) |
+| Heltec WiFi LoRa 32 V3 (915 MHz for US) | Runs the MeshCore repeater firmware | [Amazon](https://link.amazon/B0czhvm4K) |
+| Hologram SIM | Any plan; incoming SMS to the SIM is free | hologram.io |
+| 18650 Li-ion cell, small 5–6 V solar panel, LTE + LoRa antennas, weatherproof box | | |
+| 100 µF + 10 µF capacitors, 6 jumper wires | | |
+
+*As an Amazon Associate I earn from qualifying purchases.*
+
+## Wiring
+
+
+![Wiring](docs/wiring_7672.svg)
+
+| Wire   | T-SIM pin | Heltec V3 pin |
+|--------|-----------|---------------|
+| Power  | 3V3       | 3V3           |
+| Ground | GND       | GND           |
+| Serial | GPIO42    | GPIO44 (RX)   |
+| Serial | GPIO41    | GPIO43 (TX)   |
+| Reset  | GPIO1     | RST / EN      |
+| Boot   | GPIO2     | GPIO0 / PRG   |
+
+On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9. Put 100 µF + 10 µF across the Heltec 3V3/GND. Don't power both boards from USB at the same time while 3V3 is linked.
+
+
+## Costs and notes
+
+- **Incoming SMS is free** on Hologram. The Worker sends each text through the Hologram API; for outgoing SMS costs see [Hologram's current pricing](https://www.hologram.io/pricing). **The T-SIM never sends SMS**, it reports over data only.
+- Each wake uses a few KB of data (a firmware update ~1–2 MB). Cloudflare Workers + KV free tier is plenty.
+- The T-SIM battery reads **0 V while USB is plugged in** (board design); unplug USB to see real values.
+- **Works with other MeshCore repeater firmware**, not just EasySkyMesh: the CLI reads use standard MeshCore commands, unknown ones are skipped, and the update source (GitHub repo + filename pattern, or a direct URL) is editable per repeater.
+- The scheduled check / hourly cron is **optional**: with every schedule off it sends nothing. You can delete the `[triggers]` block from `wrangler.toml` to remove it entirely.
+
+## Reference: deploy the Worker
+
+Requires a Cloudflare account and Node.js.
+
+```bash
+cd worker
+npm install
+npx wrangler kv namespace create STATE        # paste the id into wrangler.toml
+npx wrangler secret put HOLOGRAM_API_KEY      # Hologram dashboard > Account > API
+npx wrangler secret put ADMIN_TOKEN           # openssl rand -hex 32
+npx wrangler secret put SESSION_SECRET        # openssl rand -hex 32
+# optional: npx wrangler secret put GITHUB_TOKEN  (avoids GitHub API rate limits)
+npm test                                      # local harness, mocks everything
+npx wrangler deploy
+```
+
+## Reference: add a device
+
+Find the SIM's numeric **device id** in the Hologram dashboard, then:
+
+```bash
+curl -X POST https://<your-worker>/admin/devices \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"id":"tsim-1","name":"My repeater","hologram_device_id":"1234567"}'
+```
+
+The response contains a generated **password** (for the dashboard) and an **ingest_key** (for the T-SIM firmware). They're shown once.
+
+Other admin routes (all need `Authorization: Bearer <ADMIN_TOKEN>`):
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/admin/devices` | list devices (no secrets) |
+| DELETE | `/admin/devices/<id>` | remove device and its data |
+| POST | `/admin/devices/<id>/reset-password` | new password (body `{"password":"..."}` optional); logs out existing sessions |
+| POST | `/admin/devices/<id>/rotate-key` | new ingest_key (rebuild firmware) |
+
+### Fleet login (one password for many repeaters)
+
+```bash
+curl -X POST https://<your-worker>/admin/accounts \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"id":"owner","name":"My repeaters","devices":["tsim-1","tsim-2"]}'
+```
+
+Log in with `owner` and the returned password to get the fleet page. Per-device passwords keep working and only open their own repeater.
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/admin/accounts` | list fleet logins (no secrets) |
+| PUT | `/admin/accounts/<id>` | `{"devices":[...]}` change which repeaters it covers |
+| POST | `/admin/accounts/<id>/reset-password` | new password; logs out its sessions |
+| DELETE | `/admin/accounts/<id>` | remove the fleet login |
+
+## Reference: build and flash the T-SIM
+
+```bash
+cd firmware
+cp include/config.example.h include/config.h   # set WORKER_URL, DEVICE_ID, DEVICE_KEY, APN
+pio run                                         # first build installs + patches libraries
+pio run -t upload --upload-port /dev/ttyACM0    # hold BOOT, tap RST, release BOOT first
+```
+
+Or with esptool:
+
+```bash
+esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash -z \
+  --flash_mode dio --flash_freq 80m --flash_size 16MB \
+  0x0 .pio/build/tsim7672g/bootloader.bin 0x8000 .pio/build/tsim7672g/partitions.bin \
+  0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+  0x10000 .pio/build/tsim7672g/firmware.bin
+```
+
+After RST the T-SIM stays awake for 2 minutes (USB serial commands at 115200: `STATUS`, `MESH`, `CMD`, `CLI <command>`, `REBOOT`, `TESTDL <url>`, `UPDATE <url>`, `LASTLOG`, `SLEEP`, `STAY`), then sleeps until a text arrives.
+
+### Library patches
+
+- `lib/esp-serial-flasher`: Espressif esp-serial-flasher, vendored with an Arduino UART port, used to flash the Heltec.
+- `patches/`: patched ESP_SSLClient 3.1.3 headers. They're copied over the downloaded library automatically by `apply_patches.py` (PlatformIO pre-script). See `patches/README.md`.
+
+## Using the dashboard
+
+Open your Worker URL and log in with a device id or fleet login and its password. A fleet login opens **/fleet**: one card per repeater with online/stale, last seen, battery, signal, Heltec firmware, neighbor count, packet counts, schedule and console state. Tap a card for the repeater page (**/d/&lt;id&gt;**).
+
+The repeater page shows firmware, last seen (with a **stale** badge after 26 hours), wake cause, uptime, battery and solar, signal (CSQ/RSRP/RSRQ), operator, IP, the Heltec firmware, the latest `upgrade.bin` on GitHub, and an activity log. It refreshes every 30 s.
+
+**Update source** (per device, in the dashboard): GitHub repo (default `IoTThinks/EasySkyMesh`), asset filename pattern (`*` = anything, default `Heltec_v3_repeater-*-upgrade.bin`), and an optional direct `https://` URL. When the GitHub source is turned off, Check and Update use the direct URL, or are disabled if it's empty.
+
+**Mesh** section: repeater name, firmware, clock, the Heltec's own battery and uptime, radio (noise floor, last RSSI/SNR, airtime), packet counters and a neighbors table (id, SNR, last heard), from the latest snapshot.
+
+**Scheduled check** (optional, off by default): 6 h, 12 h, daily or weekly. An hourly Worker cron texts STATUS only to repeaters whose check is due. Each check costs one incoming text and wakes the T-SIM for a minute or two.
+
+**Repeater console** (optional, off by default, per repeater): type a MeshCore CLI command (`ver`, `neighbors`, `stats-packets`, `get name`, `advert`, `set ...`). Commands queue on the Worker; **Queue & wake** texts `CMD` to the T-SIM, which fetches them (`GET /api/dev/<id>/commands` with its key), runs each on the Heltec serial CLI and posts the output back. Commands that can wipe or detach a repeater (`erase`, `start ota`, `password`, radio `set`s, …) need an extra confirm. Turning the console off cancels anything queued, and the T-SIM gets no commands while it's off.
+
+**Power saving:** some repeater firmware power-saving modes (e.g. EasySkyMesh `powersaving on`) put the ESP32 to sleep and block the serial CLI. The dashboard marks a repeater as in power saving when `powersaving on` succeeds or the last CLI attempt got no reply; the console and mesh polling are then paused (the last snapshot stays visible). Any successful CLI reply, or `powersaving off`, re-enables them. Firmware without a power-saving command simply keeps the console enabled. Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.
+
+Buttons: **Request status**, **Reboot Heltec**, **Check for update** (only looks it up from the update source; sends nothing), **Update to latest** (texts the UPDATE command). Sending is limited to one text per 60 s per device.
+
+## SMS commands (what the Worker sends)
+
+| Text | Effect |
+|---|---|
+| `STATUS` | T-SIM posts full telemetry plus a mesh snapshot to the dashboard |
+| `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
+| `REBOOT` | pulses Heltec RST |
+| `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
+
+Underscores in URLs are sent as `%5F` because SMS (GSM-7) can drop `_`. Use `*-upgrade.bin` images (they keep the repeater's identity). `freshInstall-merged.bin` images wipe its name, keys and settings. Any other text is ignored. The T-SIM never sends texts.
+
+## Security notes
+
+- Each device has its own dashboard password (PBKDF2-SHA256, 100k iterations, random salt) and its own ingest key. Fleet logins are hashed the same way and only open the devices listed for them. A session cookie (HMAC-signed, HttpOnly, Secure, SameSite=Strict, 7 days) is only valid for that device or fleet. Dashboard POSTs reject cross-origin requests. Failed logins are limited to 5 per 15 min per IP and device.
+- The T-SIM only holds its ingest key, so it can only post telemetry and fetch console commands for itself. The admin token never leaves your machine.
+- **SMS commands are not authenticated.** Anyone who knows the SIM's number or can text it can reboot or reflash the repeater. Keep the number private. Hologram SIMs without a phone number can only be texted through your Hologram account.
+- Never commit `firmware/include/config.h` or any token. `.gitignore` covers the usual files.
+
+## License
+
+MIT
