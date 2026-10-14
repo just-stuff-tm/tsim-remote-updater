@@ -237,6 +237,74 @@ async function manualSend(env, dev, body, label, onSuccess) {
   }
 }
 
+// ---------- update progress (built from the telemetry events the firmware already posts) ----------
+export const STEPS = ["Waiting for T-SIM to wake", "Downloading", "Verifying", "Writing / flashing", "Rebooting", "Done"];
+const PROGRESS_TIMEOUT_MS = 15 * 60e3;
+export function friendlyFail(msg) {
+  const m = String(msg || "");
+  const R = [[/no network|PDP down/i, "The T-SIM couldn't get an LTE data connection."], [/download/i, "The firmware file couldn't be downloaded."],
+    [/checksum|mismatch|MD5/i, "The downloaded file didn't match its checksum (corrupted or wrong file)."], [/not an ESP32 app/i, "That file isn't a valid firmware image."],
+    [/slot|too large|>/i, "The firmware file is too big for the T-SIM's update slot."], [/no OTA partition/i, "This T-SIM needs one USB flash of v1.6.0+ before it can update itself."],
+    [/bad url/i, "The firmware link isn't valid."], [/write|verify|flash/i, "Writing the firmware failed. The old firmware is still in place."]];
+  for (const [re, s] of R) if (re.test(m)) return s;
+  return m ? "The update failed: " + m.replace(/^.*FAIL:\s*/, "") : "The update failed.";
+}
+// kind "heltec" | "tsim". history is newest-first.
+export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
+  const sent = kind === "tsim" ? st.tsim_update_sent : st.last_update_sent;
+  const isK = (h) => h.type === "update" && h.msg && (kind === "tsim" ? /^TSIM OTA/.test(h.msg) : !/^TSIM OTA/.test(h.msg) && !/^TESTDL/.test(h.msg)) ||
+    (kind === "tsim" && /booted new firmware after OTA/.test(h.msg || ""));
+  const evs = history.filter(isK).slice().reverse();  // oldest first
+  let startAt = sent ? Date.parse(sent.at) : null;
+  if (startAt == null) { const s = evs.filter((h) => /start/i.test(h.msg)).pop(); if (s) startAt = Date.parse(s.received_at); }
+  if (startAt == null || now - startAt > 7 * 864e5) return { state: "idle" };
+  const mine = evs.filter((h) => Date.parse(h.received_at) >= startAt - 5000);
+  const target = sent ? (sent.asset_name || "") + (sent.tag && !["url", "direct"].includes(sent.tag) ? " (" + sent.tag + ")" : "") : null;
+  const times = { 0: new Date(startAt).toISOString() };
+  let step = 0, state = "running", reason = null, finished = null;
+  for (const h of mine) {
+    const m = h.msg;
+    if (kind === "tsim") {
+      if (/OTA start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; }
+      else if (/OTA: downloaded/.test(m)) { step = Math.max(step, 3); times[1] ||= h.received_at; times[2] = times[3] = h.received_at; }
+      else if (/OTA: written/.test(m)) { step = Math.max(step, 4); times[4] = h.received_at; }
+      else if (/booted new firmware/.test(m)) { step = Math.max(step, 4); }
+      else if (/OTA OK/.test(m)) { step = 5; times[5] = h.received_at; state = "done"; finished = h.received_at; }
+      else if (/OTA FAIL/.test(m)) { state = "failed"; reason = friendlyFail(m); finished = h.received_at; }
+    } else {
+      if (/^(UPDATE )?start/i.test(m) || /^UPDATE start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; }
+      else if (/^Download done/.test(m)) { step = Math.max(step, 3); times[1] ||= h.received_at; times[2] = times[3] = h.received_at; }
+      else if (/^SUCCESS/.test(m)) { step = 5; times[4] = times[5] = h.received_at; state = "done"; finished = h.received_at; }
+      else if (/FAIL/.test(m)) { state = "failed"; reason = friendlyFail(m); finished = h.received_at; }
+    }
+  }
+  if (state === "running" && now - startAt > PROGRESS_TIMEOUT_MS) { state = "timeout";
+    reason = step === 0 ? "The T-SIM never woke up to start the update. Check its power and signal, then try again." :
+      step === 4 && kind === "tsim" ? "The T-SIM didn't check in after rebooting. It has probably rolled back to its previous firmware." :
+      "No progress reported for 15 minutes. Press Request status to see what the T-SIM is doing."; }
+  return { state, step, steps: STEPS, times, target, started_at: times[0], finished_at: finished, reason, pct: Math.round((step / 5) * 100) };
+}
+
+// Safety check before texting a Heltec UPDATE: T-SIM firmware <= 1.6.x treats any 0xE9 image over 1 MiB
+// as a merged image and writes it at 0x0 (over the bootloader). App-only images that big would brick the Heltec.
+export async function heltecImageRisk(url) {
+  const name = decodeURIComponent(url.split(/[?#]/)[0].split("/").pop() || "");
+  if (/merged|factory|freshInstall/.test(name)) return null;
+  try {
+    const r = await fetch(url, { headers: { Range: "bytes=0-0", "User-Agent": UA } });
+    const size = parseInt(((r.headers.get("Content-Range") || "").split("/")[1]) || r.headers.get("Content-Length") || "0", 10);
+    const b = new Uint8Array(await r.arrayBuffer());
+    if (r.status === 206 && b[0] === 0xE9 && size > 1024 * 1024)
+      return `Blocked for safety: ${name} is an app-only image of ${(size / 1048576).toFixed(2)} MB. The current T-SIM firmware would write it at address 0x0 (over the Heltec's bootloader) and brick it. A T-SIM firmware fix is needed before this file can be flashed.`;
+  } catch {}
+  return null;
+}
+export const FW_PRESETS = {
+  easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", direct_url: "" },
+  meshcore: { label: "Stock MeshCore repeater v1.17.1", enabled: false, repo: "meshcore-dev/MeshCore", asset_pattern: "Heltec_v3_repeater-v*.bin",
+    direct_url: "https://github.com/meshcore-dev/MeshCore/releases/download/repeater-v1.17.1/Heltec_v3_repeater-v1.17.1-d929643.bin" },
+};
+
 // Resolve what "latest" means for this device's update source.
 export async function resolveTarget(env, id) {
   const src = await getSource(env, id);
@@ -559,7 +627,8 @@ async function deviceApi(request, env, dev, action) {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null },
-      tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null } });
+      tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
+      progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS });
   }
   if (action === "source" && request.method === "GET") return json(await getSource(env, id));
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
@@ -663,6 +732,8 @@ async function deviceApi(request, env, dev, action) {
     let rel;
     try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
+    const risk = await heltecImageRisk(rel.url);
+    if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
     const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${rel.asset_name}`, async (st) => {
       st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag };
@@ -678,13 +749,15 @@ async function fleetApi(env, acc) {
   for (const id of acc.devices) {
     const dev = await getDevice(env, id);
     if (!dev) continue;
-    const [L, mesh, st, settings] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), kvJson(env, `state:${id}`), getSettings(env, id)]);
+    const [L, mesh, st, settings, hist] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), kvJson(env, `state:${id}`), getSettings(env, id), kvJson(env, `telem:${id}:history`)]);
+    const ph = computeProgress("heltec", hist || [], st || {}), pt = computeProgress("tsim", hist || [], st || {});
     const l = L || {}, m = mesh || {};
     out.push({ id, name: dev.name, last_seen: l.received_at || null, fw: l.fw || null, battery_v: l.battery_v ?? null, battery_pct: l.battery_pct ?? null,
       solar_v: l.solar_v ?? null, csq: l.csq ?? null, rsrp: l.rsrp ?? null,
       heltec_fw: m.heltec_fw || (st && st.heltec_fw) || null, node_name: m.node_name || null,
       neighbors: m.neighbors ? m.neighbors.length : null, packets: m.packets || null, radio: m.radio || null, mesh_at: m.received_at || null, mesh_test: !!m.test,
-      powersaving: !!(st && st.heltec_powersaving), console_enabled: settings.console_enabled, schedule_hours: settings.schedule_hours });
+      powersaving: !!(st && st.heltec_powersaving), console_enabled: settings.console_enabled, schedule_hours: settings.schedule_hours,
+      progress: { heltec: { state: ph.state, step: ph.step, pct: ph.pct, finished_at: ph.finished_at }, tsim: { state: pt.state, step: pt.step, pct: pt.pct, finished_at: pt.finished_at } } });
   }
   return json({ account: { kind: acc.kind, id: acc.id, name: acc.name }, devices: out });
 }
@@ -708,39 +781,65 @@ export async function runSchedules(env, now = Date.now()) {
 }
 
 // ---------- pages ----------
-const CSS = `:root{color-scheme:light dark;--bg:#f4f6f8;--card:#fff;--fg:#1b1f24;--mut:#667;--acc:#1f6feb;--bad:#d1242f;--ok:#1a7f37}
-@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e}}
-*{box-sizing:border-box}body{margin:0;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:var(--card);border-bottom:1px solid #8883}
-main{max-width:1000px;margin:auto;padding:12px}.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
-.card{background:var(--card);border-radius:10px;padding:12px 14px;box-shadow:0 1px 2px #0002}.card h3{margin:0 0 6px;font-size:13px;text-transform:uppercase;color:var(--mut)}
-.kv{display:flex;justify-content:space-between;gap:8px;padding:2px 0}.kv span:first-child{color:var(--mut)}.kv span:last-child{text-align:right;word-break:break-all}
-button,.btn{border:0;border-radius:8px;padding:12px;font-size:15px;background:var(--acc);color:#fff;cursor:pointer}button.w{background:var(--bad)}button.g{background:#57606a}
-.acts{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));margin:12px 0}
-pre{background:var(--card);padding:10px;border-radius:8px;overflow:auto;max-height:240px;font-size:12px}
-table{width:100%;border-collapse:collapse;background:var(--card);border-radius:10px;overflow:hidden;font-size:13px}td,th{padding:6px 8px;border-bottom:1px solid #8882;text-align:left;vertical-align:top}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:#fff;background:var(--ok)}.badge.stale{background:var(--bad)}
-input{width:100%;padding:10px;margin:6px 0 12px;border-radius:8px;border:1px solid #8886;font-size:16px;background:var(--card);color:var(--fg)}
-.login{max-width:360px;margin:10vh auto}.err{color:var(--bad)}.mut{color:var(--mut)}.small{font-size:13px}.sm{padding:6px 12px;font-size:13px}
-a{color:var(--acc)}a.dev{color:inherit;text-decoration:none;display:block}a.dev:hover{outline:2px solid var(--acc)}a.back{text-decoration:none;margin-right:6px}
-.row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.row input{flex:1;min-width:160px;margin:6px 0}
-h2{font-size:18px;margin:20px 0 8px}h3.sec{margin:16px 0 6px}details.card{margin:12px 0}summary{cursor:pointer;padding:4px 0}
-.psnote{background:#d1242f22;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px}.dim{opacity:.45}
-.tog{display:flex;gap:8px;align-items:center;margin:8px 0}.tog input{width:auto;margin:0}select{padding:10px;border-radius:8px;font-size:15px;margin-right:6px}
-pre.o{margin:0;padding:4px;max-height:160px;white-space:pre-wrap;background:transparent}code{font-size:12px}
-@media(max-width:600px){main{padding:8px}td,th{padding:5px}}`;
+const CSS = `:root{color-scheme:light dark;--bg:#f3f5f8;--card:#fff;--fg:#1b1f24;--mut:#667085;--line:#e4e7ec;--acc:#1f6feb;--bad:#d1242f;--ok:#1a7f37;--warn:#b54708;--r:12px}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e;--line:#30363d}}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+header{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+header .t{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}header b{font-size:17px}
+main{max-width:1040px;margin:auto;padding:14px}.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px}.card h3{margin:0 0 8px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut)}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line)}.kv:last-child{border:0}.kv span:first-child{color:var(--mut)}.kv span:last-child{text-align:right;word-break:break-word}
+button,.btn{border:0;border-radius:10px;padding:11px 14px;font-size:15px;font-weight:500;background:var(--acc);color:#fff;cursor:pointer}button:disabled{opacity:.5;cursor:default}
+button.w{background:var(--bad)}button.g{background:#57606a}button.sm{padding:6px 12px;font-size:13px}
+.acts{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:12px 0}
+section{margin:22px 0}h2{font-size:17px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mut);font-weight:500}
+.tw{overflow-x:auto}.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;background:var(--ok)}
+.badge.stale,.badge.failed{background:var(--bad)}.badge.run{background:var(--acc)}.badge.mut{background:#8b949e}
+input,select{width:100%;padding:10px;margin:4px 0 12px;border-radius:8px;border:1px solid var(--line);font-size:16px;background:var(--card);color:var(--fg)}
+label{font-size:13px;color:var(--mut)}.login{max-width:380px;margin:10vh auto}.err{color:var(--bad)}.mut{color:var(--mut)}.small{font-size:13px}
+a{color:var(--acc)}a.dev{color:inherit;text-decoration:none;display:block}a.dev:hover{border-color:var(--acc)}a.back{text-decoration:none}
+.row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.row input{flex:1;min-width:160px;margin:0}
+details.card{margin:10px 0;padding:0}details.card>summary{cursor:pointer;padding:14px;list-style:none;display:flex;justify-content:space-between;gap:8px}
+details.card>summary::after{content:"▸";color:var(--mut)}details[open].card>summary::after{content:"▾"}details.card>.in{padding:0 14px 14px}
+.psnote{background:#d1242f1a;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px;font-size:13px}.dim{opacity:.45}
+.tog{display:flex;gap:8px;align-items:center;margin:8px 0;color:var(--fg);font-size:15px}.tog input{width:auto;margin:0}
+pre.o{margin:0;max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px}code{font-size:12px}
+.bar{height:8px;background:var(--line);border-radius:99px;overflow:hidden;margin:8px 0}.bar i{display:block;height:100%;background:var(--acc);transition:width .4s}
+.bar.done i{background:var(--ok)}.bar.failed i{background:var(--bad)}
+ol.steps{list-style:none;margin:8px 0 0;padding:0;font-size:13px}ol.steps li{display:flex;justify-content:space-between;gap:8px;padding:3px 0;color:var(--mut)}
+ol.steps li.ok{color:var(--fg)}ol.steps li.ok:before{content:"✓ ";color:var(--ok)}ol.steps li.cur{color:var(--acc);font-weight:600}ol.steps li.cur:before{content:"● "}
+ol.steps li.bad{color:var(--bad);font-weight:600}ol.steps li.bad:before{content:"✕ "}ol.steps li:not(.ok):not(.cur):not(.bad):before{content:"○ "}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);max-width:min(560px,92vw);padding:12px 16px;border-radius:10px;color:#fff;background:#1f2328;box-shadow:0 6px 24px #0005;z-index:9;font-size:14px}
+#toast.ok{background:var(--ok)}#toast.bad{background:var(--bad)}.msg{font-size:13px;margin-left:6px}.msg.bad{color:var(--bad)}.msg.ok{color:var(--ok)}
+.fc .row b{font-size:16px}.mini{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+@media(max-width:600px){main{padding:10px}header{padding:8px 10px}.acts{grid-template-columns:1fr 1fr}td,th{padding:6px 5px}}`;
 
 const HEAD = (title) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${CSS}</style></head>`;
 const COMMON_JS = `const $=s=>document.getElementById(s);
 const e=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const t=s=>s?new Date(s).toLocaleString():"—";
+const t=s=>s?new Date(s).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"—";
 const ago=s=>{if(!s)return "never";const d=(Date.now()-new Date(s))/1000;return d<90?Math.round(d)+"s ago":d<5400?Math.round(d/60)+" min ago":d<172800?Math.round(d/3600)+" h ago":Math.round(d/86400)+" d ago"};
 const kv=rows=>rows.map(([k,v])=>'<div class="kv"><span>'+e(k)+'</span><span>'+e(v??"—")+'</span></div>').join("");
 const STALE_MS=26*3600e3;
-const sig=c=>c==null||c<0||c==99?null:(c>=20?"excellent":c>=15?"good":c>=10?"ok":"weak")+" ("+c+")";`;
+const sig=c=>c==null||c<0||c==99?null:(c>=20?"Excellent":c>=15?"Good":c>=10?"OK":"Weak")+" ("+c+")";
+const PSTATE={running:["Updating…","run"],done:["Updated","ok"],failed:["Update failed","failed"],timeout:["No response","failed"]};
+function pbadge(p,label){if(!p||p.state==="idle")return"";if(p.state==="done"&&p.finished_at&&Date.now()-new Date(p.finished_at)>36e5)return"";const s=PSTATE[p.state]||[p.state,"mut"];return '<span class="badge '+(s[1]==="ok"?"":s[1])+'">'+e(label+": "+s[0]+(p.state==="running"?" "+p.pct+"%":""))+'</span>'}
+let toastT;function toast(msg,kind){let el=$("toast");if(!el){el=document.createElement("div");el.id="toast";document.body.appendChild(el)}el.className=kind||"";el.textContent=msg;el.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>el.hidden=true,kind==="bad"?9000:6000)}
+function friendly(j,status){const x=String((j&&(j.error||(j.hologram_response_summary||{}).error))||"");
+ if(status===401)return"Your login has expired. Please log in again.";
+ if(/rate limited/.test(x))return"Please wait a minute between texts to the same T-SIM ("+(x.match(/\\d+s/)||["a few s"])[0]+" left).";
+ if(/^Blocked for safety/.test(x))return x;
+ if(/Hologram|HOLOGRAM/.test(x))return"The text couldn't be sent: the SMS service (Hologram) rejected it. Check the Hologram API key and the SIM's status.";
+ if(/hologram_device_id/.test(x))return"This T-SIM has no SIM device id set up, so it can't be texted.";
+ if(/GitHub|no upgrade asset|not found/.test(x))return"Couldn't find a firmware file at the update source. Check the repo and file name in Settings.";
+ if(/disabled/.test(x))return"No update source is set. Choose one in Settings › Heltec update source.";
+ if(/bad origin/.test(x))return"Security check failed. Reload the page and try again.";
+ if(/power saving/.test(x))return"The repeater is in power saving, so its console isn't available right now.";
+ if(status>=500||!x)return"Something went wrong. Please try again in a minute.";return x}`;
 
 export function loginPage(id = "", err = "") {
-  return `${HEAD("T-SIM login")}
+  return `${HEAD("Mesh dashboard login")}
 <body><main class="login card"><h2>Mesh repeater dashboard</h2>${err ? `<p class="err">${esc(err)}</p>` : ""}
 <form method="post" action="/login"><label>Device id or fleet login<input name="device" value="${esc(id)}" autocomplete="username" required autocapitalize="none"></label>
 <label>Password<input name="password" type="password" autocomplete="current-password" required></label><button style="width:100%">Log in</button></form></main></body></html>`;
@@ -748,167 +847,205 @@ export function loginPage(id = "", err = "") {
 
 export function fleetPage(acc) {
   return `${HEAD("Repeaters")}
-<body><header><div><b>Repeaters</b> <small class="mut">${esc(acc.name || acc.id)}</small></div>
+<body><header><div class="t"><b>Repeaters</b> <span class="mut small">${esc(acc.name || acc.id)}</span></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
 <main><p class="mut" id="sum">Loading…</p><div class="grid" id="fleet"></div>
-<p class="mut small">Readings update only when a T-SIM wakes (Request status, a console command, or an optional scheduled check). "Stale" = nothing heard for 26 h.</p></main>
+<p class="mut small">Readings update when a T-SIM wakes (Request status, a console command, or an optional scheduled check). "Stale" means nothing was heard for 26 hours.</p></main>
 <script>${COMMON_JS}
+let busy=false;
 async function load(){
  const r=await fetch("/api/fleet",{credentials:"same-origin"});if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.devices||[];let on=0;
+ const d=await r.json(),L=d.devices||[];let on=0;busy=false;
  $("fleet").innerHTML=L.map(x=>{const fresh=x.last_seen&&Date.now()-new Date(x.last_seen)<STALE_MS;if(fresh)on++;
-  const p=x.packets||{};
-  return '<a class="card dev" href="/d/'+encodeURIComponent(x.id)+'"><div class="row"><b>'+e(x.name)+'</b><span class="badge'+(fresh?'':' stale')+'">'+(fresh?'online':'stale')+'</span></div>'+
-  '<small class="mut">'+e(x.id)+(x.node_name?' · '+e(x.node_name):'')+'</small>'+
+  const P=x.progress||{};if((P.heltec||{}).state==="running"||(P.tsim||{}).state==="running")busy=true;
+  return '<a class="card dev fc" href="/d/'+encodeURIComponent(x.id)+'"><div class="row"><b>'+e(x.name)+'</b><span class="badge'+(fresh?'':' stale')+'">'+(fresh?'Online':'Stale')+'</span></div>'+
+  '<div class="small mut">'+e(x.id)+(x.node_name?' · '+e(x.node_name):'')+'</div>'+
+  '<div class="mini">'+pbadge(P.heltec,"Heltec")+pbadge(P.tsim,"T-SIM")+(x.powersaving?'<span class="badge mut">Power saving</span>':'')+'</div>'+
   kv([["Last seen",ago(x.last_seen)],["Battery",x.battery_v==null?null:x.battery_v.toFixed(2)+" V ("+x.battery_pct+"%)"],["Signal",sig(x.csq)],
-   ["Heltec fw",x.heltec_fw],["Neighbors",x.neighbors],["Packets rx / tx",p.recv==null?null:p.recv+" / "+p.sent],
-   ["Scheduled check",x.schedule_hours?"every "+x.schedule_hours+" h":"off"],["Console",x.powersaving?"paused (power saving)":(x.console_enabled?"on":"off")]])+
-  (x.mesh_test?'<small class="err">mesh data is TEST data</small>':'')+'</a>'}).join("")||'<p>No repeaters on this login.</p>';
+   ["Heltec firmware",x.heltec_fw],["Neighbors",x.neighbors]])+
+  (x.mesh_test?'<small class="err">Mesh data is test data</small>':'')+'</a>'}).join("")||'<p>No repeaters on this login.</p>';
  $("sum").textContent=L.length+" repeater"+(L.length==1?"":"s")+" · "+on+" heard in the last 26 h";
+ clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
 }
-load();setInterval(load,30000);
+load();
 </script></body></html>`;
 }
 
+const PS_HTML = `Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.`;
+
 export function dashboardPage(dev, acc = { kind: "d" }) {
   return `${HEAD(dev.name)}
-<body><header><div>${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a> ' : ""}<b>${esc(dev.name)}</b> <small class="mut">${esc(dev.id)}</small> <span id="seen" class="badge">…</span></div>
+<body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
-<main><div class="grid">
+<main>
+<div class="acts">
+<button data-a="status" data-c="Text the T-SIM to wake it? It reads the repeater and reports here within about 2 minutes.">Request status</button>
+<button data-a="check" data-c="">Check for updates</button>
+<button data-a="update-latest" class="w" data-c="Update the Heltec repeater to the latest firmware? It will be reflashed and restart.">Update Heltec</button>
+<button data-a="tsim-update" class="w" data-c="Update the T-SIM's own firmware? It downloads, installs and restarts. If the new firmware can't check in, it rolls back automatically.">Update T-SIM</button>
+<button data-a="reboot" class="g" data-c="Restart the Heltec repeater?">Reboot Heltec</button>
+</div>
+
+<section><h2>Overview</h2><div class="grid">
 <div class="card"><h3>T-SIM</h3><div id="c-tsim"></div></div>
 <div class="card"><h3>Power</h3><div id="c-power"></div></div>
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
-<div class="card"><h3>Updates</h3><div id="c-upd"></div></div>
-<div class="card"><h3>T-SIM firmware</h3><div id="c-tsimfw"></div></div>
-</div>
-<div class="acts">
-<button data-a="status" data-c="Text STATUS to the T-SIM? It wakes, reads the repeater and reports here.">Request status</button>
-<button data-a="reboot" data-c="Text REBOOT to the T-SIM? The Heltec will restart.">Reboot Heltec</button>
-<button data-a="check" data-c="">Check for update</button>
-<button data-a="update-latest" class="w" data-c="Text UPDATE for the latest upgrade.bin? The Heltec will be reflashed.">Update to latest</button>
-</div>
-<pre id="out" hidden></pre>
+</div></section>
 
-<h2>Mesh <small class="mut" id="meshat"></small></h2>
-<p class="psnote" id="meshps" hidden>Mesh polling paused: the repeater is in power saving and its serial CLI isn't answering. Showing the last snapshot taken while it was awake. It resumes automatically when a status check gets a CLI reply. Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.</p>
+<section><h2>Updates</h2><div class="grid">
+<div class="card"><h3>Heltec repeater firmware</h3><div id="c-upd"></div><div id="p-heltec"></div></div>
+<div class="card"><h3>T-SIM firmware</h3><div id="c-tsimfw"></div><div id="p-tsim"></div></div>
+</div></section>
+
+<section><h2>Mesh <small class="mut small" id="meshat"></small></h2>
+<p class="psnote" id="meshps" hidden>Mesh polling is paused: the repeater is in power saving and its serial CLI isn't answering. Showing the last snapshot taken while it was awake. It resumes automatically when a status check gets a CLI reply. ${PS_HTML}</p>
 <div class="grid" id="meshgrid">
 <div class="card"><h3>Repeater</h3><div id="m-node"></div></div>
 <div class="card"><h3>Radio</h3><div id="m-radio"></div></div>
 <div class="card"><h3>Packets</h3><div id="m-pkt"></div></div>
 </div>
-<h3 class="sec">Neighbors</h3>
-<table><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table>
+<div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
 
-<details class="card" id="schbox"><summary><b>Scheduled check</b> <small id="schsum" class="mut"></small></summary>
-<p class="small mut">Optional. The Worker texts STATUS on this interval so readings stay fresh. Each check costs one incoming text and wakes the T-SIM (about 1–2 minutes of modem battery).</p>
-<select id="sch"><option value="0">Off</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Daily</option><option value="168">Weekly</option></select>
-<button id="schsave">Save</button> <span id="schmsg"></span></details>
-
-<details class="card" id="conbox"><summary><b>Repeater console</b> <small id="consum" class="mut"></small></summary>
-<label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
-<p class="small mut">Commands run on the Heltec's MeshCore CLI the next time the T-SIM wakes. "Queue &amp; wake" texts CMD to the T-SIM (one incoming text); output appears below within a few minutes. Note: some firmware power-saving modes (e.g. EasySkyMesh <code>powersaving on</code>) block the serial CLI. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code> <code>advert</code></p>
-<p class="psnote" id="conps" hidden>Console unavailable while the repeater is in power saving (last CLI attempt got no reply, or <code>powersaving on</code> succeeded). Some firmware power-saving modes block the serial CLI. It re-enables after <code>powersaving off</code> or any successful CLI reply, e.g. after Request status. Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.</p>
-<div id="conui"><form id="conf" class="row"><input id="cmd" maxlength="120" placeholder="MeshCore CLI command" autocapitalize="none" autocomplete="off">
-<button type="submit" name="q" class="g">Queue</button><button type="button" id="qwake">Queue &amp; wake</button></form>
-<div class="row small"><span id="conmsg"></span><span><button type="button" id="wake" class="g sm">Wake to run queued</button> <button type="button" id="cancel" class="g sm">Cancel queued</button></span></div>
-<table><thead><tr><th>Command</th><th>Status</th><th>Output</th></tr></thead><tbody id="cmds"></tbody></table></div></details>
-
-<details class="card" id="tsimbox"><summary><b>T-SIM firmware update</b> <small id="tsimsum" class="mut"></small></summary>
-<p class="small mut">Updates the T-SIM itself over LTE (needs T-SIM firmware 1.6.0+). The T-SIM downloads the .bin, checks it, writes the spare app slot and reboots. If the new firmware can't check in here, the T-SIM rolls back to the old one. Uses one incoming text.</p>
-<form id="tsimf">
-<label>Source <select name="mode"><option value="github">GitHub releases</option><option value="url">Direct URL</option></select></label>
-<label>GitHub repo (owner/name)<input name="repo" placeholder="just-stuff-tm/tsim-remote-updater"></label>
-<label>Release asset name<input name="asset" placeholder="firmware.bin"></label>
-<label>Direct URL<input name="url" placeholder="https://.../firmware.bin"></label>
-<label>Checksum (optional SHA-256 or MD5; GitHub's asset digest is used if empty)<input name="checksum" placeholder="sha256:..."></label>
-<button type="submit" class="g">Save source</button> <span id="tsimmsg"></span></form>
-<div class="acts"><button data-a="tsim-check" data-c="">Check T-SIM firmware</button>
-<button data-a="tsim-update" class="w" data-c="Update the T-SIM's own firmware? It texts CMD to the T-SIM, which downloads, flashes and reboots (rolls back automatically if the new firmware can't check in).">Update T-SIM firmware</button></div></details>
-
-<details class="card" id="srcbox"><summary><b>Update source</b> <small id="srcsum" class="mut"></small></summary>
-<form id="srcf" style="margin-top:8px">
-<label class="tog"><input type="checkbox" name="enabled"> Use GitHub releases</label>
+<section><h2>Settings</h2>
+<details class="card" id="srcbox"><summary><b>Heltec update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
+<label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
+<p class="small mut" id="presetnote"></p>
+<form id="srcf">
+<label class="tog"><input type="checkbox" name="enabled"> Use the latest GitHub release</label>
 <label>GitHub repo (owner/name)<input name="repo" placeholder="IoTThinks/EasySkyMesh"></label>
-<label>Asset filename pattern (* = anything)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
-<label>Direct URL override (used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
-<button type="submit">Save source</button> <span id="srcmsg"></span></form></details>
-<p class="small mut">One text per 60 s per T-SIM. The T-SIM wakes on the text, then reports here within a few minutes.</p>
-<h3 class="sec">Recent activity</h3><table><thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody id="log"></tbody></table>
-</main>
+<label>File name pattern (* = anything)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
+<label>Direct link (used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
+<button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
+
+<details class="card" id="tsimbox"><summary><b>T-SIM firmware source</b><small id="tsimsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Needs T-SIM firmware 1.6.0 or newer. The T-SIM downloads the file, checks it, installs it in its spare slot and restarts. If the new firmware can't check in, it rolls back on its own.</p>
+<form id="tsimf">
+<label>Source<select name="mode"><option value="github">Latest GitHub release</option><option value="url">Direct link</option></select></label>
+<label>GitHub repo (owner/name)<input name="repo" placeholder="just-stuff-tm/tsim-remote-updater"></label>
+<label>Release file name<input name="asset" placeholder="firmware.bin"></label>
+<label>Direct link<input name="url" placeholder="https://.../firmware.bin"></label>
+<label>Checksum (optional; GitHub's own checksum is used if empty)<input name="checksum" placeholder="sha256:..."></label>
+<button type="submit">Save</button><span id="tsimmsg" class="msg"></span></form></div></details>
+
+<details class="card" id="schbox"><summary><b>Scheduled check</b><small id="schsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Optional. Texts the T-SIM on this interval so readings stay fresh. Each check uses one incoming text and a little battery.</p>
+<select id="sch"><option value="0">Off</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Daily</option><option value="168">Weekly</option></select>
+<button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
+
+<details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
+<label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
+<p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
+<p class="psnote" id="conps" hidden>The console is unavailable while the repeater is in power saving. It comes back after <code>powersaving off</code> or any successful reply, e.g. after Request status. ${PS_HTML}</p>
+<div id="conui"><form id="conf" class="row"><input id="cmd" maxlength="120" placeholder="MeshCore CLI command" autocapitalize="none" autocomplete="off">
+<button type="submit" class="g">Queue</button><button type="button" id="qwake">Queue &amp; wake</button></form>
+<div class="row small" style="margin:8px 0"><span id="conmsg" class="msg"></span><span><button type="button" id="wake" class="g sm">Wake to run queued</button> <button type="button" id="cancel" class="g sm">Cancel queued</button></span></div>
+<div class="tw"><table><thead><tr><th>Command</th><th>Status</th><th>Reply</th></tr></thead><tbody id="cmds"></tbody></table></div></div></div></details>
+</section>
+
+<section><details class="card"><summary><b>Activity</b><small class="mut">recent events</small></summary><div class="in tw">
+<table><thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody id="log"></tbody></table></div></details>
+<p class="small mut">One text per minute per T-SIM. After a text, the T-SIM wakes and reports here within a few minutes.</p></section>
+</main><div id="toast" hidden></div>
 <script>${COMMON_JS}
 const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
-const WAKE={0:"cold boot / RST",2:"text (RI pin)",4:"timer",7:"USB/other"};
+const WAKE={0:"Power-on / reset",2:"Text message",4:"Timer",7:"USB / other"};
 const up=s=>s==null?null:(s>=86400?Math.floor(s/86400)+"d ":"")+(s>=3600?Math.floor(s%86400/3600)+"h ":"")+Math.floor(s%3600/60)+"m";
 const post=(a,b)=>fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
-let first=true;
+const rj=async r=>{try{return await r.json()}catch{return{}}};
+const say=(id,ok,msg)=>{const el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=msg};
+let first=true,pending={},PRE={};
+function prog(p,label,pend){
+ if(pend&&(!p||p.state==="idle"||(p.started_at&&new Date(p.started_at)<pend)))p={state:"running",step:0,pct:0,steps:["Waiting for T-SIM to wake","Downloading","Verifying","Writing / flashing","Rebooting","Done"],times:{0:pend.toISOString()}};
+ if(!p||p.state==="idle")return '<p class="small mut">No update in progress.</p>';
+ const fail=p.state==="failed"||p.state==="timeout",cls=p.state==="done"?"done":fail?"failed":"";
+ const head=p.state==="done"?"Update finished "+t(p.finished_at):p.state==="running"?"Update in progress":p.state==="timeout"?"No response from the T-SIM":"Update failed "+t(p.finished_at);
+ const rows=p.steps.map((s,i)=>{let c="";if(p.state==="done"||i<p.step)c="ok";else if(i===p.step)c=fail?"bad":"cur";
+  if(i===5&&fail)return '<li class="bad"><span>Failed</span><span>'+e(t(p.finished_at)||"")+'</span></li>';
+  return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
+ return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":fail?"Failed":p.pct+"%")+'</span></div>'+
+  '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+
+  (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+'<ol class="steps">'+rows+'</ol></div>'}
 async function load(){
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{};if(d.source)showSource(d.source);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
- $("seen").textContent=seen?(stale?"stale · ":"")+"seen "+ago(L.received_at):"never seen";$("seen").className="badge"+(stale?" stale":"");
- $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",t(L.received_at)],["Wake cause",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:L.uptime+" s"],["Last message",L.msg]]);
- $("c-power").innerHTML=kv([["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free heap",L.heap],["Flash free",L.fs_free]]);
- $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Operator",L.operator],["Registration",L.reg],["IP",L.ip],["Modem fw",L.modem_fw]]);
- const la=U.latest_available,lr=U.last_update_result;
- const TS=d.tsim||{},tla=TS.latest_available,tlo=TS.last_ota;
- $("c-tsimfw").innerHTML=kv([["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":"")+(tla.checksum?" ✓ checksum":""):"press Check T-SIM firmware"],["Last OTA",tlo?tlo.msg:null],["When",tlo&&t(tlo.at)]]);
- if(TS.source)showTsim(TS.source);
- $("c-upd").innerHTML=kv([["Heltec firmware",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name+(la.via==="direct"?" (direct URL)":""):"press Check for update"],["Checked",la&&t(la.checked_at)],["Last update",lr?lr.msg:null],["Last text sent",U.last_action?U.last_action.label+" · "+t(U.last_action.at):null]]);
- // mesh
+ $("seen").textContent=seen?(stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale?" stale":"");
+ $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
+ $("c-power").innerHTML=kv([["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
+ $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",L.ip]]);
+ const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
+ $("c-upd").innerHTML=kv([["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)]]);
+ $("c-tsimfw").innerHTML=kv([["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]]);
+ for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
+ $("p-heltec").innerHTML=prog(PG.heltec,"Heltec",pending.heltec);$("p-tsim").innerHTML=prog(PG.tsim,"T-SIM",pending.tsim);
+ const busy=["heltec","tsim"].some(k=>pending[k]||(PG[k]||{}).state==="running");
  const C=M.core||{},R=M.radio||{},P=M.packets||{};
  $("meshat").textContent=M.received_at?"· snapshot "+ago(M.received_at)+(M.test?" · TEST DATA":""):"· no snapshot yet (press Request status)";
- $("m-node").innerHTML=kv([["Name",M.node_name],["Firmware",M.heltec_fw],["Clock",M.clock],["Heltec battery",C.battery_mv==null?null:(C.battery_mv/1000).toFixed(2)+" V"],["Uptime",up(C.uptime_secs)],["Queue / errors",C.queue_len==null?null:C.queue_len+" / "+C.errors]]);
+ $("m-node").innerHTML=kv([["Name",M.node_name],["Firmware",M.heltec_fw],["Clock",M.clock],["Battery",C.battery_mv==null?null:(C.battery_mv/1000).toFixed(2)+" V"],["Uptime",up(C.uptime_secs)],["Queue / errors",C.queue_len==null?null:C.queue_len+" / "+C.errors]]);
  $("m-radio").innerHTML=kv([["Noise floor",R.noise_floor==null?null:R.noise_floor+" dBm"],["Last RSSI",R.last_rssi==null?null:R.last_rssi+" dBm"],["Last SNR",R.last_snr==null?null:R.last_snr+" dB"],["TX airtime",up(R.tx_air_secs)],["RX airtime",up(R.rx_air_secs)]]);
  $("m-pkt").innerHTML=kv([["Received",P.recv],["Sent",P.sent],["Flood tx / rx",P.flood_tx==null?null:P.flood_tx+" / "+P.flood_rx],["Direct tx / rx",P.direct_tx==null?null:P.direct_tx+" / "+P.direct_rx],["RX errors",P.recv_errors]]);
- const N=M.neighbors;$("nb").innerHTML=N==null?'<tr><td colspan=3>No data yet</td></tr>':(N.length?N.map(n=>'<tr><td><code>'+e(n.id)+'</code></td><td>'+e(n.snr)+' dB</td><td>'+e(ago(n.heard_at))+'</td></tr>').join(""):'<tr><td colspan=3>No neighbors heard</td></tr>');
+ const N=M.neighbors;$("nb").innerHTML=N==null?'<tr><td colspan=3 class="mut">No data yet</td></tr>':(N.length?N.map(n=>'<tr><td><code>'+e(n.id)+'</code></td><td>'+e(n.snr)+' dB</td><td>'+e(ago(n.heard_at))+'</td></tr>').join(""):'<tr><td colspan=3 class="mut">No neighbors heard</td></tr>');
  if(M.error)$("nb").innerHTML+='<tr><td colspan=3 class="err">'+e(M.error)+'</td></tr>';
- // schedule + console
- const sc=d.schedule||{};$("schsum").textContent="· "+(S.schedule_hours?"every "+S.schedule_hours+" h, next ~"+t(sc.next_due):"off");
- $("consum").textContent="· "+(S.console_enabled?"on":"off");
+ const sc=d.schedule||{};$("schsum").textContent=S.schedule_hours?"every "+S.schedule_hours+" h, next "+t(sc.next_due):"off";
+ $("consum").textContent=S.console_enabled?"on":"off";
  if(first){$("sch").value=String(S.schedule_hours||0);$("conon").checked=!!S.console_enabled;first=false}
  const PS=!!(d.powersaving&&d.powersaving.on);
- $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nb").closest("table").classList.toggle("dim",PS);
+ $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
- if(PS)$("consum").textContent="· unavailable (power saving)";
- const CM=d.commands||[];$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3>No commands yet</td></tr>';
- $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"status report":""))+'</td></tr>').join("")||'<tr><td colspan=3>No activity yet</td></tr>';
+ if(PS)$("consum").textContent="paused (power saving)";
+ const CM=d.commands||[];$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.sys?"T-SIM update":c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3 class="mut">No commands yet</td></tr>';
+ $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"Status report":""))+'</td></tr>').join("")||'<tr><td colspan=3 class="mut">No activity yet</td></tr>';
+ clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
 }
+function setPresets(p){PRE=p;const s=$("preset");for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
+$("preset").onchange=ev=>{const v=PRE[ev.target.value],f=$("srcf");if(!v){$("presetnote").textContent="";return}
+ f.enabled.checked=v.enabled;f.repo.value=v.repo;f.asset_pattern.value=v.asset_pattern;f.direct_url.value=v.direct_url;
+ $("presetnote").textContent=ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). Its newest GitHub release is often the companion build, so this preset uses a direct link. Press Save to use it.":"Press Save to use it."};
 let tsimLoaded=false;
-function showTsim(s){const f=$("tsimf");$("tsimsum").textContent="· "+(s.mode==="url"?"direct URL":s.repo+" · "+s.asset)+(s.checksum?" · checksum":"");
+function showTsim(s){const f=$("tsimf");$("tsimsum").textContent=s.mode==="url"?"direct link":s.repo+" · "+s.asset;
  if(!tsimLoaded){f.mode.value=s.mode;f.repo.value=s.repo||"";f.asset.value=s.asset||"";f.url.value=s.url||"";f.checksum.value=s.checksum||"";tsimLoaded=true}}
 $("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const r=await post("tsim-source",{mode:f.mode.value,repo:f.repo.value,asset:f.asset.value,url:f.url.value,checksum:f.checksum.value});
- const j=await r.json();$("tsimmsg").textContent=r.ok?"Saved":("Error: "+(j.error||r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
+ const j=await rj(r);say("tsimmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
 let srcLoaded=false;
-function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?"· "+s.repo+" · "+s.asset_pattern:(s.direct_url?"· direct URL":"· disabled");
- const off=!s.enabled&&!s.direct_url;document.querySelectorAll('button[data-a="check"],button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
+function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+s.asset_pattern:(s.direct_url?"direct link":"not set");
+ const off=!s.enabled&&!s.direct_url;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
  if(!srcLoaded){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.direct_url.value=s.direct_url||"";srcLoaded=true;}}
 $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const r=await post("source",{enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,direct_url:f.direct_url.value});
- const j=await r.json();$("srcmsg").textContent=r.ok?"Saved":("Error: "+(j.error||r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
+ const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
 $("schsave").onclick=async()=>{const h=+$("sch").value;
- if(h&&!confirm("Text STATUS to this T-SIM every "+h+" hours? Each check costs one incoming text and some battery."))return;
- const r=await post("settings",{schedule_hours:h});const j=await r.json();$("schmsg").textContent=r.ok?"Saved":"Error: "+(j.error||r.status);load();};
+ if(h&&!confirm("Text this T-SIM every "+h+" hours? Each check uses one incoming text and some battery."))return;
+ const r=await post("settings",{schedule_hours:h});const j=await rj(r);say("schmsg",r.ok,r.ok?"Saved":friendly(j,r.status));load();};
 $("conon").onchange=async ev=>{const on=ev.target.checked;
  if(on&&!confirm("Allow console commands for this repeater? Anyone with this login can then run MeshCore CLI commands on it."))return void(ev.target.checked=false);
- const r=await post("settings",{console_enabled:on});if(!r.ok)ev.target.checked=!on;load();};
+ const r=await post("settings",{console_enabled:on});if(!r.ok){ev.target.checked=!on;toast(friendly(await rj(r),r.status),"bad")}else toast("Console "+(on?"on":"off"),"ok");load();};
 async function queue(wake,force){const c=$("cmd").value.trim();if(!c)return;
- if(wake&&!confirm("Queue '"+c+"' and text CMD to wake the T-SIM?"))return;
- const r=await post("commands",{cmd:c,wake,force:!!force});const j=await r.json();
+ if(wake&&!confirm("Queue '"+c+"' and text the T-SIM to run it now?"))return;
+ const r=await post("commands",{cmd:c,wake,force:!!force});const j=await rj(r);
  if(r.status===409&&j.risky){if(confirm("'"+c+"' can change or wipe the repeater's settings. Queue it anyway?"))return queue(wake,true);return}
- $("conmsg").textContent=r.ok?("Queued"+(j.wake?(j.wake.sent?" · wake text sent":" · wake not sent: "+(j.wake.error||(j.wake.hologram_response_summary||{}).error)):"")):"Error: "+(j.error||r.status);
+ say("conmsg",r.ok&&(!j.wake||j.wake.sent),r.ok?("Queued"+(j.wake?(j.wake.sent?". Text sent, the reply will appear here within a few minutes.":". The wake text wasn't sent: "+friendly(j.wake,j.wake.status)):". It runs the next time the T-SIM wakes.")):friendly(j,r.status));
  if(r.ok)$("cmd").value="";load();}
 $("conf").onsubmit=ev=>{ev.preventDefault();queue(false)};$("qwake").onclick=()=>queue(true);
-$("wake").onclick=async()=>{if(!confirm("Text CMD to wake the T-SIM and run the queued commands?"))return;const r=await post("wake-cmd");const j=await r.json();$("conmsg").textContent=j.sent?"Wake text sent":"Not sent: "+(j.error||(j.hologram_response_summary||{}).error||r.status);load();};
-$("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await r.json();$("conmsg").textContent=r.ok?"Cancelled "+j.cancelled:"Error: "+(j.error||r.status);load();};
+$("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("conmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load();};
+$("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await rj(r);say("conmsg",r.ok,r.ok?"Cancelled "+j.cancelled+" queued command"+(j.cancelled==1?"":"s"):friendly(j,r.status));load();};
+const OKMSG={status:"Text sent. The T-SIM will wake and report within ~2 minutes.",reboot:"Text sent. The Heltec will restart when the T-SIM wakes (~2 minutes).",
+ "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it under Updates.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it under Updates."};
 document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
- if(b.dataset.c&&!confirm(b.dataset.c))return;
- b.disabled=true;const o=$("out");o.hidden=false;o.textContent="…";
- try{const r=await post(b.dataset.a);o.textContent=r.status+"\\n"+JSON.stringify(await r.json(),null,2);if(r.status===401)location.href="/";}
- catch(x){o.textContent=String(x)}b.disabled=false;load();
+ const a=b.dataset.a;if(b.dataset.c&&!confirm(b.dataset.c))return;
+ b.disabled=true;const old=b.textContent;b.textContent="Working…";
+ try{
+  if(a==="check"){const[r1,r2]=await Promise.all([post("check"),post("tsim-check")]);const[j1,j2]=await Promise.all([rj(r1),rj(r2)]);
+   const parts=[r1.ok?"Heltec: "+j1.latest_available.asset_name:"Heltec: "+friendly(j1,r1.status),r2.ok?"T-SIM: "+j2.latest_available.asset_name+(j2.latest_available.tag&&j2.latest_available.tag!=="url"?" ("+j2.latest_available.tag+")":""):"T-SIM: "+friendly(j2,r2.status)];
+   toast("Latest available. "+parts.join(" · "),r1.ok&&r2.ok?"ok":"bad");}
+  else{const r=await post(a);const j=await rj(r);if(r.status===401){location.href="/";return}
+   if(j.sent){toast(OKMSG[a],"ok");if(a==="update-latest")pending.heltec=new Date();if(a==="tsim-update")pending.tsim=new Date();}
+   else toast(friendly(j,r.status),"bad");}
+ }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
+ b.textContent=old;b.disabled=false;load();
 });
-load();setInterval(load,30000);
+load();
 </script></body></html>`;
 }
 

@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
+import worker, { computeProgress, friendlyFail, heltecImageRisk, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -47,7 +47,7 @@ const sc = r.headers.get("Set-Cookie"); assert(/HttpOnly/.test(sc) && /Secure/.t
 const cookie = sc.split(";")[0];
 const auth = (path, init = {}) => call(path, { ...init, headers: { ...(init.headers || {}), Cookie: cookie } });
 assert.equal((await auth("/d/tsim-1")).status, 200);
-assert((await (await auth("/d/tsim-1")).text()).includes("Update to latest"));
+assert((await (await auth("/d/tsim-1")).text()).includes("Update Heltec") && !(await (await auth("/d/tsim-1")).text()).includes('id="out"'));
 assert.equal((await call("/d/tsim-1")).status, 303);
 assert.equal((await call("/api/d/tsim-1/telemetry")).status, 401);
 // forged / other-device cookie
@@ -185,7 +185,7 @@ assert.equal(typeof worker.scheduled, "function");
   tel = await (await A("/api/d/rpt-b/telemetry")).json(); assert.equal(tel.powersaving.on, true);
   let pr = await P("commands", { cmd: "ver" }); assert.equal(pr.status, 409); assert((await pr.json()).error.includes("power saving"));
   assert.equal((await P("wake-cmd", {})).status, 409);
-  assert((await (await A("/d/rpt-b")).text()).includes("Console unavailable while the repeater is in power saving"));
+  assert((await (await A("/d/rpt-b")).text()).includes("console is unavailable while the repeater is in power saving"));
   await ingB({ type: "mesh", ver: "", error: "no reply from Heltec CLI" });  // v1.5.x firmware format
   tel = await (await A("/api/d/rpt-b/telemetry")).json(); assert.equal(tel.mesh.neighbors.length, 1); assert(tel.mesh.cli_asleep_at);
   assert.equal((await (await A("/api/fleet")).json()).devices.find((d) => d.id === "rpt-b").powersaving, true);
@@ -263,4 +263,32 @@ console.log("ALL TESTS PASSED");
   const r1 = await worker.fetch(new Request("https://w/login", { method: "POST", headers: { Origin: "null", "Content-Type": "application/x-www-form-urlencoded", "CF-Connecting-IP": "7.7.7.7" }, body: "device=x&password=y" }), env);
   assert.notEqual(r1.status, 403);
   console.log("ORIGIN TESTS PASSED");
+}
+
+// update progress
+{
+  const T = (m) => new Date(Date.parse("2026-10-14T20:00:00Z") + m * 60e3).toISOString();
+  const now = Date.parse(T(3));
+  const st = { tsim_update_sent: { at: T(0), asset_name: "firmware.bin", tag: "v1.6.1" }, last_update_sent: { at: T(0), asset_name: "x-upgrade.bin" } };
+  let p = computeProgress("tsim", [], st, now); assert.equal(p.state, "running"); assert.equal(p.step, 0);
+  const H = [{ type: "update", msg: "TSIM OTA: written 1 bytes to app1, rebooting", received_at: T(2) },
+    { type: "update", msg: "TSIM OTA: downloaded 1 bytes (checksum OK), writing app1", received_at: T(1.5) },
+    { type: "update", msg: "TSIM OTA start: https://x", received_at: T(1) }];
+  p = computeProgress("tsim", H, st, now); assert.equal(p.step, 4); assert.equal(p.target, "firmware.bin (v1.6.1)");
+  p = computeProgress("tsim", [{ type: "update", msg: "TSIM OTA OK: 1.6.1 running", received_at: T(3) }, ...H], st, now); assert.equal(p.state, "done"); assert.equal(p.pct, 100);
+  p = computeProgress("tsim", H, st, now + 20 * 60e3); assert.equal(p.state, "timeout"); assert(/rolled back/.test(p.reason));
+  p = computeProgress("heltec", [{ type: "update", msg: "FAIL: download", received_at: T(2) }, { type: "update", msg: "UPDATE start: https://x", received_at: T(1) }], st, now);
+  assert.equal(p.state, "failed"); assert(/downloaded/.test(p.reason));
+  p = computeProgress("heltec", [{ type: "update", msg: "SUCCESS: https://x", received_at: T(2) }, { type: "update", msg: "Download done: 9 bytes, flashing", received_at: T(1.5) }], st, now);
+  assert.equal(p.state, "done");
+  assert.equal(computeProgress("heltec", [], {}, now).state, "idle");
+  assert(/checksum/.test(friendlyFail("TSIM OTA FAIL: sha256 mismatch")));
+  const of = globalThis.fetch;
+  globalThis.fetch = async () => new Response(new Uint8Array([0xE9]), { status: 206, headers: { "Content-Range": "bytes 0-0/1171104" } });
+  assert(/Blocked for safety/.test(await heltecImageRisk("https://h/Heltec_v3_repeater-v1.17.1-d929643.bin")));
+  assert.equal(await heltecImageRisk("https://h/a-merged.bin"), null);
+  globalThis.fetch = async () => new Response(new Uint8Array([0xE9]), { status: 206, headers: { "Content-Range": "bytes 0-0/900000" } });
+  assert.equal(await heltecImageRisk("https://h/small.bin"), null);
+  globalThis.fetch = of;
+  console.log("progress tests ok");
 }
