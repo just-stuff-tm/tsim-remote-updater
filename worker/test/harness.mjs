@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { computeProgress, friendlyFail, heltecImageRisk, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
+import worker, { computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -287,6 +287,10 @@ console.log("ALL TESTS PASSED");
   globalThis.fetch = async () => new Response(new Uint8Array([0xE9]), { status: 206, headers: { "Content-Range": "bytes 0-0/1171104" } });
   assert(/Blocked for safety/.test(await heltecImageRisk("https://h/Heltec_v3_repeater-v1.17.1-d929643.bin")));
   assert.equal(await heltecImageRisk("https://h/a-merged.bin"), null);
+  assert(/Blocked/.test(await heltecImageRisk("https://h/x.bin", "tsim-updater 1.6.1")));
+  assert.equal(await heltecImageRisk("https://h/x.bin", "tsim-updater 1.6.2"), null);
+  assert.equal(await heltecImageRisk("https://h/x.bin", "tsim-updater 1.10.0"), null);
+  assert(fwAtLeast("tsim-updater 2.0.0", "1.6.2") && !fwAtLeast("tsim-updater 1.5.9", "1.6.2") && !fwAtLeast(null, "1.6.2"));
   globalThis.fetch = async () => new Response(new Uint8Array([0xE9]), { status: 206, headers: { "Content-Range": "bytes 0-0/900000" } });
   assert.equal(await heltecImageRisk("https://h/small.bin"), null);
   globalThis.fetch = of;

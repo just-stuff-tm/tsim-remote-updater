@@ -174,7 +174,7 @@ The repeater page shows firmware, last seen (with a **stale** badge after 26 hou
 
 **Firmware presets** (Heltec update source): *EasySkyMesh PowerSaving* (GitHub `IoTThinks/EasySkyMesh`, `Heltec_v3_repeater-*-upgrade.bin`) or *Stock MeshCore repeater* (a direct link to the official `meshcore-dev/MeshCore` app-only image `Heltec_v3_repeater-v<ver>-<hash>.bin`; the newest release of that repo is often a companion build, so the preset uses a direct link). Use the non-`merged` file to keep the repeater's identity.
 
-**Safety check:** T-SIM firmware up to 1.6.x decides "merged image" by file name *or* by "starts with 0xE9 and is over 1 MiB". Current app-only Heltec V3 images (EasySkyMesh `upgrade.bin` ~1.19 MB, stock MeshCore ~1.17 MB) are over 1 MiB, so they would be written at 0x0 over the Heltec's bootloader. Until the T-SIM firmware is fixed, **Update Heltec** checks the file first and refuses app-only images over 1 MiB with an explanation.
+**Safety check:** T-SIM firmware before 1.6.2 decided "merged image" by file name or by "starts with 0xE9 and is over 1 MiB", so current app-only Heltec V3 images (EasySkyMesh `upgrade.bin` ~1.19 MB, stock MeshCore ~1.17 MB) would be written at 0x0 over the Heltec's bootloader. From 1.6.2 the T-SIM ignores the file name: an image is merged only if it has a partition table (0xAA 0x50) at 0x8000 (or an app header at 0x10000 after an erased gap) and goes to 0x0; an app-only image (0xE9 at offset 0) goes to 0x10000; anything else is refused. While a device reports T-SIM firmware older than 1.6.2, **Update Heltec** checks the file first and refuses app-only images over 1 MiB.
 
 ## SMS commands (what the Worker sends)
 
