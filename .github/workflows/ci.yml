@@ -1,5 +1,9 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
 jobs:
   worker:
     runs-on: ubuntu-latest
@@ -20,10 +24,35 @@ jobs:
           path: ~/.platformio
           key: pio-${{ hashFiles('firmware/platformio.ini') }}
       - run: pip install platformio
+      # No include/config.h in CI: the build uses config.example.h placeholders. Such a firmware.bin is
+      # meant for OTA onto a T-SIM already running >= 1.6.0, which keeps its real config in NVS.
       - run: pio run
         working-directory: firmware
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          B=firmware/.pio/build/tsim7672g
+          cp $B/firmware.bin $B/bootloader.bin $B/partitions.bin dist/
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin dist/
+          (cd dist && sha256sum firmware.bin > firmware.bin.sha256 && cat firmware.bin.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: tsim-firmware
-          path: |
-            firmware/.pio/build/tsim7672g/*.bin
+          path: dist/*
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [worker, firmware]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: tsim-firmware, path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/firmware.bin
+            dist/firmware.bin.sha256
+            dist/bootloader.bin
+            dist/partitions.bin
+            dist/boot_app0.bin

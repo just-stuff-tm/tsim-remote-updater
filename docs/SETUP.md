@@ -100,6 +100,8 @@ esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash -z \
 
 Tap **RST** once (without BOOT) to start it. `pio device monitor` shows the boot log for 2 minutes before it sleeps.
 
+After this first USB flash (v1.6.0+ with the OTA partition table), later T-SIM firmware updates can be done from the dashboard (**T-SIM firmware update** → **Update T-SIM firmware**). Your config is kept in the board's NVS. If the new firmware can't reach the dashboard after booting, it rolls back on its own.
+
 ## 7. First test
 
 Wait ~30 s after RST, open your Worker URL, log in, press **Request status**. Within 1–2 minutes you should see signal, battery and a mesh snapshot.
@@ -110,6 +112,8 @@ Wait ~30 s after RST, open your Worker URL, log in, press **Request status**. Wi
 |---|---|
 | T-SIM battery shows 0 V | Normal while USB is connected (board design). Unplug USB. |
 | Console / mesh stats "paused (power saving)" | Repeater power-saving modes (e.g. EasySkyMesh `powersaving on`) sleep the Heltec's serial CLI. Repeater stats are still available over the mesh with MeshCore remote admin; T-SIM stats still come via Request status. `powersaving off` (from remote admin) re-enables it. |
+| T-SIM OTA says "no OTA partition" | The board still has the old single-app partition table. Do one USB flash of all four files from a ≥1.6.0 build. |
+| T-SIM OTA rolled back | The new firmware booted but couldn't post to `/ingest` (wrong config, no signal). Check the boot log over USB; a placeholder build needs NVS config from a correctly configured ≥1.6.0 USB flash. |
 | Text arrives but T-SIM ignores it | Some carriers deliver SMS as UCS2 hex. Firmware ≥1.5.1 decodes it automatically; update the firmware. |
 | Firmware download from GitHub fails (TLS) | GitHub sends 16 KB TLS records; the patched ESP_SSLClient in `firmware/patches/` uses a 16 KB receive buffer. Make sure `apply_patches.py` ran (clean build: `pio run -t clean && pio run`). |
 | Dashboard says Hologram 403 / invalid key | The `HOLOGRAM_API_KEY` secret is wrong. Re-enter it with `wrangler secret put` or the Cloudflare dashboard (paste exactly, no spaces). |

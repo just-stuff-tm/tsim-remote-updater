@@ -18,6 +18,7 @@ You are building and deploying this project for a human. Human-oriented steps ar
 6. Copy `config.example.h` → `config.h`, fill in, `pio run`.
 7. Hardware steps need the human: wiring, putting the T-SIM in download mode (hold BOOT, tap RST, release BOOT), and tapping RST after flashing. Ask and wait.
 8. Flash (`pio run -t upload` or esptool, offsets in SETUP.md), then ask the human to press Request status.
+9. T-SIM firmware updates after that: changing `partitions.csv` always needs a USB flash. Otherwise use the dashboard's **Update T-SIM firmware** (GitHub release `firmware.bin` from CI, or a URL + checksum). Prefer giving a SHA-256. Confirm afterwards that the activity log shows `TSIM OTA OK` and the new version; a rollback shows the old version again.
 
 ## Never
 - Never commit or paste into public places: passwords, ADMIN_TOKEN, SESSION_SECRET, ingest keys, Hologram key/device ids, phone numbers, emails, Cloudflare account/KV ids, the workers.dev subdomain. `config.h` is gitignored; keep it that way.
@@ -33,4 +34,5 @@ You are building and deploying this project for a human. Human-oriented steps ar
 - [ ] T-SIM boot log: modem registered, no errors
 - [ ] After Request status, fresh telemetry appears within ~2 min
 - [ ] Check for update shows the latest release and sends nothing
+- [ ] Check T-SIM firmware shows the latest release (with checksum) and sends nothing
 - [ ] `git grep` for every secret value returns nothing before any push
