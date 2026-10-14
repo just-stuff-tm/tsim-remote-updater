@@ -47,7 +47,7 @@ const sc = r.headers.get("Set-Cookie"); assert(/HttpOnly/.test(sc) && /Secure/.t
 const cookie = sc.split(";")[0];
 const auth = (path, init = {}) => call(path, { ...init, headers: { ...(init.headers || {}), Cookie: cookie } });
 assert.equal((await auth("/d/tsim-1")).status, 200);
-assert((await (await auth("/d/tsim-1")).text()).includes("Update Heltec") && !(await (await auth("/d/tsim-1")).text()).includes('id="out"'));
+assert((await (await auth("/d/tsim-1")).text()).includes("Update radio firmware") && (await (await auth("/d/tsim-1")).text()).includes(">LoRa radio<") && !(await (await auth("/d/tsim-1")).text()).includes('id="out"'));
 assert.equal((await call("/d/tsim-1")).status, 303);
 assert.equal((await call("/api/d/tsim-1/telemetry")).status, 401);
 // forged / other-device cookie

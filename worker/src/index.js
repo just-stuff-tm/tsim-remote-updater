@@ -821,6 +821,9 @@ ol.steps li.bad{color:var(--bad);font-weight:600}ol.steps li.bad:before{content:
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);max-width:min(560px,92vw);padding:12px 16px;border-radius:10px;color:#fff;background:#1f2328;box-shadow:0 6px 24px #0005;z-index:9;font-size:14px}
 #toast.ok{background:var(--ok)}#toast.bad{background:var(--bad)}.msg{font-size:13px;margin-left:6px}.msg.bad{color:var(--bad)}.msg.ok{color:var(--ok)}
 .fc .row b{font-size:16px}.mini{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.tabs{position:sticky;top:53px;z-index:4;display:flex;gap:4px;overflow-x:auto;padding:0 12px;background:var(--card);border-bottom:1px solid var(--line)}
+.tabs button{background:none;color:var(--mut);border-radius:0;padding:12px 14px;border-bottom:2px solid transparent;white-space:nowrap}.tabs button.on{color:var(--acc);border-bottom-color:var(--acc)}
+.pane>section:first-of-type{margin-top:14px}
 @media(max-width:600px){main{padding:10px}header{padding:8px 10px}.acts{grid-template-columns:1fr 1fr}td,th{padding:6px 5px}}`;
 
 const HEAD = (title) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${CSS}</style></head>`;
@@ -841,7 +844,7 @@ function friendly(j,status){const x=String((j&&(j.error||(j.hologram_response_su
  if(/Hologram|HOLOGRAM/.test(x))return"The text couldn't be sent: the SMS service (Hologram) rejected it. Check the Hologram API key and the SIM's status.";
  if(/hologram_device_id/.test(x))return"This T-SIM has no SIM device id set up, so it can't be texted.";
  if(/GitHub|no upgrade asset|not found/.test(x))return"Couldn't find a firmware file at the update source. Check the repo and file name in Settings.";
- if(/disabled/.test(x))return"No update source is set. Choose one in Settings › Heltec update source.";
+ if(/disabled/.test(x))return"No update source is set. Choose one under LoRa radio › Settings › Firmware update source.";
  if(/bad origin/.test(x))return"Security check failed. Reload the page and try again.";
  if(/power saving/.test(x))return"The repeater is in power saving, so its console isn't available right now.";
  if(status>=500||!x)return"Something went wrong. Please try again in a minute.";return x}`;
@@ -885,26 +888,28 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
   return `${HEAD(dev.name)}
 <body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
+<nav class="tabs" id="tabs"><button type="button" data-t="ov">Overview</button><button type="button" data-t="radio">LoRa radio</button><button type="button" data-t="tsim">T-SIM</button><button type="button" data-t="act">Activity</button></nav>
 <main>
+<div class="pane" id="t-ov">
 <div class="acts">
 <button data-a="status" data-c="Text the T-SIM to wake it? It reads the repeater and reports here within about 2 minutes.">Request status</button>
-<button data-a="check" data-c="">Check for updates</button>
-<button data-a="update-latest" class="w" data-c="Update the Heltec repeater to the latest firmware? It will be reflashed and restart.">Update Heltec</button>
-<button data-a="tsim-update" class="w" data-c="Update the T-SIM's own firmware? It downloads, installs and restarts. If the new firmware can't check in, it rolls back automatically.">Update T-SIM</button>
-<button data-a="reboot" class="g" data-c="Restart the Heltec repeater?">Reboot Heltec</button>
+<button data-a="check" data-c="" class="g">Check for updates</button>
+</div>
+<div class="mini" id="ov-prog"></div>
+<div class="grid" style="margin-top:12px">
+<div class="card"><h3>LoRa radio</h3><div id="ov-radio"></div><p class="small"><a href="#radio">Open LoRa radio ›</a></p></div>
+<div class="card"><h3>T-SIM</h3><div id="ov-tsim"></div><p class="small"><a href="#tsim">Open T-SIM ›</a></p></div>
+</div>
+<p class="small mut">One text per minute per T-SIM. After a text, the T-SIM wakes and reports here within a few minutes.</p>
 </div>
 
-<section><h2>Overview</h2><div class="grid">
-<div class="card"><h3>T-SIM</h3><div id="c-tsim"></div></div>
-<div class="card"><h3>Power</h3><div id="c-power"></div></div>
-<div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
-</div></section>
-
-<section><h2>Updates</h2><div class="grid">
-<div class="card"><h3>Heltec repeater firmware</h3><div id="c-upd"></div><div id="p-heltec"></div></div>
-<div class="card"><h3>T-SIM firmware</h3><div id="c-tsimfw"></div><div id="p-tsim"></div></div>
-</div></section>
-
+<div class="pane" id="t-radio" hidden>
+<div class="acts">
+<button data-a="update-latest" class="w" data-c="Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.">Update radio firmware</button>
+<button data-a="reboot" class="g" data-c="Restart the LoRa radio (repeater)?">Reboot radio</button>
+<button data-a="check" data-c="" class="g">Check for updates</button>
+</div>
+<section><h2>Firmware</h2><div class="card"><div id="c-upd"></div><div id="p-heltec"></div></div></section>
 <section><h2>Mesh <small class="mut small" id="meshat"></small></h2>
 <p class="psnote" id="meshps" hidden>Mesh polling is paused: the repeater is in power saving and its serial CLI isn't answering. Showing the last snapshot taken while it was awake. It resumes automatically when a status check gets a CLI reply. ${PS_HTML}</p>
 <div class="grid" id="meshgrid">
@@ -913,9 +918,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Packets</h3><div id="m-pkt"></div></div>
 </div>
 <div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
-
 <section><h2>Settings</h2>
-<details class="card" id="srcbox"><summary><b>Heltec update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
+<details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
 <label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
 <p class="small mut" id="presetnote"></p>
 <form id="srcf">
@@ -924,22 +928,6 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label>File name pattern (* = anything)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
 <label>Direct link (used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
-
-<details class="card" id="tsimbox"><summary><b>T-SIM firmware source</b><small id="tsimsum" class="mut"></small></summary><div class="in">
-<p class="small mut">Needs T-SIM firmware 1.6.0 or newer. The T-SIM downloads the file, checks it, installs it in its spare slot and restarts. If the new firmware can't check in, it rolls back on its own.</p>
-<form id="tsimf">
-<label>Source<select name="mode"><option value="github">Latest GitHub release</option><option value="url">Direct link</option></select></label>
-<label>GitHub repo (owner/name)<input name="repo" placeholder="just-stuff-tm/tsim-remote-updater"></label>
-<label>Release file name<input name="asset" placeholder="firmware.bin"></label>
-<label>Direct link<input name="url" placeholder="https://.../firmware.bin"></label>
-<label>Checksum (optional; GitHub's own checksum is used if empty)<input name="checksum" placeholder="sha256:..."></label>
-<button type="submit">Save</button><span id="tsimmsg" class="msg"></span></form></div></details>
-
-<details class="card" id="schbox"><summary><b>Scheduled check</b><small id="schsum" class="mut"></small></summary><div class="in">
-<p class="small mut">Optional. Texts the T-SIM on this interval so readings stay fresh. Each check uses one incoming text and a little battery.</p>
-<select id="sch"><option value="0">Off</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Daily</option><option value="168">Weekly</option></select>
-<button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
-
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
@@ -949,10 +937,42 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="row small" style="margin:8px 0"><span id="conmsg" class="msg"></span><span><button type="button" id="wake" class="g sm">Wake to run queued</button> <button type="button" id="cancel" class="g sm">Cancel queued</button></span></div>
 <div class="tw"><table><thead><tr><th>Command</th><th>Status</th><th>Reply</th></tr></thead><tbody id="cmds"></tbody></table></div></div></div></details>
 </section>
+</div>
 
-<section><details class="card"><summary><b>Activity</b><small class="mut">recent events</small></summary><div class="in tw">
-<table><thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody id="log"></tbody></table></div></details>
-<p class="small mut">One text per minute per T-SIM. After a text, the T-SIM wakes and reports here within a few minutes.</p></section>
+<div class="pane" id="t-tsim" hidden>
+<div class="acts">
+<button data-a="status" data-c="Text the T-SIM to wake it? It reads the repeater and reports here within about 2 minutes.">Request status</button>
+<button data-a="tsim-update" class="w" data-c="Update the T-SIM's own firmware? It downloads, installs and restarts. If the new firmware can't check in, it rolls back automatically.">Update T-SIM firmware</button>
+<button data-a="check" data-c="" class="g">Check for updates</button>
+</div>
+<section><h2>Firmware</h2><div class="card"><div id="c-tsimfw"></div><div id="p-tsim"></div></div></section>
+<section><h2>Telemetry</h2><div class="grid">
+<div class="card"><h3>Device</h3><div id="c-tsim"></div></div>
+<div class="card"><h3>Power</h3><div id="c-power"></div></div>
+<div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
+</div></section>
+<section><h2>Settings</h2>
+<details class="card" id="tsimbox"><summary><b>T-SIM firmware source</b><small id="tsimsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Needs T-SIM firmware 1.6.0 or newer. The T-SIM downloads the file, checks it, installs it in its spare slot and restarts. If the new firmware can't check in, it rolls back on its own.</p>
+<form id="tsimf">
+<label>Source<select name="mode"><option value="github">Latest GitHub release</option><option value="url">Direct link</option></select></label>
+<label>GitHub repo (owner/name)<input name="repo" placeholder="just-stuff-tm/tsim-remote-updater"></label>
+<label>Release file name<input name="asset" placeholder="firmware.bin"></label>
+<label>Direct link<input name="url" placeholder="https://.../firmware.bin"></label>
+<label>Checksum (optional; GitHub's own checksum is used if empty)<input name="checksum" placeholder="sha256:..."></label>
+<button type="submit">Save</button><span id="tsimmsg" class="msg"></span></form></div></details>
+<details class="card" id="schbox"><summary><b>Scheduled check</b><small id="schsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Optional. Texts the T-SIM on this interval so readings stay fresh. Each check uses one incoming text and a little battery.</p>
+<select id="sch"><option value="0">Off</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Daily</option><option value="168">Weekly</option></select>
+<button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
+<details class="card"><summary><b>Login &amp; password</b><small class="mut">dashboard access</small></summary><div class="in">
+<p class="small mut">Each T-SIM has its own dashboard password; fleet logins open several. Passwords are changed by the owner with the admin API (<code>/admin/devices/&lt;id&gt;/reset-password</code>), see docs/SETUP.md. The T-SIM's upload key is separate and never shown here.</p></div></details>
+</section>
+</div>
+
+<div class="pane" id="t-act" hidden>
+<div class="card tw"><table><thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody id="log"></tbody></table></div>
+</div>
 </main><div id="toast" hidden></div>
 <script>${COMMON_JS}
 const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
@@ -999,6 +1019,9 @@ async function load(){
  $("consum").textContent=S.console_enabled?"on":"off";
  if(first){$("sch").value=String(S.schedule_hours||0);$("conon").checked=!!S.console_enabled;first=false}
  const PS=!!(d.powersaving&&d.powersaving.on);
+ $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+(PS?'<span class="badge mut">Power saving</span>':'');
+ $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
+ $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
  if(PS)$("consum").textContent="paused (power saving)";
@@ -1039,7 +1062,7 @@ $("conf").onsubmit=ev=>{ev.preventDefault();queue(false)};$("qwake").onclick=()=
 $("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("conmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load();};
 $("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await rj(r);say("conmsg",r.ok,r.ok?"Cancelled "+j.cancelled+" queued command"+(j.cancelled==1?"":"s"):friendly(j,r.status));load();};
 const OKMSG={status:"Text sent. The T-SIM will wake and report within ~2 minutes.",reboot:"Text sent. The Heltec will restart when the T-SIM wakes (~2 minutes).",
- "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it under Updates.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it under Updates."};
+ "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it on the LoRa radio tab.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it on the T-SIM tab."};
 document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
  const a=b.dataset.a;if(b.dataset.c&&!confirm(b.dataset.c))return;
  b.disabled=true;const old=b.textContent;b.textContent="Working…";
@@ -1053,6 +1076,10 @@ document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
  }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  b.textContent=old;b.disabled=false;load();
 });
+function tab(){const k=(location.hash||"#ov").slice(1),v=["ov","radio","tsim","act"].includes(k)?k:"ov";
+ document.querySelectorAll(".pane").forEach(p=>p.hidden=p.id!=="t-"+v);document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===v))}
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{history.replaceState(null,"","#"+b.dataset.t);tab();scrollTo(0,0)});
+addEventListener("hashchange",tab);tab();
 load();
 </script></body></html>`;
 }
