@@ -10,13 +10,43 @@
 #include <stdarg.h>
 
 #include <ESP_SSLClient.h>
-
 #include "board.h"
+#include <Update.h>
+#include <Preferences.h>
+#include <esp_ota_ops.h>
+#include <mbedtls/sha256.h>
 #include "esp_loader.h"
 #include "arduino_port.h"
 #include "modem_tcp.h"
 
 SET_LOOP_TASK_STACK_SIZE(24 * 1024);
+
+// Runtime config (v1.6.0): compiled-in values from include/config.h are saved to NVS; a build with the
+// public placeholders (e.g. a GitHub release firmware.bin) loads them from NVS, so OTA keeps the config.
+static char g_worker_url[160], g_device_id[40], g_device_key[80], g_apn[48], g_ingest_url[220], g_key_hdr[100];
+static void loadConfig() {
+  bool placeholder = strstr(DEVICE_KEY, "REPLACE") || strstr(WORKER_URL, "YOUR-SUBDOMAIN");
+  Preferences p; p.begin("tsimcfg", false);
+  if (!placeholder) {
+    strncpy(g_worker_url, WORKER_URL, sizeof(g_worker_url) - 1); strncpy(g_device_id, DEVICE_ID, sizeof(g_device_id) - 1);
+    strncpy(g_device_key, DEVICE_KEY, sizeof(g_device_key) - 1); strncpy(g_apn, APN, sizeof(g_apn) - 1);
+    if (p.getString("url", "") != g_worker_url || p.getString("id", "") != g_device_id || p.getString("key", "") != g_device_key || p.getString("apn", "") != g_apn) {
+      p.putString("url", g_worker_url); p.putString("id", g_device_id); p.putString("key", g_device_key); p.putString("apn", g_apn);
+      Serial.println("config: saved compiled config to NVS");
+    }
+  } else if (p.getString("key", "").length()) {
+    p.getString("url", g_worker_url, sizeof(g_worker_url)); p.getString("id", g_device_id, sizeof(g_device_id));
+    p.getString("key", g_device_key, sizeof(g_device_key)); p.getString("apn", g_apn, sizeof(g_apn));
+    Serial.println("config: placeholder build, using config from NVS");
+  } else {
+    strncpy(g_worker_url, WORKER_URL, sizeof(g_worker_url) - 1); strncpy(g_device_id, DEVICE_ID, sizeof(g_device_id) - 1);
+    strncpy(g_device_key, DEVICE_KEY, sizeof(g_device_key) - 1); strncpy(g_apn, APN, sizeof(g_apn) - 1);
+    Serial.println("config: WARNING placeholder build and no NVS config - set include/config.h and flash over USB");
+  }
+  p.end();
+  snprintf(g_ingest_url, sizeof(g_ingest_url), "%s/ingest/%s", g_worker_url, g_device_id);
+  snprintf(g_key_hdr, sizeof(g_key_hdr), "X-Device-Key: %s", g_device_key);
+}
 
 static HardwareSerial ModemSerial(1);
 static HardwareSerial HeltecSerial(2);
@@ -309,8 +339,9 @@ static void modemEnableSleep() {
 
 static bool modemOpenData() {
   if (s_pdp_up) { logf("PDP: already up"); return true; }
-  logf("PDP: activating APN=%s", APN);
-  modemAT("AT+CGDCONT=1,\"IP\",\"" APN "\"");
+  logf("PDP: activating APN=%s", g_apn);
+  snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CGDCONT=1,\"IP\",\"%s\"", g_apn);
+  modemAT(s_cmdbuf);
   bool ok = modemAT("AT+CGACT=1,1", 60000);
   delay(1500);
   modemAT("AT+CGPADDR=1", 5000);
@@ -604,7 +635,7 @@ static int clientReadExact(Client &c, uint8_t *buf, int len, uint32_t timeout_ms
 // Fallback: POST over ESP32 TLS (BearSSL, SNI) on a raw modem socket — same path that downloads from GitHub.
 static bool ingestPostTls(const char *json) {
   UrlParts u;
-  if (!parseUrl(INGEST_URL, u)) return false;
+  if (!parseUrl(g_ingest_url, u)) return false;
   if (!ModemTcpClient::netOpen(ModemSerial)) { logf("ingest-tls: NETOPEN failed"); return false; }
   ModemTcpClient tcp(ModemSerial, 0);
   ESP_SSLClient ssl;
@@ -618,7 +649,7 @@ static bool ingestPostTls(const char *json) {
     size_t n = strlen(json);
     ssl.printf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tsim-updater/1.5.0\r\n"
                "Content-Type: application/json\r\nX-Device-Key: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-               u.path, u.host, DEVICE_KEY, (unsigned)n);
+               u.path, u.host, g_device_key, (unsigned)n);
     ssl.write((const uint8_t *)json, n);
     ssl.flush();
     char line[160];
@@ -635,10 +666,16 @@ static bool ingestPostTls(const char *json) {
   return ok;
 }
 
-static bool ingestSend(const char *json) {
-  if (modemHttpPost(INGEST_URL, "application/json", "X-Device-Key: " DEVICE_KEY, json)) return true;
+static void markOtaValidIfPending(const char *why);
+static bool ingestSendRaw(const char *json) {
+  if (modemHttpPost(g_ingest_url, "application/json", g_key_hdr, json)) return true;
   logf("ingest: modem HTTPS failed, trying ESP32 TLS");
   return ingestPostTls(json);
+}
+static bool ingestSend(const char *json) {
+  bool ok = ingestSendRaw(json);
+  if (ok) markOtaValidIfPending("ingest accepted");
+  return ok;
 }
 
 // -------------------- Heltec MeshCore CLI + mesh snapshot + console (v1.5.0) --------------------
@@ -755,7 +792,7 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
   int st = -1;
   if (ssl.connect(u.host, u.port)) {
     ssl.printf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tsim-updater/1.5.0\r\nX-Device-Key: %s\r\nConnection: close\r\n\r\n",
-               u.path, u.host, DEVICE_KEY);
+               u.path, u.host, g_device_key);
     ssl.flush();
     char line[200];
     if (clientReadLine(ssl, line, sizeof(line), 20000) >= 0) sscanf(line, "HTTP/%*d.%*d %d", &st);
@@ -794,8 +831,10 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
 }
 
 // CMD wake: pull queued console commands from the Worker, run each on the Heltec CLI, post outputs.
+static bool doTsimUpdate(const char *args);
 static void doConsoleCommands(void) {
-  int st = httpsGetTls(WORKER_URL "/api/dev/" DEVICE_ID "/commands", s_cmd_list, sizeof(s_cmd_list));
+  static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands", g_worker_url, g_device_id);
+  int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
   if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return; }
   int ran = 0;
   char *save = nullptr;
@@ -804,14 +843,25 @@ static void doConsoleCommands(void) {
     if (!tab) continue;
     *tab = 0;
     char id[20]; strncpy(id, line, sizeof(id) - 1); id[sizeof(id) - 1] = 0;
-    char cmd[128]; strncpy(cmd, tab + 1, sizeof(cmd) - 1); cmd[sizeof(cmd) - 1] = 0;
+    static char cmd[480]; strncpy(cmd, tab + 1, sizeof(cmd) - 1); cmd[sizeof(cmd) - 1] = 0;
     trimInPlace(cmd);
     bool clean = cmd[0] != 0;
     for (char *q = cmd; *q; q++) if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e) clean = false;
     bool ok = false;
+    static char ec[960], ei[40];
+    if (clean && strncasecmp(cmd, "TSIMUPDATE ", 11) == 0) {  // T-SIM self-update (Worker system command, not a Heltec CLI command)
+      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"T-SIM OTA starting\"}", FW_VERSION, ei, ec);
+      ingestSendBig(s_mesh_body);
+      heltecCliEnd();
+      static char a[480]; strncpy(a, cmd + 11, sizeof(a) - 1); a[sizeof(a) - 1] = 0;
+      doTsimUpdate(a);  // reboots on success
+      ran++;
+      continue;
+    }
     if (clean) ok = heltecCli(cmd, s_cli_out, sizeof(s_cli_out), 8000);
     else strcpy(s_cli_out, "");
-    static char eo[CLI_OUT_MAX * 2], ec[260], ei[40];
+    static char eo[CLI_OUT_MAX * 2];
     jsonEsc(eo, sizeof(eo), s_cli_out); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
     snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"%s\"%s}",
              FW_VERSION, ei, ec, eo, !clean ? ",\"error\":\"rejected by T-SIM\"" : (ok ? "" : ",\"error\":\"no reply from Heltec\""));
@@ -1269,6 +1319,118 @@ static bool httpDownloadToFile(const char *url, const char *path) {
   return false;
 }
 
+// -------------------- T-SIM self-update (OTA, v1.6.0) --------------------
+// TSIMUPDATE <url> [sha256:<64 hex>|md5:<32 hex>]
+// Download -> LittleFS (same TLS/redirect path as Heltec images) -> verify size/hash -> Update (inactive
+// OTA slot, image check) -> set boot partition -> reboot. The new app stays PENDING_VERIFY until it has
+// posted to /ingest after the modem comes up (markOtaValidIfPending); otherwise it rolls back.
+#define TSIM_FW_PATH "/tsim.bin"
+extern "C" bool verifyRollbackLater() { return true; }  // we confirm the app ourselves (after ingest)
+
+static bool otaPendingVerify() {
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  return run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+static void markOtaValidIfPending(const char *why) {
+  if (!otaPendingVerify()) return;
+  esp_ota_mark_app_valid_cancel_rollback();
+  logf("OTA: new app marked VALID (%s)", why);
+  char m[120]; snprintf(m, sizeof(m), "TSIM OTA OK: %s running (%s)", FW_VERSION, why);
+  ingestEvent("update", m);
+}
+static void rollbackIfPending(const char *why) {
+  if (!otaPendingVerify()) return;
+  logf("OTA: app NOT verified (%s) -> rollback + reboot", why);
+  Serial.flush(); delay(100);
+  esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
+static bool fileHash(const char *path, bool sha, char *hexout) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  uint8_t out[32];
+  if (sha) {
+    mbedtls_sha256_context c; mbedtls_sha256_init(&c); mbedtls_sha256_starts(&c, 0);
+    while (f.available()) { size_t n = f.read(s_flash_block, sizeof(s_flash_block)); if (!n) break; mbedtls_sha256_update(&c, s_flash_block, n); }
+    mbedtls_sha256_finish(&c, out); mbedtls_sha256_free(&c);
+  } else {
+    MD5Builder md5; md5.begin();
+    while (f.available()) { size_t n = f.read(s_flash_block, sizeof(s_flash_block)); if (!n) break; md5.add(s_flash_block, n); }
+    md5.calculate(); md5.getBytes(out);
+  }
+  f.close();
+  int n = sha ? 32 : 16;
+  for (int i = 0; i < n; i++) sprintf(hexout + i * 2, "%02x", out[i]);
+  hexout[n * 2] = 0;
+  return true;
+}
+
+static void tsimReport(const char *fmt, ...) {
+  char m[200]; va_list ap; va_start(ap, fmt); vsnprintf(m, sizeof(m), fmt, ap); va_end(ap);
+  setLastResult("%s", m);
+  logf("%s", m);
+  ingestEvent("update", m);
+}
+
+// Returns only on failure (success reboots).
+static bool doTsimUpdate(const char *args) {
+  static char url[URL_MAX]; char hash[80] = "";
+  const char *sp = strchr(args, ' ');
+  size_t ul = sp ? (size_t)(sp - args) : strlen(args);
+  if (ul >= sizeof(url)) ul = sizeof(url) - 1;
+  memcpy(url, args, ul); url[ul] = 0;
+  if (sp) { while (*sp == ' ') sp++; strncpy(hash, sp, sizeof(hash) - 1); trimInPlace(hash); }
+  for (char *q = hash; *q; q++) *q = tolower((unsigned char)*q);
+  bool want_sha = strncmp(hash, "sha256:", 7) == 0, want_md5 = strncmp(hash, "md5:", 4) == 0;
+  const char *want = want_sha ? hash + 7 : (want_md5 ? hash + 4 : "");
+  if (hash[0] && !((want_sha && strlen(want) == 64) || (want_md5 && strlen(want) == 32))) { tsimReport("TSIM OTA FAIL: bad checksum '%.40s'", hash); return false; }
+  if (!(strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0)) { tsimReport("TSIM OTA FAIL: bad url"); return false; }
+  const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+  if (!next) { tsimReport("TSIM OTA FAIL: no OTA partition (needs the v1.6.0 partition table via USB)"); return false; }
+
+  s_busy_update = true;
+  tsimReport("TSIM OTA start: %.150s", url);
+  if (!modemWaitNetwork(60000) || !modemOpenData()) { tsimReport("TSIM OTA FAIL: no network"); s_busy_update = false; return false; }
+  LittleFS.remove(TSIM_FW_PATH);
+  bool dl = httpDownloadToFile(url, TSIM_FW_PATH);
+  s_tcp_busy = false;
+  pendingFlush();
+  File f = LittleFS.open(TSIM_FW_PATH, "r");
+  size_t size = f ? f.size() : 0;
+  if (!dl || !f || size < 64 * 1024) { if (f) f.close(); tsimReport("TSIM OTA FAIL: download (%u bytes)", (unsigned)size); LittleFS.remove(TSIM_FW_PATH); s_busy_update = false; return false; }
+  uint8_t magic = f.peek(); f.close();
+  if (magic != 0xE9) { tsimReport("TSIM OTA FAIL: not an ESP32 app image (0x%02x)", magic); LittleFS.remove(TSIM_FW_PATH); s_busy_update = false; return false; }
+  if (size > next->size) { tsimReport("TSIM OTA FAIL: image %u > slot %u", (unsigned)size, (unsigned)next->size); LittleFS.remove(TSIM_FW_PATH); s_busy_update = false; return false; }
+  if (want[0]) {
+    char got[65];
+    if (!fileHash(TSIM_FW_PATH, want_sha, got) || strcmp(got, want) != 0) {
+      tsimReport("TSIM OTA FAIL: %s mismatch (got %.16s…)", want_sha ? "sha256" : "md5", got);
+      LittleFS.remove(TSIM_FW_PATH); s_busy_update = false; return false;
+    }
+    logf("TSIM OTA: %s OK", want_sha ? "sha256" : "md5");
+  }
+  { char m[120]; snprintf(m, sizeof(m), "TSIM OTA: downloaded %u bytes%s, writing %s", (unsigned)size, want[0] ? " (checksum OK)" : "", next->label); ingestEvent("update", m); }
+  f = LittleFS.open(TSIM_FW_PATH, "r");
+  bool ok = Update.begin(size, U_FLASH);
+  size_t wr = 0;
+  while (ok && f.available()) {
+    size_t n = f.read(s_flash_block, sizeof(s_flash_block));
+    if (!n) break;
+    if (Update.write(s_flash_block, n) != n) ok = false; else wr += n;
+  }
+  f.close();
+  LittleFS.remove(TSIM_FW_PATH);
+  if (ok) ok = (wr == size) && Update.end(true);  // end(): verifies the app image, sets boot partition
+  else Update.abort();
+  if (!ok) { tsimReport("TSIM OTA FAIL: write/verify (%s)", Update.errorString()); s_busy_update = false; return false; }
+  tsimReport("TSIM OTA: written %u bytes to %s, rebooting (new app must check in or it rolls back)", (unsigned)size, next->label);
+  modemCloseData();
+  Serial.flush(); delay(500);
+  ESP.restart();
+  return true;
+}
+
 // -------------------- flash --------------------
 static bool isMergedImage(File &f, const char *url) {
   if (url && (strstr(url, "-merged") || strstr(url, "merged") || strstr(url, "factory") ||
@@ -1442,12 +1604,12 @@ static void doStatusReport(void) {
   snprintf(s_text_body, sizeof(s_text_body),
     "%s | %s\nbat=%.2fV (%d%%) solar=%.2fV\n%s\n%s\n%s\n%s\n%s\nmodem: %.80s\n"
     "uptime=%lus wake=%d heap=%u\nLittleFS free=%u/%u\nlast: %s\n"
-    "APN=%s awake=%lus cmds=REBOOT|UPDATE|STATUS|CMD|TESTDL",
+    "APN=%s awake=%lus cmds=REBOOT|UPDATE|TSIMUPDATE|STATUS|CMD|TESTDL",
     FW_VERSION, FW_BUILD_DATE, bat, batPercent(bat), sol,
     csq, cpsi, cops, cereg, ip, cgmr,
     (unsigned long)(millis()/1000UL), (int)s_wake_cause, (unsigned)ESP.getFreeHeap(),
     (unsigned)(tot - used), (unsigned)tot, s_last_result,
-    APN, (unsigned long)(AWAKE_WINDOW_MS/1000UL));
+    g_apn, (unsigned long)(AWAKE_WINDOW_MS/1000UL));
   Serial.println(s_text_body);
   {
     int csqv = -1, rsrq = 0, rsrp = 0, reg = -1;
@@ -1492,7 +1654,7 @@ static bool doUpdate(const char *url, bool flash_too) {
     progressf("UPDATE", "x", 5, "FAIL: PDP down");
     s_busy_update = false; return false;
   }
-  progressf("UPDATE", "signal_strength", 3, "PDP up APN=%s", APN);
+  progressf("UPDATE", "signal_strength", 3, "PDP up APN=%s", g_apn);
 
   bool dl = httpDownloadToFile(url, FW_PATH);
   s_tcp_busy = false;
@@ -1557,6 +1719,11 @@ static bool handleCommand(const char *from, const char *body) {
   if (strcasecmp(s_cmdbuf, "REBOOT") == 0) {
     heltecReboot();
     { progressf("REBOOT", "arrows_counterclockwise", 3, "REBOOT done"); ingestEvent("reboot", "REBOOT done"); }
+    return true;
+  }
+  if (strncasecmp(s_cmdbuf, "TSIMUPDATE ", 11) == 0) {
+    static char a[URL_MAX + 100]; strncpy(a, s_cmdbuf + 11, sizeof(a) - 1); a[sizeof(a) - 1] = 0;
+    doTsimUpdate(a);
     return true;
   }
   if (strncasecmp(s_cmdbuf, "UPDATE ", 7) == 0) {
@@ -1696,6 +1863,7 @@ static void processSmsInbox() {
 
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  rollbackIfPending("no successful ingest before sleep");
   logf("Deep sleep; RI GPIO%d LOW", MODEM_RI_PIN);
   heltecPinsRelease();
   modemEnableSleep();
@@ -1733,12 +1901,13 @@ static void handleUsbLine(char *line) {
     doUpdate(u, false); return;
   }
   if (strncasecmp(line, "UPDATE ", 7) == 0) { handleCommand("USB", line); return; }
+  if (strncasecmp(line, "TSIMUPDATE ", 11) == 0) { handleCommand("USB", line); return; }
   if (strncasecmp(line, "AT", 2) == 0) {
     const char *cmd = line;
     if (line[2] == ' ') { cmd = line + 3; while (*cmd && isspace((unsigned char)*cmd)) cmd++; }
     modemAT(cmd, 15000); return;
   }
-  logf("USB: AT|REBOOT|UPDATE|TESTDL|STATUS|MESH|CMD|CLI <cmd>|LASTLOG|SLEEP|STAY");
+  logf("USB: AT|REBOOT|UPDATE|TSIMUPDATE|TESTDL|STATUS|MESH|CMD|CLI <cmd>|LASTLOG|SLEEP|STAY");
 }
 
 static void interactiveWindow(uint32_t window_ms) {
@@ -1784,7 +1953,9 @@ void setup() {
   logf("=== %s ===", FW_VERSION);
   logf("Built: %s", FW_BUILD_DATE);
   logf("Wake: %d%s", (int)s_wake_cause, fast ? " (fast)" : " (cold/RST)");
-  logf("ingest: %s", INGEST_URL);
+  loadConfig();
+  logf("ingest: %s", g_ingest_url);
+  { const esp_partition_t *r = esp_ota_get_running_partition(); logf("app partition: %s%s", r ? r->label : "?", otaPendingVerify() ? " (OTA pending verify)" : ""); }
   logf("heap: %u", (unsigned)ESP.getFreeHeap());
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
@@ -1810,6 +1981,7 @@ void setup() {
   if (sim) {
     modemWaitNetwork(fast ? 30000 : 60000);
     modemConfigureSms();
+    if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
     processSmsInbox();
   }
   if (fast && !s_busy_update) { goToSleep(); return; }

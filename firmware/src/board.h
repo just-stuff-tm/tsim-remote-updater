@@ -13,7 +13,7 @@
 #endif
 #define INGEST_URL          WORKER_URL "/ingest/" DEVICE_ID
 
-#define FW_VERSION          "tsim-updater 1.5.1"
+#define FW_VERSION          "tsim-updater 1.6.0"
 #define FW_BUILD_DATE       __DATE__ " " __TIME__
 
 // LilyGO T-SIM7670G-S3 / T-SIM7672G V1.1 modem pins

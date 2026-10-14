@@ -137,7 +137,13 @@ esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash -z \
   0x10000 .pio/build/tsim7672g/firmware.bin
 ```
 
-After RST the T-SIM stays awake for 2 minutes (USB serial commands at 115200: `STATUS`, `MESH`, `CMD`, `CLI <command>`, `REBOOT`, `TESTDL <url>`, `UPDATE <url>`, `LASTLOG`, `SLEEP`, `STAY`), then sleeps until a text arrives.
+After RST the T-SIM stays awake for 2 minutes (USB serial commands at 115200: `STATUS`, `MESH`, `CMD`, `CLI <command>`, `REBOOT`, `TESTDL <url>`, `UPDATE <url>`, `TSIMUPDATE <url> [sha256:…]`, `LASTLOG`, `SLEEP`, `STAY`), then sleeps until a text arrives.
+
+### Partition layout and OTA (v1.6.0)
+
+`partitions.csv` (16 MB flash): `nvs` 0x9000, `otadata` 0xe000, `app0` 0x10000 and `app1` 0x1F0000 (1.875 MB each), `spiffs` (LittleFS, ~12.2 MB, for downloaded Heltec images) at 0x3D0000. Going from an older single-app layout to this one needs **one USB flash** of all four files (bootloader, partitions, boot_app0, firmware). After that, T-SIM updates can go over the air. LittleFS is reformatted once, which only loses the saved last-update result.
+
+The config from `include/config.h` (Worker URL, device id, device key, APN) is saved to NVS on first boot. Release builds from CI use the placeholder `config.example.h` and read the real values from NVS, so public release `firmware.bin` files work over the air on any T-SIM that has run a correctly configured ≥ 1.6.0 build once. Tagging `v*` makes CI attach `firmware.bin`, `firmware.bin.sha256`, `bootloader.bin`, `partitions.bin` and `boot_app0.bin` to a GitHub release.
 
 ### Library patches
 
@@ -160,6 +166,8 @@ The repeater page shows firmware, last seen (with a **stale** badge after 26 hou
 
 **Power saving:** some repeater firmware power-saving modes (e.g. EasySkyMesh `powersaving on`) put the ESP32 to sleep and block the serial CLI. The dashboard marks a repeater as in power saving when `powersaving on` succeeds or the last CLI attempt got no reply; the console and mesh polling are then paused (the last snapshot stays visible). Any successful CLI reply, or `powersaving off`, re-enables them. Firmware without a power-saving command simply keeps the console enabled. Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.
 
+**T-SIM firmware** card and **T-SIM firmware update** panel (T-SIM firmware ≥ 1.6.0): shows the running T-SIM version, the latest available and the last OTA result. Source: GitHub releases of a repo (default `just-stuff-tm/tsim-remote-updater`, asset `firmware.bin`) or a direct `https://` URL, plus an optional SHA-256/MD5 checksum (if empty, GitHub's asset digest is used). **Update T-SIM firmware** queues `TSIMUPDATE <url> <checksum>` as a system command (delivered even when the repeater console is off) and texts `CMD`. The T-SIM downloads the image, checks size, ESP32 image header and checksum, writes the spare app slot, and reboots. The new firmware only marks itself good after it has posted to the dashboard; otherwise it rolls back to the previous version.
+
 Buttons: **Request status**, **Reboot Heltec**, **Check for update** (only looks it up from the update source; sends nothing), **Update to latest** (texts the UPDATE command). Sending is limited to one text per 60 s per device.
 
 ## SMS commands (what the Worker sends)
@@ -169,6 +177,7 @@ Buttons: **Request status**, **Reboot Heltec**, **Check for update** (only looks
 | `STATUS` | T-SIM posts full telemetry plus a mesh snapshot to the dashboard |
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
+| `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 
 Underscores in URLs are sent as `%5F` because SMS (GSM-7) can drop `_`. Use `*-upgrade.bin` images (they keep the repeater's identity). `freshInstall-merged.bin` images wipe its name, keys and settings. Any other text is ignored. The T-SIM never sends texts.

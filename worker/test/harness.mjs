@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
+import worker, { normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -11,6 +11,8 @@ const env = { STATE, HOLOGRAM_API_KEY: "k", ADMIN_TOKEN: "admintok", SESSION_SEC
 let holo = 0, holoOk = true;
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
+  if (url.includes("api.github.com") && url.includes("tsim-remote-updater")) return new Response(JSON.stringify({ tag_name: "v1.6.0", assets: [
+    { id: 9, name: "firmware.bin", digest: "sha256:" + "ab".repeat(32), browser_download_url: "https://github.com/just-stuff-tm/tsim-remote-updater/releases/download/v1.6.0/firmware.bin" }] }));
   if (url.includes("api.github.com")) return new Response(JSON.stringify({ tag_name: "PowerSaving17.2", assets: [
     { id: 5, name: "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin", browser_download_url: "https://github.com/x/y/releases/download/t/Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin" }] }));
   if (url.includes("hologram")) { holo++; assert.equal(JSON.parse(init.body).deviceid, 1234567);
@@ -217,6 +219,43 @@ assert.equal(typeof worker.scheduled, "function");
   await admin("/admin/accounts/owner/reset-password", "POST", {});
   assert.equal((await A("/api/fleet")).status, 401);
   assert.equal((await admin("/admin/accounts/owner", "DELETE")).status, 200);
+}
+// ---------- T-SIM OTA ----------
+{
+  assert.equal(normChecksum("AB".repeat(32)), "sha256:" + "ab".repeat(32)); assert.equal(normChecksum("md5:" + "0".repeat(32)), "md5:" + "0".repeat(32));
+  assert.throws(() => normChecksum("xyz")); assert.equal(buildTsimCommand("https://a/b", ""), "TSIMUPDATE https://a/b");
+  await admin("/admin/devices", "POST", { id: "ota-1", hologram_device_id: "1234567" });
+  await admin("/admin/devices/ota-1/reset-password", "POST", { password: "ota-device-password" });
+  const r = await login("ota-1", "ota-device-password", "4.4.4.4"); const oc = r.headers.get("Set-Cookie").split(";")[0];
+  const O = (a, body, h = {}) => call("/api/d/ota-1/" + a, { method: "POST", headers: { Cookie: oc, "Content-Type": "application/json", ...h }, body: body && JSON.stringify(body) });
+  const key = JSON.parse(kv.get("device:ota-1")).ingest_key;
+  let tel = await (await call("/api/d/ota-1/telemetry", { headers: { Cookie: oc } })).json();
+  assert.equal(tel.tsim.source.repo, "just-stuff-tm/tsim-remote-updater"); assert.equal(tel.tsim.source.asset, "firmware.bin");
+  assert.equal((await O("tsim-update", null, { Origin: "https://evil" })).status, 403);
+  const h0 = holo;
+  let j = await (await O("tsim-check")).json(); assert.equal(j.sent, false); assert.equal(holo, h0);
+  assert.equal(j.latest_available.tag, "v1.6.0"); assert.equal(j.latest_available.checksum, "sha256:" + "ab".repeat(32));
+  // console is OFF, yet the system command is delivered
+  j = await (await O("tsim-update")).json(); assert(j.sent); assert.equal(j.body, "CMD"); assert.equal(holo, h0 + 1);
+  assert.equal((await O("tsim-update")).status, 429);
+  const txt = await (await call("/api/dev/ota-1/commands", { headers: { "X-Device-Key": key } })).text();
+  assert.equal(txt.split("\t")[1].trim(), "TSIMUPDATE https://github.com/just-stuff-tm/tsim-remote-updater/releases/download/v1.6.0/firmware.bin sha256:" + "ab".repeat(32));
+  // OTA progress is tracked; system cmd output does not touch powersaving state
+  const ing = (o) => call("/ingest/ota-1", { method: "POST", headers: { "X-Device-Key": key }, body: JSON.stringify(o) });
+  await ing({ type: "cmd", cmd_id: txt.split("\t")[0], cmd: "TSIMUPDATE x", output: "T-SIM OTA starting" });
+  await ing({ type: "update", msg: "TSIM OTA OK: tsim-updater 1.6.0 running (ingest accepted)", fw: "tsim-updater 1.6.0" });
+  tel = await (await call("/api/d/ota-1/telemetry", { headers: { Cookie: oc } })).json();
+  assert(tel.tsim.last_ota.msg.startsWith("TSIM OTA OK")); assert.equal(tel.tsim.fw, "tsim-updater 1.6.0"); assert.equal(tel.powersaving.on, false);
+  assert.equal(tel.commands[0].status, "done");
+  // source: URL mode + checksum validation
+  assert.equal((await O("tsim-source", { mode: "url", url: "" })).status, 400);
+  assert.equal((await O("tsim-source", { mode: "url", url: "https://example.com/t.bin", checksum: "nothex" })).status, 400);
+  assert.equal((await O("tsim-source", { mode: "url", url: "https://example.com/t.bin", checksum: "c".repeat(32) })).status, 200);
+  const st = JSON.parse(kv.get("state:ota-1")); st.last_send_ts = 0; kv.set("state:ota-1", JSON.stringify(st));
+  j = await (await O("tsim-update")).json(); assert(j.sent);
+  const t2 = await (await call("/api/dev/ota-1/commands", { headers: { "X-Device-Key": key } })).text();
+  assert(t2.includes("TSIMUPDATE https://example.com/t.bin md5:" + "c".repeat(32)));
+  assert.equal((await admin("/admin/devices/ota-1", "DELETE")).status, 200); assert.equal(kv.get("tsimsrc:ota-1"), undefined);
 }
 console.log("ALL TESTS PASSED");
 // origin handling

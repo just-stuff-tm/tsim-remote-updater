@@ -24,6 +24,41 @@ export function validateSource(b) {
   }
   return o;
 }
+// T-SIM's own firmware (OTA self-update, firmware >= 1.6.0)
+const DEFAULT_TSIM_SOURCE = { mode: "github", repo: "just-stuff-tm/tsim-remote-updater", asset: "firmware.bin", url: "", checksum: "" };
+export function normChecksum(c) {
+  c = String(c || "").trim().toLowerCase().replace(/\s+/g, "");
+  if (!c) return "";
+  if (/^sha256:[0-9a-f]{64}$/.test(c) || /^md5:[0-9a-f]{32}$/.test(c)) return c;
+  if (/^[0-9a-f]{64}$/.test(c)) return "sha256:" + c;
+  if (/^[0-9a-f]{32}$/.test(c)) return "md5:" + c;
+  throw new Error("checksum must be a SHA-256 (64 hex) or MD5 (32 hex), optionally prefixed sha256: / md5:");
+}
+export function validateTsimSource(b) {
+  const o = { ...DEFAULT_TSIM_SOURCE };
+  if (b.mode !== undefined) { if (!["github", "url"].includes(b.mode)) throw new Error("mode must be github or url"); o.mode = b.mode; }
+  if (b.repo !== undefined) { o.repo = String(b.repo).trim(); if (!REPO_RE.test(o.repo)) throw new Error("repo must look like owner/name"); }
+  if (b.asset !== undefined) { o.asset = String(b.asset).trim(); if (!o.asset || o.asset.length > 120 || /[\s/]/.test(o.asset)) throw new Error("asset: 1-120 chars, no spaces or slashes"); }
+  if (b.url !== undefined) { o.url = String(b.url).trim(); if (o.url && (!/^https:\/\/\S+$/.test(o.url) || o.url.length > 300)) throw new Error("URL must start with https:// (max 300 chars)"); }
+  if (b.checksum !== undefined) o.checksum = normChecksum(b.checksum);
+  if (o.mode === "url" && !o.url) throw new Error("set a firmware URL or switch to GitHub releases");
+  return o;
+}
+const getTsimSource = async (env, id) => ({ ...DEFAULT_TSIM_SOURCE, ...((await kvJson(env, `tsimsrc:${id}`)) || {}) });
+export async function resolveTsimTarget(env, id) {
+  const src = await getTsimSource(env, id);
+  if (src.mode === "url") {
+    const name = decodeURIComponent(src.url.split(/[?#]/)[0].split("/").pop() || "firmware.bin");
+    return { src, rel: { tag: "url", asset_name: name, url: src.url, checksum: src.checksum || "", via: "url" } };
+  }
+  const rel = await latestRelease(env, { repo: src.repo, asset_pattern: src.asset });
+  if (rel.skipped) return { src, rel };
+  let checksum = src.checksum || "";
+  if (!checksum && rel.digest) { try { checksum = normChecksum(rel.digest); } catch {} }
+  return { src, rel: { ...rel, checksum } };
+}
+export const buildTsimCommand = (url, checksum) => `TSIMUPDATE ${url}${checksum ? " " + checksum : ""}`;
+
 const getSource = async (env, id) => ({ ...DEFAULT_SOURCE, ...((await kvJson(env, `source:${id}`)) || {}) });
 const UA = "tsim-remote-updater (+cloudflare-workers)";
 const HOLOGRAM_SMS_URL = "https://dashboard.hologram.io/api/1/sms/incoming";
@@ -150,7 +185,7 @@ export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
   if (rel.draft || rel.prerelease) return { skipped: `draft/prerelease ${rel.tag_name}` };
   const asset = (rel.assets || []).find((a) => ASSET_RE.test(a.name));
   if (!asset) return { skipped: `no upgrade asset in ${rel.tag_name}` };
-  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at };
+  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null };
 }
 export const buildUpdateBody = (url) => `UPDATE ${url.replace(/_/g, "%5F")} `;
 
@@ -296,7 +331,8 @@ async function handleIngest(request, env, id) {
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     const ran = (c ? c.cmd : String(t.cmd || "")).trim().toLowerCase();
     const reply = cleanCli(out);
-    if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
+    if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
+    else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
     else if (!t.error && ran === "powersaving on" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving on");
     else if (!t.error && reply) await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : "console: CLI answered");
     const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
@@ -307,7 +343,11 @@ async function handleIngest(request, env, id) {
   const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
   await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type });
   await logActivity(env, id, entry);
-  if (entry.type === "update" && entry.msg) {
+  if (entry.type === "update" && entry.msg && /^TSIM OTA/.test(entry.msg)) {
+    const st = (await kvJson(env, `state:${id}`)) || {};
+    st.tsim_last_ota = { at: entry.received_at, msg: entry.msg };
+    await putJson(env, `state:${id}`, st);
+  } else if (entry.type === "update" && entry.msg) {
     const st = (await kvJson(env, `state:${id}`)) || {};
     st.last_update_result = { at: entry.received_at, msg: entry.msg };
     const m = entry.msg.match(/^SUCCESS:\s*(\S+)/);
@@ -333,7 +373,7 @@ async function handleDeviceCommands(request, env, id) {
   const settings = await getSettings(env, id);
   const list = (await kvJson(env, `cmds:${id}`)) || [];
   const now = new Date().toISOString();
-  const pending = settings.console_enabled ? list.filter((c) => c.status === "queued").reverse().slice(0, CMD_MAX_PENDING) : [];
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || settings.console_enabled)).reverse().slice(0, CMD_MAX_PENDING);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
   return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
@@ -382,7 +422,7 @@ async function handleAdmin(request, env, parts) {
   const dev = await getDevice(env, id);
   if (!dev) return json({ error: "no such device" }, 404);
   if (parts.length === 2 && m === "DELETE") {
-    for (const k of [`device:${id}`, `state:${id}`, `source:${id}`, `release:${id}`, `telem:${id}:latest`, `telem:${id}:history`, `mesh:${id}`, `settings:${id}`, `cmds:${id}`]) await env.STATE.delete(k);
+    for (const k of [`device:${id}`, `state:${id}`, `source:${id}`, `release:${id}`, `telem:${id}:latest`, `telem:${id}:history`, `mesh:${id}`, `settings:${id}`, `cmds:${id}`, `tsimsrc:${id}`, `tsimrel:${id}`]) await env.STATE.delete(k);
     return json({ deleted: id });
   }
   if (parts.length === 3 && parts[2] === "reset-password" && m === "POST") {
@@ -507,9 +547,9 @@ function sameOrigin(request) {
 async function deviceApi(request, env, dev, action) {
   const id = dev.id;
   if (action === "telemetry" && request.method === "GET") {
-    const [latest, history, st, rel, mesh, settings, cmds] = await Promise.all([
+    const [latest, history, st, rel, mesh, settings, cmds, tsimSrc, tsimRel] = await Promise.all([
       kvJson(env, `telem:${id}:latest`), kvJson(env, `telem:${id}:history`), kvJson(env, `state:${id}`), kvJson(env, `release:${id}`),
-      kvJson(env, `mesh:${id}`), getSettings(env, id), kvJson(env, `cmds:${id}`),
+      kvJson(env, `mesh:${id}`), getSettings(env, id), kvJson(env, `cmds:${id}`), getTsimSource(env, id), kvJson(env, `tsimrel:${id}`),
     ]);
     const s = st || {};
     const source = await getSource(env, id);
@@ -518,7 +558,8 @@ async function deviceApi(request, env, dev, action) {
     return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: cmds || [], history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
-      powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null } });
+      powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null },
+      tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null } });
   }
   if (action === "source" && request.method === "GET") return json(await getSource(env, id));
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
@@ -555,7 +596,7 @@ async function deviceApi(request, env, dev, action) {
     await putJson(env, `settings:${id}`, cur);
     if (!cur.console_enabled) {  // turning the console off drops anything still queued
       const list = (await kvJson(env, `cmds:${id}`)) || [];
-      let n = 0; for (const c of list) if (c.status === "queued") { c.status = "cancelled"; n++; }
+      let n = 0; for (const c of list) if (c.status === "queued" && !c.sys) { c.status = "cancelled"; n++; }
       if (n) await putJson(env, `cmds:${id}`, list);
     }
     await logActivity(env, id, { type: "action", msg: `Settings: console ${cur.console_enabled ? "ON" : "off"}, scheduled check ${cur.schedule_hours ? "every " + cur.schedule_hours + "h" : "off"}` });
@@ -589,6 +630,32 @@ async function deviceApi(request, env, dev, action) {
     if (!settings.console_enabled) return json({ error: "Repeater console is off for this device." }, 403);
     if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE, powersaving: true }, 409);
     const [o, c] = await manualSend(env, dev, "CMD", "CMD (console)"); return json(o, c);
+  }
+  if (action === "tsim-source") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    let src; try { src = validateTsimSource({ ...(await getTsimSource(env, id)), ...b }); } catch (e) { return json({ error: e.message }, 400); }
+    await putJson(env, `tsimsrc:${id}`, src);
+    await env.STATE.delete(`tsimrel:${id}`);
+    await logActivity(env, id, { type: "action", msg: `T-SIM firmware source: ${src.mode === "url" ? "URL" : src.repo + " " + src.asset}${src.checksum ? " (checksum set)" : ""}` });
+    return json({ saved: true, source: src });
+  }
+  if (action === "tsim-check" || action === "tsim-update") {
+    let rel;
+    try { ({ rel } = await resolveTsimTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
+    if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
+    const rec = { ...rel, checked_at: new Date().toISOString() };
+    await putJson(env, `tsimrel:${id}`, rec);
+    if (action === "tsim-check") return json({ sent: false, latest_available: rec });
+    const cmd = buildTsimCommand(rel.url, rel.checksum);
+    if (cmd.length > 450) return json({ sent: false, error: "firmware URL too long" }, 400);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    for (const c of list) if (c.status === "queued" && c.sys) c.status = "cancelled";  // only one pending self-update
+    const entry = { id: randomHex(4), cmd, sys: true, status: "queued", queued_at: new Date().toISOString() };
+    const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware update (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})`, async (st) => {
+      st.tsim_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, checksum: rel.checksum || null };
+    });
+    if (o.sent) { list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
+    return json({ ...o, release: rec, queued: o.sent ? entry : null }, code);
   }
   if (action === "status") { const [o, c] = await manualSend(env, dev, "STATUS", "STATUS"); return json(o, c); }
   if (action === "reboot") { const [o, c] = await manualSend(env, dev, "REBOOT", "REBOOT"); return json(o, c); }
@@ -712,6 +779,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Power</h3><div id="c-power"></div></div>
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
 <div class="card"><h3>Updates</h3><div id="c-upd"></div></div>
+<div class="card"><h3>T-SIM firmware</h3><div id="c-tsimfw"></div></div>
 </div>
 <div class="acts">
 <button data-a="status" data-c="Text STATUS to the T-SIM? It wakes, reads the repeater and reports here.">Request status</button>
@@ -745,6 +813,18 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="row small"><span id="conmsg"></span><span><button type="button" id="wake" class="g sm">Wake to run queued</button> <button type="button" id="cancel" class="g sm">Cancel queued</button></span></div>
 <table><thead><tr><th>Command</th><th>Status</th><th>Output</th></tr></thead><tbody id="cmds"></tbody></table></div></details>
 
+<details class="card" id="tsimbox"><summary><b>T-SIM firmware update</b> <small id="tsimsum" class="mut"></small></summary>
+<p class="small mut">Updates the T-SIM itself over LTE (needs T-SIM firmware 1.6.0+). The T-SIM downloads the .bin, checks it, writes the spare app slot and reboots. If the new firmware can't check in here, the T-SIM rolls back to the old one. Uses one incoming text.</p>
+<form id="tsimf">
+<label>Source <select name="mode"><option value="github">GitHub releases</option><option value="url">Direct URL</option></select></label>
+<label>GitHub repo (owner/name)<input name="repo" placeholder="just-stuff-tm/tsim-remote-updater"></label>
+<label>Release asset name<input name="asset" placeholder="firmware.bin"></label>
+<label>Direct URL<input name="url" placeholder="https://.../firmware.bin"></label>
+<label>Checksum (optional SHA-256 or MD5; GitHub's asset digest is used if empty)<input name="checksum" placeholder="sha256:..."></label>
+<button type="submit" class="g">Save source</button> <span id="tsimmsg"></span></form>
+<div class="acts"><button data-a="tsim-check" data-c="">Check T-SIM firmware</button>
+<button data-a="tsim-update" class="w" data-c="Update the T-SIM's own firmware? It texts CMD to the T-SIM, which downloads, flashes and reboots (rolls back automatically if the new firmware can't check in).">Update T-SIM firmware</button></div></details>
+
 <details class="card" id="srcbox"><summary><b>Update source</b> <small id="srcsum" class="mut"></small></summary>
 <form id="srcf" style="margin-top:8px">
 <label class="tog"><input type="checkbox" name="enabled"> Use GitHub releases</label>
@@ -771,6 +851,9 @@ async function load(){
  $("c-power").innerHTML=kv([["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free heap",L.heap],["Flash free",L.fs_free]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Operator",L.operator],["Registration",L.reg],["IP",L.ip],["Modem fw",L.modem_fw]]);
  const la=U.latest_available,lr=U.last_update_result;
+ const TS=d.tsim||{},tla=TS.latest_available,tlo=TS.last_ota;
+ $("c-tsimfw").innerHTML=kv([["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":"")+(tla.checksum?" ✓ checksum":""):"press Check T-SIM firmware"],["Last OTA",tlo?tlo.msg:null],["When",tlo&&t(tlo.at)]]);
+ if(TS.source)showTsim(TS.source);
  $("c-upd").innerHTML=kv([["Heltec firmware",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name+(la.via==="direct"?" (direct URL)":""):"press Check for update"],["Checked",la&&t(la.checked_at)],["Last update",lr?lr.msg:null],["Last text sent",U.last_action?U.last_action.label+" · "+t(U.last_action.at):null]]);
  // mesh
  const C=M.core||{},R=M.radio||{},P=M.packets||{};
@@ -791,6 +874,12 @@ async function load(){
  const CM=d.commands||[];$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3>No commands yet</td></tr>';
  $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"status report":""))+'</td></tr>').join("")||'<tr><td colspan=3>No activity yet</td></tr>';
 }
+let tsimLoaded=false;
+function showTsim(s){const f=$("tsimf");$("tsimsum").textContent="· "+(s.mode==="url"?"direct URL":s.repo+" · "+s.asset)+(s.checksum?" · checksum":"");
+ if(!tsimLoaded){f.mode.value=s.mode;f.repo.value=s.repo||"";f.asset.value=s.asset||"";f.url.value=s.url||"";f.checksum.value=s.checksum||"";tsimLoaded=true}}
+$("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
+ const r=await post("tsim-source",{mode:f.mode.value,repo:f.repo.value,asset:f.asset.value,url:f.url.value,checksum:f.checksum.value});
+ const j=await r.json();$("tsimmsg").textContent=r.ok?"Saved":("Error: "+(j.error||r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
 let srcLoaded=false;
 function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?"· "+s.repo+" · "+s.asset_pattern:(s.direct_url?"· direct URL":"· disabled");
  const off=!s.enabled&&!s.direct_url;document.querySelectorAll('button[data-a="check"],button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
