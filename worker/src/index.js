@@ -636,7 +636,8 @@ async function deviceApi(request, env, dev, action) {
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
-      progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS });
+      progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS,
+      update_status: statuses(latest, mesh, s, history, rel, tsimRel) });
   }
   if (action === "source" && request.method === "GET") return json(await getSource(env, id));
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
@@ -757,7 +758,7 @@ async function fleetApi(env, acc) {
   for (const id of acc.devices) {
     const dev = await getDevice(env, id);
     if (!dev) continue;
-    const [L, mesh, st, settings, hist] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), kvJson(env, `state:${id}`), getSettings(env, id), kvJson(env, `telem:${id}:history`)]);
+    const [L, mesh, st, settings, hist, rel, trel] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), kvJson(env, `state:${id}`), getSettings(env, id), kvJson(env, `telem:${id}:history`), kvJson(env, `release:${id}`), kvJson(env, `tsimrel:${id}`)]);
     const ph = computeProgress("heltec", hist || [], st || {}), pt = computeProgress("tsim", hist || [], st || {});
     const l = L || {}, m = mesh || {};
     out.push({ id, name: dev.name, last_seen: l.received_at || null, fw: l.fw || null, battery_v: l.battery_v ?? null, battery_pct: l.battery_pct ?? null,
@@ -765,9 +766,62 @@ async function fleetApi(env, acc) {
       heltec_fw: m.heltec_fw || (st && st.heltec_fw) || null, node_name: m.node_name || null,
       neighbors: m.neighbors ? m.neighbors.length : null, packets: m.packets || null, radio: m.radio || null, mesh_at: m.received_at || null, mesh_test: !!m.test,
       powersaving: !!(st && st.heltec_powersaving), console_enabled: settings.console_enabled, schedule_hours: settings.schedule_hours,
+      update_status: statuses(L, mesh, st || {}, hist, rel, trel),
       progress: { heltec: { state: ph.state, step: ph.step, pct: ph.pct, finished_at: ph.finished_at }, tsim: { state: pt.state, step: pt.step, pct: pt.pct, finished_at: pt.finished_at } } });
   }
   return json({ account: { kind: acc.kind, id: acc.id, name: acc.name }, devices: out });
+}
+
+// ---------- update status (installed vs last check) ----------
+export function verOf(x) { const m = String(x || "").match(/v?(\d+)\.(\d+)(?:\.(\d+))?/); return m ? [+m[1], +m[2], +(m[3] || 0)] : null; }
+const vcmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; };
+const vstr = (v) => "v" + v.join(".");
+// installed: version string reported by the device (or null); flashed: {tag, asset_name} last successfully installed (fallback)
+export function updateStatus(installed, rel, flashed = null) {
+  if (!rel || rel.skipped) return { state: "unchecked", text: "Not checked yet", checked_at: null };
+  const at = rel.checked_at || null, lv = verOf(rel.tag) || verOf(rel.asset_name);
+  const latest = lv ? vstr(lv) : rel.asset_name;
+  const iv = verOf(installed) || (flashed && (verOf(flashed.tag) || verOf(flashed.asset_name)));
+  if (lv && iv) {
+    const c = vcmp(lv, iv);
+    return c > 0 ? { state: "available", text: `New update available: ${latest} (installed ${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at }
+      : { state: "current", text: `Up to date (${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at };
+  }
+  if (flashed && flashed.asset_name && flashed.asset_name === rel.asset_name && (!flashed.tag || flashed.tag === rel.tag))
+    return { state: "current", text: `Up to date (${flashed.asset_name})`, latest, installed: flashed.asset_name, checked_at: at };
+  return { state: "unknown", text: `Latest: ${latest} (installed version unknown)`, latest, installed: null, checked_at: at };
+}
+function radioFlashed(s, hist) {
+  const p = computeProgress("heltec", hist || [], s || {});
+  return p.state === "done" && s && s.last_update_sent ? s.last_update_sent : null;
+}
+function statuses(latest, mesh, s, hist, rel, tsimRel) {
+  const radioInst = (mesh && mesh.heltec_fw) || (s && s.heltec_fw) || null;
+  return { tsim: updateStatus(latest && latest.fw, tsimRel), radio: updateStatus(radioInst, rel, radioFlashed(s, hist)) };
+}
+// Cron: refresh release checks for GitHub sources (server-side GitHub API only; never texts a device).
+const REFRESH_MS = 6 * 3600e3;
+export async function refreshReleases(env, now = Date.now()) {
+  const cache = new Map(), out = [];
+  const get = async (src) => { const k = src.repo + "|" + src.asset_pattern; if (!cache.has(k)) cache.set(k, latestRelease(env, src).catch((e) => ({ skipped: "error: " + e.message }))); return cache.get(k); };
+  for (const id of await listDeviceIds(env)) {
+    try {
+      const src = await getSource(env, id), cur = await kvJson(env, `release:${id}`);
+      if (src.enabled && !(cur && cur.checked_at && now - Date.parse(cur.checked_at) < REFRESH_MS)) {
+        const rel = await get(src);
+        if (!rel.skipped) { await putJson(env, `release:${id}`, { ...rel, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":radio"); }
+      }
+      const ts = await getTsimSource(env, id), tcur = await kvJson(env, `tsimrel:${id}`);
+      if (ts.mode !== "url" && !(tcur && tcur.checked_at && now - Date.parse(tcur.checked_at) < REFRESH_MS)) {
+        const r = await get({ repo: ts.repo, asset_pattern: ts.asset });
+        if (!r.skipped) {
+          let checksum = ts.checksum || ""; if (!checksum && r.digest) { try { checksum = normChecksum(r.digest); } catch {} }
+          await putJson(env, `tsimrel:${id}`, { ...r, checksum, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":tsim");
+        }
+      }
+    } catch (e) { out.push(id + ":error"); }
+  }
+  return out;
 }
 
 // Cron (hourly): text STATUS only to devices whose optional scheduled check is due.
@@ -835,6 +889,8 @@ const kv=rows=>rows.map(([k,v])=>'<div class="kv"><span>'+e(k)+'</span><span>'+e
 const STALE_MS=26*3600e3;
 const sig=c=>c==null||c<0||c==99?null:(c>=20?"Excellent":c>=15?"Good":c>=10?"OK":"Weak")+" ("+c+")";
 const PSTATE={running:["Updating…","run"],done:["Updated","ok"],failed:["Update failed","failed"],timeout:["No response","failed"]};
+function ubadge(u,label){if(!u)return"";const c=u.state==="available"?"run":u.state==="current"?"":"mut";const w=u.state==="available"?"update available":u.state==="current"?"up to date":u.state==="unknown"?"version unknown":"not checked";return '<span class="badge '+c+'" title="'+e(u.text)+'">'+e(label+": "+w)+'</span>'}
+function utext(u){if(!u)return null;return u.state==="available"?"⬆ "+u.text:u.state==="current"?"✓ "+u.text:u.text}
 function pbadge(p,label){if(!p||p.state==="idle")return"";if(p.state==="done"&&p.finished_at&&Date.now()-new Date(p.finished_at)>36e5)return"";const s=PSTATE[p.state]||[p.state,"mut"];return '<span class="badge '+(s[1]==="ok"?"":s[1])+'">'+e(label+": "+s[0]+(p.state==="running"?" "+p.pct+"%":""))+'</span>'}
 let toastT;function toast(msg,kind){let el=$("toast");if(!el){el=document.createElement("div");el.id="toast";document.body.appendChild(el)}el.className=kind||"";el.textContent=msg;el.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>el.hidden=true,kind==="bad"?9000:6000)}
 function friendly(j,status){const x=String((j&&(j.error||(j.hologram_response_summary||{}).error))||"");
@@ -871,7 +927,7 @@ async function load(){
   const P=x.progress||{};if((P.heltec||{}).state==="running"||(P.tsim||{}).state==="running")busy=true;
   return '<a class="card dev fc" href="/d/'+encodeURIComponent(x.id)+'"><div class="row"><b>'+e(x.name)+'</b><span class="badge'+(fresh?'':' stale')+'">'+(fresh?'Online':'Stale')+'</span></div>'+
   '<div class="small mut">'+e(x.id)+(x.node_name?' · '+e(x.node_name):'')+'</div>'+
-  '<div class="mini">'+pbadge(P.heltec,"Heltec")+pbadge(P.tsim,"T-SIM")+(x.powersaving?'<span class="badge mut">Power saving</span>':'')+'</div>'+
+  '<div class="mini">'+pbadge(P.heltec,"Heltec")+pbadge(P.tsim,"T-SIM")+ubadge((x.update_status||{}).radio,"Radio fw")+ubadge((x.update_status||{}).tsim,"T-SIM fw")+(x.powersaving?'<span class="badge mut">Power saving</span>':'')+'</div>'+
   kv([["Last seen",ago(x.last_seen)],["Battery",x.battery_v==null?null:x.battery_v.toFixed(2)+" V ("+x.battery_pct+"%)"],["Signal",sig(x.csq)],
    ["Heltec firmware",x.heltec_fw],["Neighbors",x.neighbors]])+
   (x.mesh_test?'<small class="err">Mesh data is test data</small>':'')+'</a>'}).join("")||'<p>No repeaters on this login.</p>';
@@ -1003,8 +1059,9 @@ async function load(){
  $("c-power").innerHTML=kv([["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",L.ip]]);
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
- $("c-upd").innerHTML=kv([["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)]]);
- $("c-tsimfw").innerHTML=kv([["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]]);
+ const US=d.update_status||{};
+ $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)]]);
+ $("c-tsimfw").innerHTML=kv([["Status",utext(US.tsim)],["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]]);
  for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
  $("p-heltec").innerHTML=prog(PG.heltec,"Heltec",pending.heltec);$("p-tsim").innerHTML=prog(PG.tsim,"T-SIM",pending.tsim);
  const busy=["heltec","tsim"].some(k=>pending[k]||(PG[k]||{}).state==="running");
@@ -1019,9 +1076,9 @@ async function load(){
  $("consum").textContent=S.console_enabled?"on":"off";
  if(first){$("sch").value=String(S.schedule_hours||0);$("conon").checked=!!S.console_enabled;first=false}
  const PS=!!(d.powersaving&&d.powersaving.on);
- $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+(PS?'<span class="badge mut">Power saving</span>':'');
- $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
- $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
+ $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PS?'<span class="badge mut">Power saving</span>':'');
+ $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Updates",utext(US.radio)],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
+ $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Updates",utext(US.tsim)],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
  if(PS)$("consum").textContent="paused (power saving)";
@@ -1130,5 +1187,6 @@ export default {
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runSchedules(env).then((r) => console.log("schedules", JSON.stringify(r))));
+    ctx.waitUntil(refreshReleases(env).then((r) => console.log("release refresh", JSON.stringify(r))).catch((e) => console.log("release refresh failed", e.message)));
   },
 };

@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules } from "../src/index.js";
+import worker, { computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -295,4 +295,19 @@ console.log("ALL TESTS PASSED");
   assert.equal(await heltecImageRisk("https://h/small.bin"), null);
   globalThis.fetch = of;
   console.log("progress tests ok");
+}
+{
+  const R = { tag: "v1.6.3", asset_name: "firmware.bin", checked_at: "x" };
+  assert.equal(updateStatus("tsim-updater 1.6.2", R).text, "New update available: v1.6.3 (installed v1.6.2)");
+  assert.equal(updateStatus("tsim-updater 1.6.3", R).text, "Up to date (v1.6.3)");
+  assert.equal(updateStatus("x", null).text, "Not checked yet");
+  assert.equal(updateStatus(null, R).state, "unknown");
+  assert.equal(updateStatus(null, { tag: "direct", asset_name: "a.bin" }, { tag: "direct", asset_name: "a.bin" }).state, "current");
+  assert.equal(updateStatus(null, { tag: "v1.10.0", asset_name: "Heltec_v3_repeater-v1.10.0.bin" }, { tag: "v1.9.1" }).state, "available");
+  const of = globalThis.fetch; let n = 0, sms = 0;
+  globalThis.fetch = async (u) => { if (/hologram/i.test(String(u))) sms++; n++; return new Response(JSON.stringify({ tag_name: "v9.9.9", assets: [{ id: 1, name: "firmware.bin", browser_download_url: "https://g/f.bin" }, { id: 2, name: "Heltec_v3_repeater-x-upgrade.bin", browser_download_url: "https://g/h.bin" }] }), { status: 200 }); };
+  const r1 = await refreshReleases(env); const n1 = n; await refreshReleases(env);
+  assert.equal(sms, 0); assert.equal(n, n1, "second run uses cache"); assert(r1.length >= 1);
+  globalThis.fetch = of;
+  console.log("update status tests ok");
 }
