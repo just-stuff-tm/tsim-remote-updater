@@ -56,6 +56,29 @@ flowchart LR
 On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9. Put 100 µF + 10 µF across the Heltec 3V3/GND. Don't power both boards from USB at the same time while 3V3 is linked.
 
 
+## Supported repeater boards
+
+The Worker and dashboard don't care which board the repeater is. The T-SIM drives the repeater over 4 wires (TX, RX, RST, BOOT/GPIO0) plus GND. Remote flashing uses Espressif's ROM serial bootloader (esp-serial-flasher). Since v1.6.3 the T-SIM detects the chip after connecting, logs it ("Repeater chip detected: …"), and picks the write address.
+
+| Repeater board | Remote flash | Reboot / status / console |
+|---|---|---|
+| **ESP32-S3** MeshCore boards (Heltec V3/V4, LilyGO T3S3, Station G2, Seeed Xiao S3, …) | ✅ Yes | ✅ Yes |
+| **Classic ESP32** and **ESP32-C3** boards (also S2/C6, untested) | ✅ Yes | ✅ Yes |
+| **nRF52** boards (RAK4631, LilyGO T-Echo, Heltec T114, Xiao nRF52840, Wio Tracker) | ❌ No: they use a UF2/DFU bootloader, not the ESP ROM bootloader | ✅ Yes, over serial + RST |
+| Anything else (ESP8266, unknown) | ❌ Refused cleanly, nothing is written | depends on the board |
+
+Only the Heltec V3 has been tested on real hardware. The other boards are expected to work from the code paths but are unverified.
+
+**Wiring for other boards:** connect T-SIM TX→board RX, RX→TX, an RST pin to the board's EN/RST, BOOT to the board's **GPIO0** (S3/classic ESP32) or **GPIO9** (C3), and GND. Run it at 3.3 V logic. Pins are set in `firmware/src/board.h`.
+
+**Pick the right firmware file for your board** (Settings → Heltec update source → *File name pattern* or *Direct URL*; presets fill these in for Heltec V3):
+- Change the pattern to your board's file name, e.g. `Heltec_v3_repeater-*-upgrade.bin` → your board's equivalent from the same release.
+- **App-only** file (no `merged`/`factory` in the name) is written at `0x10000` and keeps the repeater's identity and settings. Prefer this.
+- **Merged/factory** file includes the bootloader + partition table and may reset identity. It is written at `0x0` (or `0x1000` for a classic-ESP32 image that starts with the bootloader).
+- The T-SIM decides by reading the file contents (not the name), and refuses anything that isn't an ESP32 image or a classic-ESP32 image aimed at a different chip. It can't tell an S3 file from a C3 file, so make sure the file is for your board.
+
+**T-SIM side:** the controller must be a **LilyGO T-SIM7670G / T-SIM7672G** (ESP32-S3 + SIM767x). The firmware's modem pins and AT commands are for that board. Other modems would need code changes.
+
 ## Costs and notes
 
 - **Incoming SMS is free** on Hologram. The Worker sends each text through the Hologram API; for outgoing SMS costs see [Hologram's current pricing](https://www.hologram.io/pricing). **The T-SIM never sends SMS**, it reports over data only.

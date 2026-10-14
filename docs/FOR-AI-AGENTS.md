@@ -20,6 +20,11 @@ You are building and deploying this project for a human. Human-oriented steps ar
 8. Flash (`pio run -t upload` or esptool, offsets in SETUP.md), then ask the human to press Request status.
 9. T-SIM firmware updates after that: changing `partitions.csv` always needs a USB flash. Otherwise use the dashboard's **Update T-SIM firmware** (GitHub release `firmware.bin` from CI, or a URL + checksum). Prefer giving a SHA-256. Confirm afterwards that the activity log shows `TSIM OTA OK` and the new version; a rollback shows the old version again.
 
+## Repeater boards
+- Remote flash only for ESP32-family targets (ESP32, S2, S3, C3, C6). The T-SIM detects the chip via `esp_loader_get_target()` and refuses unknown chips. nRF52 targets (UF2/DFU) cannot be flashed, only rebooted, status-checked and given console commands.
+- Ask the human for the exact board, and set the Worker update source `asset_pattern`/`direct_url` to that board's **app-only** file (written at 0x10000). Merged images go to 0x0 (or 0x1000 for classic-ESP32 images that start with the bootloader).
+- Controller must be a LilyGO T-SIM7670G/7672G.
+
 ## Never
 - Never commit or paste into public places: passwords, ADMIN_TOKEN, SESSION_SECRET, ingest keys, Hologram key/device ids, phone numbers, emails, Cloudflare account/KV ids, the workers.dev subdomain. `config.h` is gitignored; keep it that way.
 - Never make the T-SIM send SMS. It reports over data only.
