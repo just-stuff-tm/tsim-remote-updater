@@ -1437,7 +1437,7 @@ static bool doTsimUpdate(const char *args) {
 // Decide the flash address from the file contents only (never the filename), v1.6.2.
 // Merged/factory image: partition table magic 0xAA 0x50 at 0x8000 and/or an app header 0xE9 at 0x10000
 // -> write at 0x0. App-only image: 0xE9 at offset 0 -> write at 0x10000. Anything else: refuse.
-// Returns 1 merged, 0 app-only, -1 unrecognised.
+// Returns 1 merged (from 0x0), 2 merged from 0x1000 (classic ESP32 only), 0 app-only, -1 unrecognised.
 static int imageKind(File &f) {
   size_t size = f.size();
   uint8_t pt[2] = {0, 0}, ap[2] = {0, 0}, h[2] = {0, 0};
@@ -1448,8 +1448,13 @@ static int imageKind(File &f) {
   bool gapErased = pt[0] == 0xFF && pt[1] == 0xFF;                 // merge_bin fills gaps with 0xFF
   bool app10k = ap[0] == 0xE9 && ap[1] >= 1 && ap[1] <= 16;        // magic + sane segment count
   bool app0 = h[0] == 0xE9 && h[1] >= 1 && h[1] <= 16;
-  logf("flash: image check pt@0x8000=%d app@0x10000=%d app@0=%d", (int)ptMagic, (int)app10k, (int)app0);
+  // v1.6.3: classic-ESP32 merged image built from 0x1000 (bootloader first): partition table at file 0x7000
+  uint8_t pt7[2] = {0, 0};
+  if (size > 0x7002) { f.seek(0x7000); f.read(pt7, 2); f.seek(0); }
+  bool pt7Magic = pt7[0] == 0xAA && pt7[1] == 0x50;
+  logf("flash: image check pt@0x8000=%d pt@0x7000=%d app@0x10000=%d app@0=%d", (int)ptMagic, (int)pt7Magic, (int)app10k, (int)app0);
   if (ptMagic || (app10k && gapErased)) return 1;
+  if (pt7Magic && app0) return 2;
   if (app0) return 0;
   return -1;
 }
@@ -1496,8 +1501,8 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   f.close();
   (void)url;
   if (kind < 0) { logf("flash: not an ESP32 image (no 0xE9 header) - refusing"); return false; }
-  bool merged = kind == 1;
-  uint32_t addr = merged ? 0x0 : 0x10000;
+  bool merged = kind >= 1;
+  uint32_t addr = merged ? 0x0 : 0x10000;   // final address chosen after chip detection
   uint32_t flash_size = (size + 3) & ~3u;
 
   String md5_file, md5_pad;
@@ -1528,6 +1533,38 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   if (err != ESP_LOADER_SUCCESS) {
     logf("flash: connect FAILED %d", (int)err);
     f.close(); heltecEndFlash(true); return false;
+  }
+  {
+    // v1.6.3: detect target chip and pick merged-image base. Classic ESP32 bootloader lives at 0x1000,
+    // S2/S3/C2/C3/C6/H2 at 0x0. App partition is 0x10000 on all of them.
+    target_chip_t chip = esp_loader_get_target();
+    const char *cn = "unknown";
+    switch (chip) {
+      case ESP32_CHIP: cn = "ESP32"; break;
+      case ESP32S2_CHIP: cn = "ESP32-S2"; break;
+      case ESP32C3_CHIP: cn = "ESP32-C3"; break;
+      case ESP32S3_CHIP: cn = "ESP32-S3"; break;
+      case ESP32C2_CHIP: cn = "ESP32-C2"; break;
+      case ESP32H2_CHIP: cn = "ESP32-H2"; break;
+      case ESP32C6_CHIP: cn = "ESP32-C6"; break;
+      default: break;
+    }
+    logf("flash: target chip %s (%d)", cn, (int)chip);
+    progressf("UPDATE", "hammer_and_wrench", 4, "Repeater chip detected: %s", cn);
+    if (chip == ESP8266_CHIP || chip >= ESP_MAX_CHIP || chip == ESP32_RESERVED0_CHIP) {
+      setLastResult("FLASH REFUSED: unsupported/unknown repeater chip (%d)", (int)chip);
+      logf("flash: unknown chip - refusing");
+      f.close(); heltecEndFlash(true); return false;
+    }
+    if (kind == 2) {
+      if (chip != ESP32_CHIP) {
+        setLastResult("FLASH REFUSED: image is classic-ESP32 merged (from 0x1000) but chip is %s", cn);
+        logf("flash: 0x1000 merged image on %s - refusing", cn);
+        f.close(); heltecEndFlash(true); return false;
+      }
+      addr = 0x1000;
+    }
+    logf("flash: write address 0x%X (kind=%d, chip=%s)", addr, kind, cn);
   }
   if (esp_loader_change_transmission_rate(460800) == ESP_LOADER_SUCCESS) {
     HeltecSerial.updateBaudRate(460800);
