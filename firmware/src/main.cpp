@@ -1337,11 +1337,13 @@ static void markOtaValidIfPending(const char *why) {
   esp_ota_mark_app_valid_cancel_rollback();
   logf("OTA: new app marked VALID (%s)", why);
   char m[120]; snprintf(m, sizeof(m), "TSIM OTA OK: %s running (%s)", FW_VERSION, why);
+  setLastResult("%s", m);
   ingestEvent("update", m);
 }
 static void rollbackIfPending(const char *why) {
   if (!otaPendingVerify()) return;
   logf("OTA: app NOT verified (%s) -> rollback + reboot", why);
+  setLastResult("TSIM OTA ROLLBACK: %s never checked in (%s), reverting", FW_VERSION, why);
   Serial.flush(); delay(100);
   esp_ota_mark_app_invalid_rollback_and_reboot();
 }
@@ -1432,13 +1434,24 @@ static bool doTsimUpdate(const char *args) {
 }
 
 // -------------------- flash --------------------
-static bool isMergedImage(File &f, const char *url) {
-  if (url && (strstr(url, "-merged") || strstr(url, "merged") || strstr(url, "factory") ||
-              strstr(url, "freshInstall"))) return true;
-  uint8_t magic = 0;
-  f.seek(0);
-  if (f.read(&magic, 1) != 1) return false;
-  return (magic == 0xE9 && f.size() > 1024 * 1024);
+// Decide the flash address from the file contents only (never the filename), v1.6.2.
+// Merged/factory image: partition table magic 0xAA 0x50 at 0x8000 and/or an app header 0xE9 at 0x10000
+// -> write at 0x0. App-only image: 0xE9 at offset 0 -> write at 0x10000. Anything else: refuse.
+// Returns 1 merged, 0 app-only, -1 unrecognised.
+static int imageKind(File &f) {
+  size_t size = f.size();
+  uint8_t pt[2] = {0, 0}, ap[2] = {0, 0}, h[2] = {0, 0};
+  if (size > 0x8002) { f.seek(0x8000); f.read(pt, 2); }
+  if (size > 0x10010) { f.seek(0x10000); f.read(ap, 2); }
+  f.seek(0); f.read(h, 2); f.seek(0);
+  bool ptMagic = pt[0] == 0xAA && pt[1] == 0x50;
+  bool gapErased = pt[0] == 0xFF && pt[1] == 0xFF;                 // merge_bin fills gaps with 0xFF
+  bool app10k = ap[0] == 0xE9 && ap[1] >= 1 && ap[1] <= 16;        // magic + sane segment count
+  bool app0 = h[0] == 0xE9 && h[1] >= 1 && h[1] <= 16;
+  logf("flash: image check pt@0x8000=%d app@0x10000=%d app@0=%d", (int)ptMagic, (int)app10k, (int)app0);
+  if (ptMagic || (app10k && gapErased)) return 1;
+  if (app0) return 0;
+  return -1;
 }
 
 // Stream the LittleFS file once (after it is closed) and MD5 it. md5_pad covers
@@ -1479,8 +1492,11 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   if (!f) { logf("flash: cannot open"); return false; }
   size_t size = f.size();
   if (size < 256) { logf("flash: too small"); f.close(); return false; }
-  bool merged = isMergedImage(f, url);
+  int kind = imageKind(f);
   f.close();
+  (void)url;
+  if (kind < 0) { logf("flash: not an ESP32 image (no 0xE9 header) - refusing"); return false; }
+  bool merged = kind == 1;
   uint32_t addr = merged ? 0x0 : 0x10000;
   uint32_t flash_size = (size + 3) & ~3u;
 

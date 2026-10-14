@@ -285,9 +285,17 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
   return { state, step, steps: STEPS, times, target, started_at: times[0], finished_at: finished, reason, pct: Math.round((step / 5) * 100) };
 }
 
-// Safety check before texting a Heltec UPDATE: T-SIM firmware <= 1.6.x treats any 0xE9 image over 1 MiB
+// Safety check before texting a Heltec UPDATE: T-SIM firmware older than 1.6.2 treats any 0xE9 image over 1 MiB
 // as a merged image and writes it at 0x0 (over the bootloader). App-only images that big would brick the Heltec.
-export async function heltecImageRisk(url) {
+// 1.6.2+ picks the address from the image contents (partition table at 0x8000), so the guard is skipped there.
+export function fwAtLeast(fw, want) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(fw || "")); if (!m) return false;
+  const a = m.slice(1).map(Number), b = want.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return true;
+}
+export async function heltecImageRisk(url, tsimFw) {
+  if (fwAtLeast(tsimFw, "1.6.2")) return null;
   const name = decodeURIComponent(url.split(/[?#]/)[0].split("/").pop() || "");
   if (/merged|factory|freshInstall/.test(name)) return null;
   try {
@@ -295,7 +303,7 @@ export async function heltecImageRisk(url) {
     const size = parseInt(((r.headers.get("Content-Range") || "").split("/")[1]) || r.headers.get("Content-Length") || "0", 10);
     const b = new Uint8Array(await r.arrayBuffer());
     if (r.status === 206 && b[0] === 0xE9 && size > 1024 * 1024)
-      return `Blocked for safety: ${name} is an app-only image of ${(size / 1048576).toFixed(2)} MB. The current T-SIM firmware would write it at address 0x0 (over the Heltec's bootloader) and brick it. A T-SIM firmware fix is needed before this file can be flashed.`;
+      return `Blocked for safety: ${name} is an app-only image of ${(size / 1048576).toFixed(2)} MB. The current T-SIM firmware would write it at address 0x0 (over the Heltec's bootloader) and brick it. Update the T-SIM firmware to 1.6.2 or newer first (Update T-SIM firmware), then try again.`;
   } catch {}
   return null;
 }
@@ -732,7 +740,7 @@ async function deviceApi(request, env, dev, action) {
     let rel;
     try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
-    const risk = await heltecImageRisk(rel.url);
+    const risk = await heltecImageRisk(rel.url, ((await kvJson(env, `telem:${id}:latest`)) || {}).fw);
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
     const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${rel.asset_name}`, async (st) => {
