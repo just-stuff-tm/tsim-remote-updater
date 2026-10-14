@@ -779,7 +779,7 @@ const vstr = (v) => "v" + v.join(".");
 // installed: version string reported by the device (or null); flashed: {tag, asset_name} last successfully installed (fallback)
 export function updateStatus(installed, rel, flashed = null) {
   if (!rel || rel.skipped) return { state: "unchecked", text: "Not checked yet", checked_at: null };
-  const at = rel.checked_at || null, lv = verOf(rel.tag) || verOf(rel.asset_name);
+  const at = rel.checked_at || null, lv = verOf(rel.asset_name) || verOf(rel.tag);  // asset names are usually more specific (tag PowerSaving17.1 vs asset ...17.1.6)
   const latest = lv ? vstr(lv) : rel.asset_name;
   const iv = verOf(installed) || (flashed && (verOf(flashed.tag) || verOf(flashed.asset_name)));
   if (lv && iv) {

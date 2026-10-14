@@ -311,3 +311,5 @@ console.log("ALL TESTS PASSED");
   globalThis.fetch = of;
   console.log("update status tests ok");
 }
+assert.equal(updateStatus("Heltec_v3_repeater-PowerSaving17.1.6", { tag: "PowerSaving17.1", asset_name: "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin" }).text, "Up to date (v17.1.6)");
+console.log("tag/asset version ok");
