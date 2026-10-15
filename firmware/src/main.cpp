@@ -73,9 +73,9 @@ static bool s_tcp_busy = false;  // true while TLS/TCP socket owns the modem AT 
 
 
 // v1.4.1: dashboard telemetry queue (JSON bodies), flushed by pendingFlush()
-static char s_ingest_q[6][640];
+static char s_ingest_q[6][1024];
 static int s_ingest_q_len = 0;
-static char s_ingest_body[640];
+static char s_ingest_body[1024];
 static void ingestEvent(const char *type, const char *msg);
 static void ingestFlush(void);
 static bool ingestSend(const char *json);
@@ -503,8 +503,9 @@ static void ingestFlush(void) {
 }
 
 // Light event (no AT queries)
+static float s_bat_idle_fwd(void);
 static void ingestEvent(const char *type, const char *msg) {
-  float bat = readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f);
+  float bat = s_bat_idle_fwd();
   float sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
   char m[400], lr[170];
   jsonEsc(m, sizeof(m), msg); jsonEsc(lr, sizeof(lr), s_last_result);
@@ -832,8 +833,9 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
 
 // CMD wake: pull queued console commands from the Worker, run each on the Heltec CLI, post outputs.
 static bool doTsimUpdate(const char *args);
-static void doConsoleCommands(void) {
-  static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands", g_worker_url, g_device_id);
+static void pwrApplyCfg(const char *args, char *out, size_t cap);
+static void doConsoleCommands(bool sys_only = false) {
+  static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
   if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return; }
   int ran = 0;
@@ -856,6 +858,14 @@ static void doConsoleCommands(void) {
       heltecCliEnd();
       static char a[480]; strncpy(a, cmd + 11, sizeof(a) - 1); a[sizeof(a) - 1] = 0;
       doTsimUpdate(a);  // reboots on success
+      ran++;
+      continue;
+    }
+    if (clean && strncasecmp(cmd, "PWRCFG ", 7) == 0) {  // power/calibration config (Worker system command)
+      static char po[400]; pwrApplyCfg(cmd + 7, po, sizeof(po));
+      static char pe[600]; jsonEsc(pe, sizeof(pe), po); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, pe);
+      ingestSendBig(s_mesh_body);
       ran++;
       continue;
     }
@@ -1631,6 +1641,114 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   return ok;
 }
 
+// -------------------- POWER: battery calibration + low-battery repeat protection (v1.6.5) --------------------
+// Idle battery = ADC sampled at the very start of a wake, before the modem is used (LTE draw sags the cell).
+// Calibrated volts = raw * scale + offset (NVS "tsimpwr"; set from the dashboard via a PWRCFG system command).
+static float s_cal_scale = 1.0f, s_cal_off = 0.0f;
+static bool  s_lb_en = false, s_lb_imm = false;
+static float s_lb_off = 3.40f, s_lb_on = 3.75f;   // ON must be >= OFF * 1.10 (user rule)
+#define LB_MIN_RATIO 1.10f
+static uint32_t s_lb_int_min = 30;
+static uint8_t s_lb_state = 0;          // 0 = repeat left ON (normal), 1 = repeat OFF by protection
+static float s_bat_raw_idle = 0, s_bat_idle = 0;
+static char  s_lb_pending[160] = "";    // change not yet reported to the Worker
+RTC_DATA_ATTR static bool s_ext0_failed = false;
+
+static float batCal(float raw) { return raw < 0.5f ? raw : raw * s_cal_scale + s_cal_off; }  // <0.5 V = USB/no reading
+static void pwrLoad() {
+  Preferences p; p.begin("tsimpwr", true);
+  s_cal_scale = p.getFloat("scale", 1.0f); s_cal_off = p.getFloat("off", 0.0f);
+  s_lb_en = p.getBool("en", false); s_lb_imm = p.getBool("imm", false);
+  s_lb_off = p.getFloat("lo", 3.40f); s_lb_on = p.getFloat("hi", 3.75f);
+  s_lb_int_min = p.getUInt("int", 30); s_lb_state = p.getUChar("state", 0);
+  String pend = p.getString("pend", ""); strncpy(s_lb_pending, pend.c_str(), sizeof(s_lb_pending) - 1);
+  p.end();
+  if (!(s_cal_scale > 0.5f && s_cal_scale < 1.5f)) s_cal_scale = 1.0f;
+  if (!(s_cal_off > -0.5f && s_cal_off < 0.5f)) s_cal_off = 0.0f;
+  if (!(s_lb_on >= s_lb_off * LB_MIN_RATIO - 0.005f)) { s_lb_off = 3.40f; s_lb_on = 3.75f; }
+  if (s_lb_int_min < 5 || s_lb_int_min > 1440) s_lb_int_min = 30;
+}
+static void pwrSavePending(const char *m) {
+  strncpy(s_lb_pending, m, sizeof(s_lb_pending) - 1); s_lb_pending[sizeof(s_lb_pending) - 1] = 0;
+  Preferences p; p.begin("tsimpwr", false); p.putString("pend", s_lb_pending); p.putUChar("state", s_lb_state); p.end();
+}
+static void pwrReadIdle() {
+  s_bat_raw_idle = readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f);
+  s_bat_idle = batCal(s_bat_raw_idle);
+  logf("battery idle raw=%.3fV cal=%.3fV (x%.4f %+.3f)", s_bat_raw_idle, s_bat_idle, s_cal_scale, s_cal_off);
+}
+// Sends "set repeat on|off" to the MeshCore repeater and verifies with "get repeat". Returns true on success.
+static bool heltecSetRepeat(bool on) {
+  bool ok = heltecCli(on ? "set repeat on" : "set repeat off", s_cli_out, sizeof(s_cli_out), 4000);
+  bool said = ok && strstr(s_cli_out, on ? "repeat is now ON" : "repeat is now OFF");
+  bool got = heltecCli("get repeat", s_cli_out, sizeof(s_cli_out), 3000);
+  bool is = got && strstr(s_cli_out, on ? "> on" : "> off");
+  heltecCliEnd();
+  logf("repeat %s: set=%d verify=%d", on ? "ON" : "OFF", (int)said, (int)is);
+  return is || (said && !got);
+}
+// Hysteresis on the calibrated idle voltage. Returns true if the repeater state was changed.
+static bool pwrCheck(const char *why) {
+  if (!s_lb_en) return false;
+  float v = s_bat_idle;
+  if (v < 2.5f) { logf("lowbat: no valid reading (%.2fV, USB?) - skip", v); return false; }
+  bool wantOff = s_lb_state == 0 && v < s_lb_off;
+  bool wantOn  = s_lb_state == 1 && v >= s_lb_on;
+  if (!wantOff && !wantOn) return false;
+  bool ok = heltecSetRepeat(!wantOff);
+  char m[160];
+  if (ok) {
+    s_lb_state = wantOff ? 1 : 0;
+    snprintf(m, sizeof(m), "Battery protection: repeat %s at %.2fV (%s %.2fV, %s)", wantOff ? "OFF" : "ON", v,
+             wantOff ? "below" : "at/above", wantOff ? s_lb_off : s_lb_on, why);
+  } else {
+    snprintf(m, sizeof(m), "Battery protection FAIL: repeat %s at %.2fV - no/unexpected CLI reply (%s)", wantOff ? "OFF" : "ON", v, why);
+  }
+  logf("%s", m);
+  pwrSavePending(m);
+  return ok;
+}
+// PWRCFG key=value ... (system command from the Worker)
+static void pwrApplyCfg(const char *args, char *out, size_t cap) {
+  Preferences p; p.begin("tsimpwr", false);
+  char buf[300]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+  char *save = nullptr; int n = 0;
+  float lo = s_lb_off, hi = s_lb_on; bool thr = false;
+  for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
+    char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
+    if (!strcmp(k, "scale")) { float f = atof(v); if (f > 0.5f && f < 1.5f) { s_cal_scale = f; p.putFloat("scale", f); n++; } }
+    else if (!strcmp(k, "off")) { float f = atof(v); if (f > -0.5f && f < 0.5f) { s_cal_off = f; p.putFloat("off", f); n++; } }
+    else if (!strcmp(k, "en")) { s_lb_en = atoi(v) != 0; p.putBool("en", s_lb_en); n++; }
+    else if (!strcmp(k, "imm")) { s_lb_imm = atoi(v) != 0; p.putBool("imm", s_lb_imm); n++; }
+    else if (!strcmp(k, "lo")) { lo = atof(v); thr = true; }
+    else if (!strcmp(k, "hi")) { hi = atof(v); thr = true; }
+    else if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m >= 5 && m <= 1440) { s_lb_int_min = m; p.putUInt("int", m); n++; } }
+  }
+  bool rej = false;
+  if (thr) { if (hi >= lo * LB_MIN_RATIO - 0.005f && lo >= 3.0f && hi <= 4.3f) { s_lb_off = lo; s_lb_on = hi; p.putFloat("lo", lo); p.putFloat("hi", hi); n++; } else rej = true; }
+  if (!s_lb_en && s_lb_state == 1) {  // protection turned off while repeat was off: restore repeat
+    if (heltecSetRepeat(true)) { s_lb_state = 0; p.putUChar("state", 0); }
+  }
+  p.end();
+  s_bat_idle = batCal(s_bat_raw_idle);
+  snprintf(out, cap, "PWRCFG applied %d%s: scale=%.4f off=%.3f en=%d lo=%.2f hi=%.2f int=%u imm=%d state=%s bat=%.2f",
+           n, rej ? " (thresholds REJECTED: ON must be >= OFF x1.10)" : "", s_cal_scale, s_cal_off, (int)s_lb_en, s_lb_off, s_lb_on, (unsigned)s_lb_int_min, (int)s_lb_imm,
+           s_lb_state ? "repeat_off" : "normal", s_bat_idle);
+  logf("%s", out);
+}
+static void pwrReportPending() {
+  if (!s_lb_pending[0]) return;
+  ingestEvent("power", s_lb_pending);
+  s_lb_pending[0] = 0;
+  Preferences p; p.begin("tsimpwr", false); p.putString("pend", ""); p.end();
+}
+static size_t pwrJson(char *dst, size_t cap) {  // extra status fields
+  return snprintf(dst, cap, ",\"battery_raw_v\":%.3f,\"cal_scale\":%.4f,\"cal_off\":%.3f,\"lb_en\":%s,\"lb_state\":%d,"
+                  "\"lb_lo\":%.2f,\"lb_hi\":%.2f,\"lb_int\":%u,\"lb_imm\":%s",
+                  s_bat_raw_idle, s_cal_scale, s_cal_off, s_lb_en ? "true" : "false", (int)s_lb_state,
+                  s_lb_off, s_lb_on, (unsigned)s_lb_int_min, s_lb_imm ? "true" : "false");
+}
+
 // -------------------- STATUS --------------------
 static float readAdcVolts(int pin, float divider) {
   uint32_t mv = 0;
@@ -1643,8 +1761,10 @@ static int batPercent(float v) {
   return (int)((v - 3.30f) * 100.0f / 0.85f);
 }
 
+static float s_bat_idle_fwd(void) { return s_bat_idle; }
 static void doStatusReport(void) {
-  float bat = readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f);
+  float bat_load = batCal(readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f));  // modem on: loaded
+  float bat = s_bat_idle;                                          // idle (start of wake): reported value
   float sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
   static char csq[80]="?", cpsi[200]="?", cops[80]="?", cereg[40]="?", ip[80]="?", cgmr[120]="?";
   auto grab = [](const char *tag, char *dst, size_t n) {
@@ -1693,9 +1813,11 @@ static void doStatusReport(void) {
     snprintf(s_ingest_body, sizeof(s_ingest_body),
       "{\"type\":\"status\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
       "\"solar_v\":%.2f,\"csq\":%d,\"rsrp\":%d,\"rsrq\":%d,\"operator\":\"%s\",\"reg\":%d,\"ip\":\"%s\","
-      "\"modem_fw\":\"%s\",\"heap\":%u,\"fs_free\":%u,\"last_update\":\"%s\",\"msg\":\"STATUS\"}",
+      "\"modem_fw\":\"%s\",\"heap\":%u,\"fs_free\":%u,\"last_update\":\"%s\",\"battery_load_v\":%.2f",
       FW_VERSION, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, bat, batPercent(bat), sol,
-      csqv, rsrp, rsrq, ope, reg, ipe, mfw, (unsigned)ESP.getFreeHeap(), (unsigned)(tot - used), lr);
+      csqv, rsrp, rsrq, ope, reg, ipe, mfw, (unsigned)ESP.getFreeHeap(), (unsigned)(tot - used), lr, bat_load);
+    { size_t L = strlen(s_ingest_body); L += pwrJson(s_ingest_body + L, sizeof(s_ingest_body) - L);
+      snprintf(s_ingest_body + L, sizeof(s_ingest_body) - L, ",\"msg\":\"STATUS\"}"); }
     ingestPostOrQueue(s_ingest_body);
   }
   (void)had;
@@ -1773,6 +1895,7 @@ static bool handleCommand(const char *from, const char *body) {
   }
   if (strcasecmp(s_cmdbuf, "STATUS") == 0) {
     doStatusReport();
+    doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
     meshSnapshot();
     return true;
   }
@@ -1784,6 +1907,7 @@ static bool handleCommand(const char *from, const char *body) {
   if (strcasecmp(s_cmdbuf, "REBOOT") == 0) {
     heltecReboot();
     { progressf("REBOOT", "arrows_counterclockwise", 3, "REBOOT done"); ingestEvent("reboot", "REBOOT done"); }
+    doConsoleCommands(true);
     return true;
   }
   if (strncasecmp(s_cmdbuf, "TSIMUPDATE ", 11) == 0) {
@@ -1926,6 +2050,19 @@ static void processSmsInbox() {
   logf("SMS processed: %d", count);
 }
 
+// Timer-wake path: the modem was never woken, so skip AT+CSCLK; just re-arm wakeups and sleep.
+static void sleepQuick() {
+  heltecPinsRelease();
+  pinMode(MODEM_RI_PIN, INPUT);
+  gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
+  gpio_deep_sleep_hold_en();
+  s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
+  if (s_ext0_failed) esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+  else esp_sleep_enable_timer_wakeup((uint64_t)s_lb_int_min * 60ULL * 1000000ULL);
+  Serial.flush(); delay(50);
+  esp_deep_sleep_start();
+}
+
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
   rollbackIfPending("no successful ingest before sleep");
@@ -1935,8 +2072,10 @@ static void goToSleep() {
   pinMode(MODEM_RI_PIN, INPUT);
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
   gpio_deep_sleep_hold_en();
-  if (esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK)
-    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+  s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
+  if (s_ext0_failed) esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+  else if (s_lb_en) { esp_sleep_enable_timer_wakeup((uint64_t)s_lb_int_min * 60ULL * 1000000ULL);  // battery check
+    logf("battery check timer: %u min", (unsigned)s_lb_int_min); }
   Serial.flush(); delay(100);
   esp_deep_sleep_start();
 }
@@ -2022,14 +2161,24 @@ void setup() {
   logf("ingest: %s", g_ingest_url);
   { const esp_partition_t *r = esp_ota_get_running_partition(); logf("app partition: %s%s", r ? r->label : "?", otaPendingVerify() ? " (OTA pending verify)" : ""); }
   logf("heap: %u", (unsigned)ESP.getFreeHeap());
-  gpio_deep_sleep_hold_dis();
-  gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
-  heltecPinsRelease();
   analogReadResolution(12);
   // LilyGO ReadBattery example: 11 dB attenuation, GPIO4 = VBAT/2, GPIO5 = solar/2 (both ADC1).
   // Per LilyGO, the battery reads 0 V on T-SIM7670G/7672G while USB is plugged in.
   analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
   analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
+  pwrLoad();
+  pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
+  // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
+  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_ext0_failed && !otaPendingVerify()) {
+    gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
+    heltecPinsRelease();
+    bool changed = pwrCheck("timer");
+    if (!(changed && s_lb_imm)) { logf(s_lb_pending[0] ? "battery check: change saved, reported at next wake" : "battery check: no change"); sleepQuick(); return; }
+    logf("battery change - reporting now (immediate report on)");
+  }
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+  heltecPinsRelease();
   if (!LittleFS.begin(true)) logf("LittleFS mount failed");
   else {
     logf("LittleFS OK total=%u used=%u", (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
@@ -2047,6 +2196,8 @@ void setup() {
     modemWaitNetwork(fast ? 30000 : 60000);
     modemConfigureSms();
     if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
+    if (s_wake_cause != ESP_SLEEP_WAKEUP_TIMER || !s_lb_en) pwrCheck("wake");
+    pwrReportPending();
     processSmsInbox();
   }
   if (fast && !s_busy_update) { goToSleep(); return; }

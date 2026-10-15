@@ -371,13 +371,15 @@ export async function resolveTarget(env, id) {
 }
 
 // ---------- ingest ----------
-const NUM = ["uptime", "wake", "battery_v", "battery_pct", "solar_v", "csq", "rsrp", "rsrq", "reg", "heap", "fs_free"];
+const NUM = ["uptime", "wake", "battery_v", "battery_pct", "solar_v", "battery_load_v", "battery_raw_v", "cal_scale", "cal_off", "lb_state", "lb_lo", "lb_hi", "lb_int", "csq", "rsrp", "rsrq", "reg", "heap", "fs_free"];
 const STR = ["fw", "operator", "ip", "modem_fw", "last_update", "msg", "ts"];
 const MESH_RAW = ["heltec_cli", "ver", "name", "clock", "stats_core", "stats_radio", "stats_packets", "neighbors", "error"];
 export function sanitizeTelemetry(t) {
   const o = { type: ["status", "update", "reboot", "event", "mesh", "cmd"].includes(t.type) ? t.type : "event" };
   for (const k of NUM) if (typeof t[k] === "number" && Number.isFinite(t[k])) o[k] = t[k];
   for (const k of STR) if (t[k] != null) o[k] = String(t[k]).slice(0, 300);
+  for (const k of ["lb_en", "lb_imm"]) if (typeof t[k] === "boolean") o[k] = t[k];
+  if (t.type === "power") o.type = "power";
   return o;
 }
 // MeshCore serial CLI replies look like "  -> <reply>" (multi-line for neighbors); "get x" replies "> value".
@@ -455,7 +457,11 @@ async function handleIngest(request, env, id) {
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     const ran = (c ? c.cmd : String(t.cmd || "")).trim().toLowerCase();
     const reply = cleanCli(out);
-    if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
+    if (/^pwrcfg /.test(ran)) {
+      const p = (await kvJson(env, `power:${id}`)) || {};
+      if (c && c.cmd === pwrCfgCmd({ ...DEFAULT_POWER, ...p })) { p.applied_at = entry.received_at; p.applied_output = out.slice(0, 300); await putJson(env, `power:${id}`, p); }
+    }
+    else if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
     else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
     else if (!t.error && ran === "powersaving on" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving on");
     else if (!t.error && reply) await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : "console: CLI answered");
@@ -468,6 +474,10 @@ async function handleIngest(request, env, id) {
   await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type });
   if (entry.type === "update") { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_checkin_ts = Date.now(); await putJson(env, `state:${id}`, s2); }
   await logActivity(env, id, entry);
+  if (entry.type === "power" && entry.msg) {
+    const st = (await kvJson(env, `state:${id}`)) || {};
+    st.power_event = { at: entry.received_at, msg: entry.msg }; await putJson(env, `state:${id}`, st);
+  }
   if (entry.type === "update" && entry.msg && /^TSIM OTA/.test(entry.msg)) {
     const st = (await kvJson(env, `state:${id}`)) || {};
     st.tsim_last_ota = { at: entry.received_at, msg: entry.msg };
@@ -491,7 +501,7 @@ async function handleIngest(request, env, id) {
 // otherwise it stays unknown (the new firmware may simply not have been polled successfully yet).
 export function psDecision(st, on, source, nowIso = new Date().toISOString()) {
   const lf = st.radio_flashed && st.radio_flashed.at;
-  if (on === true && /no (CLI )?reply/i.test(source) && lf && !(st.cli_ok_at && st.cli_ok_at > lf)) return null;
+  if (on === true && /no (CLI )?reply/i.test(source) && lf && !(st.cli_ok_at && st.cli_ok_at >= lf)) return null;
   return on;
 }
 async function setPowersaving(env, id, on, source) {
@@ -504,7 +514,39 @@ async function setPowersaving(env, id, on, source) {
   await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on === null ? "unknown (no CLI reply since the firmware change)" : on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
 
-export const isSysCmd = (cmd) => /^tsimupdate\s/i.test(String(cmd || "").trim());
+export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg)\s/i.test(String(cmd || "").trim());
+const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
+// ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
+export const LB_RATIO = 1.10;
+export const DEFAULT_POWER = { cal_scale: 1, cal_off: 0, lb_en: false, lb_lo: 3.40, lb_hi: 3.75, lb_int: 30, lb_imm: false };
+export const batPct = (v) => v == null ? null : v >= 4.15 ? 100 : v <= 3.30 ? 0 : Math.round((v - 3.30) * 100 / 0.85);  // same curve as the firmware
+const r4 = (x) => Math.round(x * 1e4) / 1e4;
+// b: {measured_v} | {cal_scale, cal_off} | {reset_cal:true} | {lb_en, lb_lo, lb_hi, lb_int, lb_imm}. rawIdle = latest idle raw ADC volts.
+export function validatePower(cur, b, rawIdle) {
+  const o = { ...DEFAULT_POWER, ...cur };
+  if (b.reset_cal) { o.cal_scale = 1; o.cal_off = 0; }
+  if (b.measured_v !== undefined) {
+    const m = Number(b.measured_v);
+    if (!(m >= 2.8 && m <= 4.5)) throw new Error("Measured voltage must be between 2.8 and 4.5 V.");
+    if (!(rawIdle >= 2.5)) throw new Error("No idle battery reading from the T-SIM yet (needs firmware 1.6.5+, and not on USB). Press Request status first.");
+    o.cal_scale = r4(m / rawIdle); o.cal_off = 0;
+    if (!(o.cal_scale > 0.5 && o.cal_scale < 1.5)) throw new Error(`That gives a scale of ${o.cal_scale}, which is out of range (0.5-1.5). Check the measurement.`);
+  }
+  if (b.cal_scale !== undefined) { const f = Number(b.cal_scale); if (!(f > 0.5 && f < 1.5)) throw new Error("Scale factor must be between 0.5 and 1.5."); o.cal_scale = r4(f); }
+  if (b.cal_off !== undefined) { const f = Number(b.cal_off); if (!(f > -0.5 && f < 0.5)) throw new Error("Offset must be between -0.5 and +0.5 V."); o.cal_off = Math.round(f * 1000) / 1000; }
+  if (b.lb_en !== undefined) o.lb_en = b.lb_en === true;
+  if (b.lb_imm !== undefined) o.lb_imm = b.lb_imm === true;
+  if (b.lb_lo !== undefined) o.lb_lo = Math.round(Number(b.lb_lo) * 100) / 100;
+  if (b.lb_hi !== undefined) o.lb_hi = Math.round(Number(b.lb_hi) * 100) / 100;
+  if (b.lb_int !== undefined) o.lb_int = Math.round(Number(b.lb_int));
+  if (!(o.lb_lo >= 3.0 && o.lb_lo <= 4.0)) throw new Error("'Turn repeat OFF below' must be between 3.00 and 4.00 V.");
+  if (!(o.lb_hi <= 4.3)) throw new Error("'Turn repeat ON at/above' must be 4.30 V or lower.");
+  if (!(o.lb_hi >= o.lb_lo * LB_RATIO - 0.005))
+    throw new Error(`'Turn repeat ON at/above' must be at least 10% higher than 'OFF below': with OFF at ${o.lb_lo.toFixed(2)} V, ON must be ${(Math.ceil(o.lb_lo * LB_RATIO * 100) / 100).toFixed(2)} V or more.`);
+  if (!(o.lb_int >= 5 && o.lb_int <= 1440)) throw new Error("Check interval must be 5-1440 minutes.");
+  return o;
+}
+export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
 // Console history shows only what the user typed (system commands still drive state, they're just hidden).
 export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.unsolicited && !isSysCmd(c.cmd));
 // T-SIM pulls queued console commands (text/plain, one "<id>\t<command>" per line). Marks them sent.
@@ -515,7 +557,8 @@ async function handleDeviceCommands(request, env, id) {
   const settings = await getSettings(env, id);
   const list = (await kvJson(env, `cmds:${id}`)) || [];
   const now = new Date().toISOString();
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || settings.console_enabled)).reverse().slice(0, CMD_MAX_PENDING);
+  const sysOnly = new URL(request.url).searchParams.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled))).reverse().slice(0, CMD_MAX_PENDING);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
   return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
@@ -705,6 +748,7 @@ export async function dupeCheck(env, id, kind, retry, now = Date.now()) {
 async function deviceApi(request, env, dev, action) {
   const id = dev.id;
   if (action === "telemetry" && request.method === "GET") {
+    const pwr = { ...DEFAULT_POWER, ...((await kvJson(env, `power:${id}`)) || {}) };
     const [latest, history, st, rel, mesh, settings, cmds, tsimSrc, tsimRel] = await Promise.all([
       kvJson(env, `telem:${id}:latest`), kvJson(env, `telem:${id}:history`), kvJson(env, `state:${id}`), kvJson(env, `release:${id}`),
       kvJson(env, `mesh:${id}`), getSettings(env, id), kvJson(env, `cmds:${id}`), getTsimSource(env, id), kvJson(env, `tsimrel:${id}`),
@@ -713,7 +757,9 @@ async function deviceApi(request, env, dev, action) {
     const source = await getSource(env, id);
     const schedule = { hours: settings.schedule_hours, last_run: s.last_sched_ts ? new Date(s.last_sched_ts).toISOString() : null,
       next_due: settings.schedule_hours ? new Date((s.last_sched_ts || Date.now()) + settings.schedule_hours * 3600e3).toISOString() : null };
-    return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), history: history || [], updates: {
+    const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
+    return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+      power: { settings: pwr, pending: pq ? pq.status : null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
@@ -740,6 +786,21 @@ async function deviceApi(request, env, dev, action) {
       await putJson(env, `release:${id}`, rec);
       return json({ sent: false, latest_available: rec });
     } catch (e) { return json({ sent: false, error: e.message }, 502); }
+  }
+  if (action === "power") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const cur = (await kvJson(env, `power:${id}`)) || {};
+    const L = (await kvJson(env, `telem:${id}:latest`)) || {};
+    let p; try { p = validatePower(cur, b, L.battery_raw_v); } catch (e) { return json({ error: e.message }, 400); }
+    p.updated_at = new Date().toISOString(); p.applied_at = null; p.applied_output = null;
+    if (b.measured_v !== undefined) p.cal_from = { measured_v: Number(b.measured_v), raw_v: L.battery_raw_v, at: L.received_at || null };
+    await putJson(env, `power:${id}`, p);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    for (const c of list) if (c.status === "queued" && /^pwrcfg\s/i.test(c.cmd || "")) c.status = "cancelled";  // newest settings win
+    const entry = { id: randomHex(4), cmd: pwrCfgCmd(p), sys: true, status: "queued", queued_at: p.updated_at };
+    list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await logActivity(env, id, { type: "action", msg: `Power settings saved (sent at the T-SIM's next wake, no text): ${entry.cmd.slice(7)}` });
+    return json({ saved: true, power: p, queued: entry });
   }
   if (action === "settings") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -810,7 +871,7 @@ async function deviceApi(request, env, dev, action) {
     let cleared = 0;
     if (kind === "tsim") {
       const list = (await kvJson(env, `cmds:${id}`)) || [];
-      for (const c of list) if (c.status === "queued" && c.sys) { c.status = "cancelled"; cleared++; }
+      for (const c of list) if (c.status === "queued" && c.sys && isTsimUpd(c)) { c.status = "cancelled"; cleared++; }
       if (cleared) await putJson(env, `cmds:${id}`, list);
     }
     const note = kind === "tsim"
@@ -835,7 +896,7 @@ async function deviceApi(request, env, dev, action) {
     const cmd = buildTsimCommand(rel.url, rel.checksum);
     if (cmd.length > 450) return json({ sent: false, error: "firmware URL too long" }, 400);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
-    for (const c of list) if (c.status === "queued" && c.sys) c.status = "cancelled";  // only one pending self-update
+    for (const c of list) if (c.status === "queued" && c.sys && isTsimUpd(c)) c.status = "cancelled";  // only one pending self-update
     const entry = { id: randomHex(4), cmd, sys: true, status: "queued", queued_at: new Date().toISOString() };
     const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware ${retry ? "update retry" : "update"} (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})`, async (st) => {
       st.tsim_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, checksum: rel.checksum || null, url: rel.url, retry };
@@ -1125,6 +1186,15 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label>File name pattern (* = anything; -merged files skipped unless named)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
 <label>Direct link (optional override, used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
+<details class="card" id="lbbox"><summary><b>Low-battery protection</b><small id="lbsum" class="mut"></small></summary><div class="in">
+<p class="small mut">The T-SIM checks its (calibrated, idle) battery on a timer without starting LTE. Below the OFF level it sends <code>set repeat off</code> to the repeater; when the battery recovers to the ON level it sends <code>set repeat on</code>. The ON level must be at least 10% higher than OFF. Settings reach the T-SIM at its next wake and are kept on the T-SIM, so it works offline. Needs T-SIM firmware 1.6.5+ and repeater firmware with the MeshCore CLI (no power saving).</p>
+<div id="lbinfo"></div>
+<form id="lbf"><label class="tog"><input type="checkbox" name="en"> Enable low-battery protection</label>
+<label>Turn repeat OFF below (V) <small class="mut" id="lbopct"></small><input name="lo" type="number" step="0.01" min="3" max="4"></label>
+<label>Turn repeat ON at/above (V) <small class="mut" id="lbhpct"></small><input name="hi" type="number" step="0.01" min="3.3" max="4.3"></label>
+<label>Check every (minutes)<input name="int" type="number" step="1" min="5" max="1440"></label>
+<label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
+<button type="submit">Save</button><span id="lbmsg" class="msg"></span></form></div></details>
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
@@ -1149,6 +1219,14 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
 </div></section>
 <section><h2>Settings</h2>
+<details class="card" id="calbox"><summary><b>Battery calibration</b><small id="calsum" class="mut"></small></summary><div class="in">
+<p class="small mut">The T-SIM reads the battery at the start of each wake, before the modem is used (idle). Measure the battery with a multimeter while the T-SIM is idle and enter the value; the factor is worked out from the latest idle reading. Settings reach the T-SIM at its next wake (no extra text). The Heltec's own reading is not changed.</p>
+<div id="calinfo"></div>
+<form id="calf"><label>Measured battery voltage (V)<input name="mv" type="number" step="0.01" min="2.8" max="4.5" placeholder="4.07"></label>
+<button type="submit">Calibrate from measurement</button></form>
+<form id="calm"><label>Scale factor<input name="scale" type="number" step="0.0001" min="0.5" max="1.5"></label><label>Offset (V)<input name="off" type="number" step="0.001" min="-0.5" max="0.5"></label>
+<button type="submit" class="g">Save manual values</button> <button type="button" class="g" id="calreset">Reset calibration</button></form>
+<span id="calmsg" class="msg"></span></div></details>
 <details class="card" id="tsimbox"><summary><b>T-SIM firmware source</b><small id="tsimsum" class="mut"></small></summary><div class="in">
 <p class="small mut">Needs T-SIM firmware 1.6.0 or newer. The T-SIM downloads the file, checks it, installs it in its spare slot and restarts. If the new firmware can't check in, it rolls back on its own.</p>
 <form id="tsimf">
@@ -1195,11 +1273,11 @@ var DS={};
 async function load(){
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  $("seen").textContent=seen?(stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale?" stale":"");
  $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
- $("c-power").innerHTML=kv([["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
+ $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
  const US=d.update_status||{};
@@ -1247,6 +1325,26 @@ function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.rep
 $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const r=await post("source",{enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,tag_prefix:f.tag_prefix.value,direct_url:f.direct_url.value});
  const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
+function bpct(v){v=+v;if(!isFinite(v)||!v)return"";return "≈"+(v>=4.15?100:v<=3.3?0:Math.round((v-3.3)*100/0.85))+"%"}
+let pwrLoaded=false,PWR={};
+function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.event;PWR=S;
+ const pend=P.pending?" · waiting for T-SIM ("+P.pending+")":"";
+ $("calsum").textContent=(S.cal_scale!==1||S.cal_off?"x"+S.cal_scale+(S.cal_off?" "+(S.cal_off>0?"+":"")+S.cal_off+" V":""):"not calibrated")+pend;
+ $("calinfo").innerHTML=kv([["Idle raw reading",L.battery_raw_v==null?"none yet (needs 1.6.5)":L.battery_raw_v.toFixed(3)+" V · "+t(L.received_at)],["T-SIM is using",L.cal_scale==null?null:"x"+L.cal_scale+" "+(L.cal_off>=0?"+":"")+L.cal_off+" V"],["Saved here",S.applied_at?"applied "+t(S.applied_at):S.updated_at?"saved "+t(S.updated_at)+", not applied yet":"defaults"]]);
+ const st=L.lb_state==null?null:(L.lb_state?"Repeat OFF (battery protection)":"Repeat ON (normal)");
+ $("lbsum").textContent=(S.lb_en?"on · OFF<"+S.lb_lo.toFixed(2)+" V, ON≥"+S.lb_hi.toFixed(2)+" V":"off")+pend;
+ $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",L.lb_lo==null?null:"OFF<"+L.lb_lo.toFixed(2)+" / ON≥"+L.lb_hi.toFixed(2)+" V, every "+L.lb_int+" min"]]);
+ if(!pwrLoaded){const f=$("lbf");f.en.checked=!!S.lb_en;f.lo.value=S.lb_lo.toFixed(2);f.hi.value=S.lb_hi.toFixed(2);f.int.value=S.lb_int;f.imm.checked=!!S.lb_imm;
+  const m=$("calm");m.scale.value=S.cal_scale;m.off.value=S.cal_off;lbPct();pwrLoaded=true}}
+function lbPct(){const f=$("lbf");$("lbopct").textContent=bpct(f.lo.value);$("lbhpct").textContent=bpct(f.hi.value)}
+$("lbf").oninput=lbPct;
+async function savePwr(b,msg){const r=await post("power",b);const j=await rj(r);say(msg,r.ok,r.ok?"Saved. It reaches the T-SIM at its next wake (no text sent).":(j.error||friendly(j,r.status)));if(r.ok){pwrLoaded=false;load()}}
+$("lbf").onsubmit=ev=>{ev.preventDefault();const f=ev.target,lo=+f.lo.value,hi=+f.hi.value;
+ if(!(hi>=lo*1.1-0.005)){say("lbmsg",false,"ON must be at least 10% higher than OFF: with OFF at "+lo.toFixed(2)+" V, ON must be "+(Math.ceil(lo*110)/100).toFixed(2)+" V or more.");return}
+ savePwr({lb_en:f.en.checked,lb_lo:lo,lb_hi:hi,lb_int:+f.int.value,lb_imm:f.imm.checked},"lbmsg")};
+$("calf").onsubmit=ev=>{ev.preventDefault();savePwr({measured_v:+ev.target.mv.value},"calmsg")};
+$("calm").onsubmit=ev=>{ev.preventDefault();savePwr({cal_scale:+ev.target.scale.value,cal_off:+ev.target.off.value},"calmsg")};
+$("calreset").onclick=()=>{if(confirm("Reset the T-SIM battery calibration to factory (x1, +0 V)?"))savePwr({reset_cal:true},"calmsg")};
 $("schsave").onclick=async()=>{const h=+$("sch").value;
  if(h&&!confirm("Text this T-SIM every "+h+" hours? Each check uses one incoming text and some battery."))return;
  const r=await post("settings",{schedule_hours:h});const j=await rj(r);say("schmsg",r.ok,r.ok?"Saved":friendly(j,r.status));load();};

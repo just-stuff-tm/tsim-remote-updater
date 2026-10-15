@@ -459,3 +459,50 @@ console.log("tag/asset version ok");
   await refreshReleases(env, Date.now()); assert.equal(ghList, g0 + 1, "6h cache: no second GitHub call");
   console.log("MeshCore repeater-* release tracking OK");
 }
+
+// v1.6.5 power: calibration + low-battery protection (no SMS)
+{
+  const { validatePower, pwrCfgCmd, DEFAULT_POWER, batPct, isSysCmd, userCommands } = await import("../src/index.js");
+  assert.equal(DEFAULT_POWER.lb_hi >= DEFAULT_POWER.lb_lo * 1.1, true);
+  assert.throws(() => validatePower({}, { lb_lo: 3.4, lb_hi: 3.7 }, 3.9), /at least 10% higher.*3\.74 V or more/);
+  assert.equal(validatePower({}, { lb_lo: 3.4, lb_hi: 3.74 }, 3.9).lb_hi, 3.74);
+  assert.throws(() => validatePower({}, { lb_int: 2 }, 3.9), /5-1440/);
+  assert.throws(() => validatePower({}, { measured_v: 4.07 }, 0), /No idle battery reading/);
+  assert.equal(validatePower({}, { measured_v: 4.07 }, 3.95).cal_scale, 1.0304);
+  assert.throws(() => validatePower({}, { cal_scale: 2 }, 3.9), /0\.5 and 1\.5/);
+  assert.deepEqual([validatePower({ cal_scale: 1.1, cal_off: 0.1 }, { reset_cal: true }, 0).cal_scale, validatePower({ cal_scale: 1.1, cal_off: 0.1 }, { reset_cal: true }, 0).cal_off], [1, 0]);
+  assert.equal(pwrCfgCmd(DEFAULT_POWER), "PWRCFG scale=1 off=0 en=0 lo=3.40 hi=3.75 int=30 imm=0");
+  assert.equal(batPct(3.75), 53); assert(isSysCmd("PWRCFG scale=1"));
+  // via API: login as device, save, queued sys cmd, no Hologram text
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const post = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  await post({ type: "status", fw: "tsim-updater 1.6.5", battery_v: 3.95, battery_raw_v: 3.95, battery_load_v: 3.86, cal_scale: 1, cal_off: 0, lb_en: false, lb_state: 0, lb_lo: 3.4, lb_hi: 3.75, lb_int: 30, msg: "STATUS" });
+  const L = JSON.parse(kv.get("telem:tsim-1:latest")); assert.equal(L.battery_raw_v, 3.95); assert.equal(L.lb_en, false); assert.equal(L.battery_load_v, 3.86);
+  const pw = JSON.parse(kv.get("device:tsim-1")); void pw;
+  kv.set("cmds:tsim-1", "[]");
+  const h0 = holo;
+  // call the device API handler directly through the router with a device session: reuse admin-free path via exported handler is not available, so simulate KV result
+  const { default: W } = await import("../src/index.js");
+  const sess = (await login("tsim-1", "device-one-password", "9.9.9.9")).headers.get("Set-Cookie");
+  if (sess && /=/.test(sess)) {
+    const c = sess.split(";")[0];
+    const P = (b) => call("/api/d/tsim-1/power", { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    let rr = await P({ lb_en: true, lb_lo: 3.4, lb_hi: 3.6 }); assert.equal(rr.status, 400); assert(/10% higher/.test((await rr.json()).error));
+    rr = await P({ measured_v: 4.07 }); assert.equal(rr.status, 200);
+    rr = await P({ lb_en: true, lb_lo: 3.4, lb_hi: 3.75 }); assert.equal(rr.status, 200);
+    const cl = JSON.parse(kv.get("cmds:tsim-1"));
+    assert.equal(cl.filter((x) => x.status === "queued").length, 1, "newest PWRCFG replaces older");
+    assert.equal(cl[0].cmd, "PWRCFG scale=1.0304 off=0 en=1 lo=3.40 hi=3.75 int=30 imm=0"); assert(cl[0].sys);
+    const txt = await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+    assert(txt.includes("PWRCFG scale=1.0304"));
+    await post({ type: "cmd", cmd_id: cl[0].id, cmd: cl[0].cmd, sys: true, output: "PWRCFG applied 6: scale=1.0304" });
+    const tel = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+    assert(tel.power.settings.applied_at); assert.equal(tel.power.pending, null); assert.equal(userCommands(JSON.parse(kv.get("cmds:tsim-1"))).length, 0);
+    await post({ type: "power", msg: "Battery protection: repeat OFF at 3.38V (below 3.40V, timer)", battery_v: 3.38 });
+    const tel2 = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+    assert(/repeat OFF/.test(tel2.power.event.msg));
+    console.log("power API tests OK (session)");
+  } else throw new Error("power API login failed");
+  assert.equal(holo, h0, "power settings never text the T-SIM");
+  console.log("v1.6.5 power tests OK");
+}

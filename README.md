@@ -56,7 +56,12 @@ flowchart LR
 On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9. Put 100 µF + 10 µF across the Heltec 3V3/GND. Don't power both boards from USB at the same time while 3V3 is linked.
 
 
-## Supported repeater boards
+## Battery calibration and low-battery protection (T-SIM firmware 1.6.5+)
+
+- **Idle battery reading:** the T-SIM samples its battery at the very start of each wake, before the modem is used, and reports that as the battery voltage. The reading with LTE running is shown separately as "Battery (LTE on)".
+- **Calibration** (T-SIM tab › Battery calibration): enter a multimeter reading and the Worker computes a scale factor from the latest idle raw reading. You can also enter a scale/offset by hand, or reset. Settings are queued as a system command (`PWRCFG …`) that the T-SIM picks up at its next wake (Request status, console command or reboot), with no extra text. The T-SIM stores them in NVS. The repeater's own battery value is never calibrated.
+- **Low-battery protection** (LoRa radio tab, off by default): when enabled, the T-SIM also wakes on a timer (default every 30 min) without starting LTE. It reads the idle battery and sends MeshCore `set repeat off` below the OFF level and `set repeat on` at/above the ON level, then verifies with `get repeat`. ON must be at least 10% higher than OFF (defaults 3.40 V / 3.75 V). The state is kept in NVS and reported at the next normal wake, or immediately if you enable that.
+
 
 The Worker and dashboard don't care which board the repeater is. The T-SIM drives the repeater over 4 wires (TX, RX, RST, BOOT/GPIO0) plus GND. Remote flashing uses Espressif's ROM serial bootloader (esp-serial-flasher). Since v1.6.3 the T-SIM detects the chip after connecting, logs it ("Repeater chip detected: …"), and picks the write address.
 
