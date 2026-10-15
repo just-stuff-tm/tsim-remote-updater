@@ -404,3 +404,26 @@ console.log("tag/asset version ok");
   assert.deepEqual(userCommands(all).map((c) => c.id), ["u1"]);
   console.log("system-command console filter OK");
 }
+
+// power saving: unknown after a flash, cleared by replies
+{
+  const { psDecision } = await import("../src/index.js");
+  const st = { radio_flashed: { at: "2026-10-15T00:07:02.178Z" } };
+  assert.equal(psDecision(st, true, "mesh poll: no CLI reply"), null);
+  assert.equal(psDecision({ ...st, cli_ok_at: "2026-10-15T00:13:00.000Z" }, true, "mesh poll: no CLI reply"), true);
+  assert.equal(psDecision(st, true, "console: powersaving on"), true);
+  assert.equal(psDecision({}, true, "mesh poll: no CLI reply"), true);
+  assert.equal(psDecision(st, false, "mesh poll: CLI answered"), false);
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const post = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const s0 = JSON.parse(kv.get("state:tsim-1")); s0.heltec_powersaving = true; kv.set("state:tsim-1", JSON.stringify(s0));
+  await post({ type: "update", msg: "SUCCESS: https://g/x/Heltec_v3_repeater-v1.17.1-d929643.bin | chip=ESP32-S3" });
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, null, "flash resets to unknown");
+  await post({ type: "mesh", heltec_cli: "asleep" });
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, null, "no reply after flash stays unknown");
+  await post({ type: "mesh", ver: "v1.17.1-d929643" });
+  const s1 = JSON.parse(kv.get("state:tsim-1")); assert.equal(s1.heltec_powersaving, false); assert(s1.cli_ok_at);
+  await post({ type: "mesh", heltec_cli: "asleep" });
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, true, "fresh no-reply after a confirmed answer asserts it");
+  console.log("power-saving state tests OK");
+}

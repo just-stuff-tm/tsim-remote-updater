@@ -452,18 +452,30 @@ async function handleIngest(request, env, id) {
     const m = entry.msg.match(/^SUCCESS:\s*(\S+)/);
     if (m) { const file = flashFile(entry.msg);
       st.heltec_fw = file.replace(/\.bin$/, "");
-      st.radio_flashed = { at: entry.received_at, file, flash: parseFlashInfo(entry.msg) }; }
+      st.radio_flashed = { at: entry.received_at, file, flash: parseFlashInfo(entry.msg) };
+      // new firmware: whatever we knew about power saving is stale
+      st.heltec_powersaving = null; st.powersaving_at = entry.received_at; st.powersaving_source = "radio firmware flashed; unknown until the next CLI/mesh reply"; }
     await putJson(env, `state:${id}`, st);
   }
   return json({ ok: true });
 }
 
+// on: true | false | null (unknown). After a radio flash the state is unknown until fresh evidence.
+// A bare "no reply" only asserts power saving if this firmware has answered the CLI since the last flash;
+// otherwise it stays unknown (the new firmware may simply not have been polled successfully yet).
+export function psDecision(st, on, source, nowIso = new Date().toISOString()) {
+  const lf = st.radio_flashed && st.radio_flashed.at;
+  if (on === true && /no (CLI )?reply/i.test(source) && lf && !(st.cli_ok_at && st.cli_ok_at > lf)) return null;
+  return on;
+}
 async function setPowersaving(env, id, on, source) {
   const st = (await kvJson(env, `state:${id}`)) || {};
+  on = psDecision(st, on, source);
+  if (on === false) { st.cli_ok_at = new Date().toISOString(); if (st.heltec_powersaving === false) { await putJson(env, `state:${id}`, st); return; } }
   if (st.heltec_powersaving === on) return;
   st.heltec_powersaving = on; st.powersaving_at = new Date().toISOString(); st.powersaving_source = source;
   await putJson(env, `state:${id}`, st);
-  await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
+  await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on === null ? "unknown (no CLI reply since the firmware change)" : on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
 
 export const isSysCmd = (cmd) => /^tsimupdate\s/i.test(String(cmd || "").trim());
@@ -678,7 +690,7 @@ async function deviceApi(request, env, dev, action) {
     return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
-      powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null },
+      powersaving: { on: s.heltec_powersaving === true, unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
       progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS,
       update_status: statuses(latest, mesh, s, history, rel, tsimRel) });
@@ -1143,7 +1155,8 @@ function prog(p,label,pend){
   return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
  return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"Failed":p.pct+"%")+'</span></div>'+
   '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+finfo(p.flash)+
-  (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+'<ol class="steps">'+rows+'</ol></div>'}
+  (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
+var DS={};
 async function load(){
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
@@ -1172,7 +1185,7 @@ async function load(){
  $("consum").textContent=S.console_enabled?"on":"off";
  if(first){$("sch").value=String(S.schedule_hours||0);$("conon").checked=!!S.console_enabled;first=false}
  const PS=!!(d.powersaving&&d.powersaving.on);
- $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PS?'<span class="badge mut">Power saving</span>':'');
+ $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PS?'<span class="badge mut">Power saving</span>':(d.powersaving&&d.powersaving.unknown?'<span class="badge mut" title="'+e(d.powersaving.source||"")+'">Power saving: unknown</span>':''));
  $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Updates",utext(US.radio)],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
  $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Updates",utext(US.tsim)],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
