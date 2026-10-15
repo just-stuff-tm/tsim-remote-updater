@@ -60,6 +60,8 @@ On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9. Put 100 µF + 1
 
 The Worker and dashboard don't care which board the repeater is. The T-SIM drives the repeater over 4 wires (TX, RX, RST, BOOT/GPIO0) plus GND. Remote flashing uses Espressif's ROM serial bootloader (esp-serial-flasher). Since v1.6.3 the T-SIM detects the chip after connecting, logs it ("Repeater chip detected: …"), and picks the write address.
 
+Since v1.6.4 every radio update reports the detected chip, image type (merged / app-only / classic-merged), flash address, bytes written and the MD5 verify result to the dashboard (LoRa radio tab). After a successful flash the radio shows "Last flashed: <file> (awaiting repeater confirmation)" until a mesh poll reports the repeater's own version; then it shows "Up to date (vX, confirmed)", or a mismatch warning if the reported version differs from the flashed file.
+
 | Repeater board | Remote flash | Reboot / status / console |
 |---|---|---|
 | **ESP32-S3** MeshCore boards (Heltec V3/V4, LilyGO T3S3, Station G2, Seeed Xiao S3, …) | ✅ Yes | ✅ Yes |

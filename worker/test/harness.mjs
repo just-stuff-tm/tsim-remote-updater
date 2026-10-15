@@ -352,3 +352,37 @@ console.log("ALL TESTS PASSED");
 }
 assert.equal(updateStatus("Heltec_v3_repeater-PowerSaving17.1.6", { tag: "PowerSaving17.1", asset_name: "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin" }).text, "Up to date (v17.1.6)");
 console.log("tag/asset version ok");
+
+// v1.6.4 flash details + radio confirmation status
+{
+  const { parseFlashInfo, radioStatus } = await import("../src/index.js");
+  const fi = parseFlashInfo("SUCCESS: https://g/x/Heltec_v3_repeater-v1.17.1-d929643.bin | chip=ESP32-S3 image=app-only addr=0x10000 size=1000 written=1000 verify=OK md5=abc");
+  assert.deepEqual(fi, { chip: "ESP32-S3", image: "app-only", addr: "0x10000", size: 1000, written: 1000, verify: "OK", md5: "abc" });
+  const now = Date.now(), T = (m) => new Date(now - 60e3 * (10 - m)).toISOString();
+  const st = { last_update_sent: { at: T(0), asset_name: "Heltec_v3_repeater-v1.17.1-d929643.bin", tag: "direct" } };
+  const H = [{ type: "update", msg: "SUCCESS: https://g/x/Heltec_v3_repeater-v1.17.1-d929643.bin | chip=ESP32-S3 image=app-only addr=0x10000 size=1000 written=1000 verify=OK md5=abc", received_at: T(3) },
+    { type: "update", msg: "Flashing: chip=ESP32-S3 image=app-only addr=0x10000 size=1000", received_at: T(2) },
+    { type: "update", msg: "Download done: 1000 bytes, flashing", received_at: T(1.5) }];
+  const p = computeProgress("heltec", H, st, now);
+  assert.equal(p.state, "done"); assert.equal(p.flash.chip, "ESP32-S3"); assert.equal(p.flash.verify, "OK"); assert.equal(p.flash.addr, "0x10000");
+  const pf = computeProgress("heltec", [{ type: "update", msg: "FAIL: flash https://g/a.bin | chip=ESP32-S3 image=merged addr=0x0 size=9 written=9 verify=FAIL md5=d", received_at: T(3) }, H[1]], st, now);
+  assert.equal(pf.state, "failed"); assert.equal(pf.flash.verify, "FAIL"); assert.equal(pf.flash.image, "merged");
+  const rel = { tag: "direct", asset_name: "Heltec_v3_repeater-v1.17.1-d929643.bin", checked_at: T(0) };
+  const s2 = { radio_flashed: { at: T(3), file: "Heltec_v3_repeater-v1.17.1-d929643.bin", flash: fi } };
+  let u = radioStatus({ heltec_fw: "PowerSaving 17.1.6", received_at: T(1) }, s2, rel);
+  assert.equal(u.state, "flashed"); assert.equal(u.text, "Last flashed: Heltec_v3_repeater-v1.17.1-d929643.bin (awaiting repeater confirmation)");
+  u = radioStatus({ heltec_fw: "v1.17.1-d929643 (Build: 1-Oct-2026)", received_at: T(5) }, s2, rel);
+  assert.equal(u.state, "current"); assert.equal(u.text, "Up to date (v1.17.1, confirmed)");
+  u = radioStatus({ heltec_fw: "v1.16.0", received_at: T(5) }, s2, rel);
+  assert.equal(u.state, "mismatch"); assert(/flashed Heltec_v3_repeater-v1.17.1-d929643.bin but the repeater reports v1.16.0/.test(u.text));
+  u = radioStatus({ heltec_fw: "v1.17.1", received_at: T(5) }, s2, null); assert.equal(u.text, "Running v1.17.1 (confirmed)");
+  assert.equal(radioStatus({ heltec_fw: "v1.17.1" }, {}, rel).state, "current");  // no flash record: old behaviour
+  // ingest stores radio_flashed
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  r = await call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify({ type: "update", fw: "tsim-updater 1.6.4", msg: H[0].msg }) });
+  assert.equal(r.status, 200);
+  const sst = JSON.parse(kv.get("state:tsim-1"));
+  assert.equal(sst.radio_flashed.file, "Heltec_v3_repeater-v1.17.1-d929643.bin"); assert.equal(sst.radio_flashed.flash.chip, "ESP32-S3");
+  assert.equal(sst.heltec_fw, "Heltec_v3_repeater-v1.17.1-d929643");
+  console.log("v1.6.4 flash-info tests OK");
+}

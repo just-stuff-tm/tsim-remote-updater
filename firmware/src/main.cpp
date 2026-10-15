@@ -73,7 +73,7 @@ static bool s_tcp_busy = false;  // true while TLS/TCP socket owns the modem AT 
 
 
 // v1.4.1: dashboard telemetry queue (JSON bodies), flushed by pendingFlush()
-static char s_ingest_q[6][520];
+static char s_ingest_q[6][640];
 static int s_ingest_q_len = 0;
 static char s_ingest_body[640];
 static void ingestEvent(const char *type, const char *msg);
@@ -506,7 +506,7 @@ static void ingestFlush(void) {
 static void ingestEvent(const char *type, const char *msg) {
   float bat = readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f);
   float sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
-  char m[200], lr[170];
+  char m[400], lr[170];
   jsonEsc(m, sizeof(m), msg); jsonEsc(lr, sizeof(lr), s_last_result);
   snprintf(s_ingest_body, sizeof(s_ingest_body),
     "{\"type\":\"%s\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
@@ -1492,7 +1492,12 @@ static void heltecEndFlash(bool loader_up) {
   logf("flash: BOOT released + Heltec reset");
 }
 
+// v1.6.4: flash details reported to the dashboard (chip, image type, address, bytes, verify)
+static char s_flash_info[200] = "";
+static const char *imageKindName(int k) { return k == 2 ? "classic-merged" : k == 1 ? "merged" : "app-only"; }
+
 static bool flashHeltecFromFile(const char *path, const char *url) {
+  s_flash_info[0] = 0;
   File f = LittleFS.open(path, "r");
   if (!f) { logf("flash: cannot open"); return false; }
   size_t size = f.size();
@@ -1565,6 +1570,9 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
       addr = 0x1000;
     }
     logf("flash: write address 0x%X (kind=%d, chip=%s)", addr, kind, cn);
+    snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
+             cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
+    { char m[240]; snprintf(m, sizeof(m), "Flashing: %s", s_flash_info); ingestEvent("update", m); }
   }
   if (esp_loader_change_transmission_rate(460800) == ESP_LOADER_SUCCESS) {
     HeltecSerial.updateBaudRate(460800);
@@ -1605,6 +1613,9 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   // library's incremental context). Heltec hashes addr..addr+flash_size.
   err = esp_loader_flash_verify_known_md5(addr, flash_size, (const uint8_t *)md5_pad.c_str());
   bool ok = (err == ESP_LOADER_SUCCESS);
+  { size_t L = strlen(s_flash_info);
+    snprintf(s_flash_info + L, sizeof(s_flash_info) - L, " written=%u verify=%s md5=%s",
+             (unsigned)written, ok ? "OK" : "FAIL", md5_file.c_str()); }
   if (ok) {
     logf("flash: MD5 OK  file=%s  heltec=%s", md5_file.c_str(), md5_pad.c_str());
     progressf("UPDATE", "white_check_mark", 3, "MD5 verify OK %s", md5_file.c_str());
@@ -1744,7 +1755,8 @@ static bool doUpdate(const char *url, bool flash_too) {
     setLastResult("FAIL: flash");
     progressf("UPDATE", "x", 5, "FAIL: flash");
   }
-  { char m[220]; snprintf(m, sizeof(m), "%s %.180s", flashed ? "SUCCESS:" : "FAIL: flash", url); ingestEvent("update", m); }
+  { char m[380]; snprintf(m, sizeof(m), "%s %.160s%s%s", flashed ? "SUCCESS:" : "FAIL: flash", url,
+                          s_flash_info[0] ? " | " : "", s_flash_info); ingestEvent("update", m); }
   return flashed;
 }
 
