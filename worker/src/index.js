@@ -459,7 +459,7 @@ async function handleIngest(request, env, id) {
     const reply = cleanCli(out);
     if (/^pwrcfg /.test(ran)) {
       const p = (await kvJson(env, `power:${id}`)) || {};
-      if (c && c.cmd === pwrCfgCmd({ ...DEFAULT_POWER, ...p })) { p.applied_at = entry.received_at; p.applied_output = out.slice(0, 300); await putJson(env, `power:${id}`, p); }
+      if (c && c.cmd === (p.last_cmd || pwrCfgCmd({ ...DEFAULT_POWER, ...p }))) { p.applied_at = entry.received_at; p.applied_output = out.slice(0, 300); p.wake = null; await putJson(env, `power:${id}`, p); }
     }
     else if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
     else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
@@ -467,7 +467,7 @@ async function handleIngest(request, env, id) {
     else if (!t.error && reply) await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : "console: CLI answered");
     const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
     await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at });
-    await logActivity(env, id, { type: "cmd", msg: `Console: ${(c ? c.cmd : String(t.cmd || "?")).slice(0, 60)} → ${out.split("\n")[0].slice(0, 80)}` });
+    await logActivity(env, id, { type: "cmd", msg: `${sys ? "System" : "Console"}: ${(c ? c.cmd : String(t.cmd || "?")).slice(0, 60)} → ${out.split("\n")[0].slice(0, 80)}` });
     return json({ ok: true });
   }
   const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
@@ -539,11 +539,16 @@ export function validatePower(cur, b, rawIdle) {
   if (b.lb_lo !== undefined) o.lb_lo = Math.round(Number(b.lb_lo) * 100) / 100;
   if (b.lb_hi !== undefined) o.lb_hi = Math.round(Number(b.lb_hi) * 100) / 100;
   if (b.lb_int !== undefined) o.lb_int = Math.round(Number(b.lb_int));
+  if (b.lb_int_h !== undefined) {
+    const h = Number(b.lb_int_h);
+    if (!(h >= 0.25 && h <= 24)) throw new Error("Check interval must be between 0.25 and 24 hours.");
+    o.lb_int = Math.round(h * 60);
+  }
   if (!(o.lb_lo >= 3.0 && o.lb_lo <= 4.0)) throw new Error("'Turn repeat OFF below' must be between 3.00 and 4.00 V.");
   if (!(o.lb_hi <= 4.3)) throw new Error("'Turn repeat ON at/above' must be 4.30 V or lower.");
   if (!(o.lb_hi >= o.lb_lo * LB_RATIO - 0.005))
     throw new Error(`'Turn repeat ON at/above' must be at least 10% higher than 'OFF below': with OFF at ${o.lb_lo.toFixed(2)} V, ON must be ${(Math.ceil(o.lb_lo * LB_RATIO * 100) / 100).toFixed(2)} V or more.`);
-  if (!(o.lb_int >= 5 && o.lb_int <= 1440)) throw new Error("Check interval must be 5-1440 minutes.");
+  if (!(o.lb_int >= 15 && o.lb_int <= 1440)) throw new Error("Check interval must be between 0.25 and 24 hours.");
   return o;
 }
 export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
@@ -558,7 +563,9 @@ async function handleDeviceCommands(request, env, id) {
   const list = (await kvJson(env, `cmds:${id}`)) || [];
   const now = new Date().toISOString();
   const sysOnly = new URL(request.url).searchParams.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled))).reverse().slice(0, CMD_MAX_PENDING);
+  const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
+  const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || ""))).reverse().slice(0, CMD_MAX_PENDING);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
   return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
@@ -755,11 +762,10 @@ async function deviceApi(request, env, dev, action) {
     ]);
     const s = st || {};
     const source = await getSource(env, id);
-    const schedule = { hours: settings.schedule_hours, last_run: s.last_sched_ts ? new Date(s.last_sched_ts).toISOString() : null,
-      next_due: settings.schedule_hours ? new Date((s.last_sched_ts || Date.now()) + settings.schedule_hours * 3600e3).toISOString() : null };
+    const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
-      power: { settings: pwr, pending: pq ? pq.status : null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
+      power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
@@ -792,15 +798,33 @@ async function deviceApi(request, env, dev, action) {
     const cur = (await kvJson(env, `power:${id}`)) || {};
     const L = (await kvJson(env, `telem:${id}:latest`)) || {};
     let p; try { p = validatePower(cur, b, L.battery_raw_v); } catch (e) { return json({ error: e.message }, 400); }
-    p.updated_at = new Date().toISOString(); p.applied_at = null; p.applied_output = null;
-    if (b.measured_v !== undefined) p.cal_from = { measured_v: Number(b.measured_v), raw_v: L.battery_raw_v, at: L.received_at || null };
-    await putJson(env, `power:${id}`, p);
+    const cmd = pwrCfgCmd(p);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
-    for (const c of list) if (c.status === "queued" && /^pwrcfg\s/i.test(c.cmd || "")) c.status = "cancelled";  // newest settings win
-    const entry = { id: randomHex(4), cmd: pwrCfgCmd(p), sys: true, status: "queued", queued_at: p.updated_at };
-    list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
-    await logActivity(env, id, { type: "action", msg: `Power settings saved (sent at the T-SIM's next wake, no text): ${entry.cmd.slice(7)}` });
-    return json({ saved: true, power: p, queued: entry });
+    const unchanged = cur.applied_at && cur.last_cmd === cmd;  // same as what the T-SIM already runs: nothing to deliver
+    const now = new Date().toISOString();
+    let entry = null;
+    if (!unchanged) {
+      p.updated_at = now; p.applied_at = null; p.applied_output = null; p.last_cmd = cmd;  // keep p.wake: a recent wake text still delivers the newest settings
+      if (b.measured_v !== undefined) p.cal_from = { measured_v: Number(b.measured_v), raw_v: L.battery_raw_v, at: L.received_at || null };
+      const q = list.find((c) => c.status === "queued" && c.cmd === cmd);
+      for (const c of list) if (c !== q && c.status === "queued" && /^pwrcfg\s/i.test(c.cmd || "")) c.status = "cancelled";  // newest settings win
+      entry = q || { id: randomHex(4), cmd, sys: true, status: "queued", queued_at: now };
+      if (!q) list.unshift(entry);
+      await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+      await putJson(env, `power:${id}`, p);
+      await logActivity(env, id, { type: "action", msg: `Power settings saved: ${cmd.slice(7)}` });
+    }
+    let wake = null;
+    if (b.send === true && !unchanged) {
+      if (!fwAtLeast(L.fw, "1.6.5")) wake = { sent: false, error: "The T-SIM needs firmware 1.6.5 or newer for these settings. Update the T-SIM first." };
+      else if (p.wake && p.wake.sent && Date.now() - Date.parse(p.wake.at) < 15 * 60e3) wake = { sent: false, already: true, error: "A wake text was already sent " + Math.round((Date.now() - Date.parse(p.wake.at)) / 60e3) + " min ago; the settings will be picked up when the T-SIM wakes. No new text sent." };
+      else {
+        const [o] = await manualSend(env, dev, "STATUS", "Deliver power settings (STATUS)");
+        wake = { sent: !!o.sent, at: new Date().toISOString(), error: o.error || (o.hologram_response_summary && o.hologram_response_summary.error) || null };
+        const p2 = (await kvJson(env, `power:${id}`)) || p; p2.wake = wake; await putJson(env, `power:${id}`, p2); p = p2;
+      }
+    }
+    return json({ saved: true, unchanged: !!unchanged, power: p, queued: entry, wake });
   }
   if (action === "settings") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -1016,6 +1040,15 @@ export async function refreshReleases(env, now = Date.now()) {
   return out;
 }
 
+// Scheduled check summary for the dashboard. The cron runs at the top of every hour and sends when an
+// interval (minus 10 min slack) has passed since the anchor (last run, or when the schedule was set).
+export function scheduleInfo(hours, st = {}, now = Date.now()) {
+  const lr = st.last_sched_run || null;
+  if (!hours) return { hours: 0, last_run: lr, next_run: null };
+  const due = (st.last_sched_ts || now) + hours * 3600e3 - 10 * 60e3;
+  const next = Math.max(Math.ceil(due / 3600e3), Math.ceil((now + 1) / 3600e3)) * 3600e3;
+  return { hours, last_run: lr, next_run: new Date(next).toISOString() };
+}
 // Cron (hourly): text STATUS only to devices whose optional scheduled check is due.
 export async function runSchedules(env, now = Date.now()) {
   const sent = [];
@@ -1029,6 +1062,7 @@ export async function runSchedules(env, now = Date.now()) {
     if (!dev) continue;
     st.last_sched_ts = now; await putJson(env, `state:${id}`, st);
     const [o] = await manualSend(env, dev, "STATUS", `Scheduled STATUS (${h}h)`);
+    { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_sched_run = { at: new Date(now).toISOString(), sent: !!o.sent, error: o.error || null }; await putJson(env, `state:${id}`, s2); }
     sent.push({ id, sent: o.sent, error: o.error || null });
   }
   return sent;
@@ -1051,7 +1085,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px 8px;b
 .tw{overflow-x:auto}.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;background:var(--ok)}
 .badge.stale,.badge.failed{background:var(--bad)}.badge.run{background:var(--acc)}.badge.mut{background:#8b949e}
 input,select{width:100%;padding:10px;margin:4px 0 12px;border-radius:8px;border:1px solid var(--line);font-size:16px;background:var(--card);color:var(--fg)}
-label{font-size:13px;color:var(--mut)}.login{max-width:380px;margin:10vh auto}.err{color:var(--bad)}.mut{color:var(--mut)}.small{font-size:13px}
+label{font-size:13px;color:var(--mut)}.login{max-width:380px;margin:10vh auto}.err{color:var(--bad)}span.ok{color:var(--ok)}.mut{color:var(--mut)}.small{font-size:13px}
 a{color:var(--acc)}a.dev{color:inherit;text-decoration:none;display:block}a.dev:hover{border-color:var(--acc)}a.back{text-decoration:none}
 .row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.row input{flex:1;min-width:160px;margin:0}
 details.card{margin:10px 0;padding:0}details.card>summary{cursor:pointer;padding:14px;list-style:none;display:flex;justify-content:space-between;gap:8px}
@@ -1188,13 +1222,14 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
 <details class="card" id="lbbox"><summary><b>Low-battery protection</b><small id="lbsum" class="mut"></small></summary><div class="in">
 <p class="small mut">The T-SIM checks its (calibrated, idle) battery on a timer without starting LTE. Below the OFF level it sends <code>set repeat off</code> to the repeater; when the battery recovers to the ON level it sends <code>set repeat on</code>. The ON level must be at least 10% higher than OFF. Settings reach the T-SIM at its next wake and are kept on the T-SIM, so it works offline. Needs T-SIM firmware 1.6.5+ and repeater firmware with the MeshCore CLI (no power saving).</p>
-<div id="lbinfo"></div>
+<div id="lbinfo"></div><div id="lbdel" class="small"></div>
 <form id="lbf"><label class="tog"><input type="checkbox" name="en"> Enable low-battery protection</label>
 <label>Turn repeat OFF below (V) <small class="mut" id="lbopct"></small><input name="lo" type="number" step="0.01" min="3" max="4"></label>
 <label>Turn repeat ON at/above (V) <small class="mut" id="lbhpct"></small><input name="hi" type="number" step="0.01" min="3.3" max="4.3"></label>
-<label>Check every (minutes)<input name="int" type="number" step="1" min="5" max="1440"></label>
+<label>Check the battery every (hours) <small class="mut" id="lbih"></small><input name="inth" type="number" step="0.25" min="0.25" max="24"></label>
 <label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
-<button type="submit">Save</button><span id="lbmsg" class="msg"></span></form></div></details>
+<button type="submit">Save &amp; send now</button> <button type="button" class="g" id="lbsave2">Save without sending</button><span id="lbmsg" class="msg"></span>
+<p class="small mut">"Save &amp; send now" texts the T-SIM once so it wakes and applies the settings within a few minutes. "Save without sending" waits for its next wake (useful to batch several changes).</p></form></div></details>
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
@@ -1223,10 +1258,10 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small mut">The T-SIM reads the battery at the start of each wake, before the modem is used (idle). Measure the battery with a multimeter while the T-SIM is idle and enter the value; the factor is worked out from the latest idle reading. Settings reach the T-SIM at its next wake (no extra text). The Heltec's own reading is not changed.</p>
 <div id="calinfo"></div>
 <form id="calf"><label>Measured battery voltage (V)<input name="mv" type="number" step="0.01" min="2.8" max="4.5" placeholder="4.07"></label>
-<button type="submit">Calibrate from measurement</button></form>
+<button type="submit">Calibrate &amp; send now</button> <button type="button" class="g" id="calsave2">Calibrate without sending</button></form>
 <form id="calm"><label>Scale factor<input name="scale" type="number" step="0.0001" min="0.5" max="1.5"></label><label>Offset (V)<input name="off" type="number" step="0.001" min="-0.5" max="0.5"></label>
-<button type="submit" class="g">Save manual values</button> <button type="button" class="g" id="calreset">Reset calibration</button></form>
-<span id="calmsg" class="msg"></span></div></details>
+<button type="submit" class="g">Save manual values &amp; send</button> <button type="button" class="g" id="calreset">Reset calibration</button></form>
+<span id="calmsg" class="msg"></span><div id="caldel" class="small"></div></div></details>
 <details class="card" id="tsimbox"><summary><b>T-SIM firmware source</b><small id="tsimsum" class="mut"></small></summary><div class="in">
 <p class="small mut">Needs T-SIM firmware 1.6.0 or newer. The T-SIM downloads the file, checks it, installs it in its spare slot and restarts. If the new firmware can't check in, it rolls back on its own.</p>
 <form id="tsimf">
@@ -1236,9 +1271,12 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label>Direct link<input name="url" placeholder="https://.../firmware.bin"></label>
 <label>Checksum (optional; GitHub's own checksum is used if empty)<input name="checksum" placeholder="sha256:..."></label>
 <button type="submit">Save</button><span id="tsimmsg" class="msg"></span></form></div></details>
-<details class="card" id="schbox"><summary><b>Scheduled check</b><small id="schsum" class="mut"></small></summary><div class="in">
-<p class="small mut">Optional. Texts the T-SIM on this interval so readings stay fresh. Each check uses one incoming text and a little battery.</p>
-<select id="sch"><option value="0">Off</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Daily</option><option value="168">Weekly</option></select>
+<details class="card" id="schbox"><summary><b>Automatic status check</b><small id="schsum" class="mut"></small></summary><div class="in">
+<p class="small">When this is on, the dashboard automatically wakes the T-SIM every few hours, so the battery, signal and mesh stats here stay fresh without you pressing <b>Request status</b>.</p>
+<p class="small mut">Cost: each check sends <b>one text</b> to the T-SIM (counts toward your SIM plan) and keeps it awake for a minute or two with LTE on (uses some battery). Nothing is sent while this is off.</p>
+<div id="schinfo"></div>
+<label class="tog"><input type="checkbox" id="schon"> Check automatically</label>
+<label>How often<select id="sch"><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Once a day</option><option value="168">Once a week</option></select></label>
 <button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
 <details class="card"><summary><b>Login &amp; password</b><small class="mut">dashboard access</small></summary><div class="in">
 <p class="small mut">Each T-SIM has its own dashboard password; fleet logins open several. Passwords are changed by the owner with the admin API (<code>/admin/devices/&lt;id&gt;/reset-password</code>), see docs/SETUP.md. The T-SIM's upload key is separate and never shown here.</p></div></details>
@@ -1294,9 +1332,11 @@ async function load(){
  $("m-pkt").innerHTML=kv([["Received",P.recv],["Sent",P.sent],["Flood tx / rx",P.flood_tx==null?null:P.flood_tx+" / "+P.flood_rx],["Direct tx / rx",P.direct_tx==null?null:P.direct_tx+" / "+P.direct_rx],["RX errors",P.recv_errors]]);
  const N=M.neighbors;$("nb").innerHTML=N==null?'<tr><td colspan=3 class="mut">No data yet</td></tr>':(N.length?N.map(n=>'<tr><td><code>'+e(n.id)+'</code></td><td>'+e(n.snr)+' dB</td><td>'+e(ago(n.heard_at))+'</td></tr>').join(""):'<tr><td colspan=3 class="mut">No neighbors heard</td></tr>');
  if(M.error)$("nb").innerHTML+='<tr><td colspan=3 class="err">'+e(M.error)+'</td></tr>';
- const sc=d.schedule||{};$("schsum").textContent=S.schedule_hours?"every "+S.schedule_hours+" h, next "+t(sc.next_due):"off";
+ const sc=d.schedule||{};const HL={6:"every 6 hours",12:"every 12 hours",24:"once a day",168:"once a week"},lr=sc.last_run;
+ $("schsum").textContent=S.schedule_hours?"On · "+(HL[S.schedule_hours]||"every "+S.schedule_hours+" h")+" · next "+t(sc.next_run)+" ET":"Off";
+ $("schinfo").innerHTML=kv([["Status",S.schedule_hours?"On: wakes the T-SIM "+(HL[S.schedule_hours]||"every "+S.schedule_hours+" h"):"Off: the T-SIM only wakes when you press a button"],["Next check",S.schedule_hours?t(sc.next_run)+" ET":null],["Last automatic check",lr?t(lr.at)+" ET"+(lr.sent?" (text sent)":" (not sent: "+(lr.error||"error")+")"):"none yet"]]);
  $("consum").textContent=S.console_enabled?"on":"off";
- if(first){$("sch").value=String(S.schedule_hours||0);$("conon").checked=!!S.console_enabled;first=false}
+ if(first){$("schon").checked=!!S.schedule_hours;$("sch").value=String(S.schedule_hours||24);$("sch").disabled=!S.schedule_hours;$("conon").checked=!!S.console_enabled;first=false}
  const PS=!!(d.powersaving&&d.powersaving.on);
  $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PS?'<span class="badge mut">Power saving</span>':(d.powersaving&&d.powersaving.unknown?'<span class="badge mut" title="'+e(d.powersaving.source||"")+'">Power saving: unknown</span>':''));
  $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Updates",utext(US.radio)],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
@@ -1328,25 +1368,36 @@ $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
 function bpct(v){v=+v;if(!isFinite(v)||!v)return"";return "≈"+(v>=4.15?100:v<=3.3?0:Math.round((v-3.3)*100/0.85))+"%"}
 let pwrLoaded=false,PWR={};
 function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.event;PWR=S;
- const pend=P.pending?" · waiting for T-SIM ("+P.pending+")":"";
+ const W=P.wake,del=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':P.pending?(W&&W.sent?"⏳ Sent "+e(t(W.at))+" ET — waiting for the T-SIM to wake and apply it":W&&W.error?'<span class="err">Not sent: '+e(W.error)+'</span> Saved; it will be applied at the next wake.':"Saved — will be applied at the T-SIM's next wake (no text sent)"):"";
+ $("caldel").innerHTML=del;$("lbdel").innerHTML=del;
+ const pend=P.pending?(W&&W.sent?" · sent, waiting for T-SIM":" · waiting for next wake"):"";
  $("calsum").textContent=(S.cal_scale!==1||S.cal_off?"x"+S.cal_scale+(S.cal_off?" "+(S.cal_off>0?"+":"")+S.cal_off+" V":""):"not calibrated")+pend;
  $("calinfo").innerHTML=kv([["Idle raw reading",L.battery_raw_v==null?"none yet (needs 1.6.5)":L.battery_raw_v.toFixed(3)+" V · "+t(L.received_at)],["T-SIM is using",L.cal_scale==null?null:"x"+L.cal_scale+" "+(L.cal_off>=0?"+":"")+L.cal_off+" V"],["Saved here",S.applied_at?"applied "+t(S.applied_at):S.updated_at?"saved "+t(S.updated_at)+", not applied yet":"defaults"]]);
  const st=L.lb_state==null?null:(L.lb_state?"Repeat OFF (battery protection)":"Repeat ON (normal)");
- $("lbsum").textContent=(S.lb_en?"on · OFF<"+S.lb_lo.toFixed(2)+" V, ON≥"+S.lb_hi.toFixed(2)+" V":"off")+pend;
- $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",L.lb_lo==null?null:"OFF<"+L.lb_lo.toFixed(2)+" / ON≥"+L.lb_hi.toFixed(2)+" V, every "+L.lb_int+" min"]]);
- if(!pwrLoaded){const f=$("lbf");f.en.checked=!!S.lb_en;f.lo.value=S.lb_lo.toFixed(2);f.hi.value=S.lb_hi.toFixed(2);f.int.value=S.lb_int;f.imm.checked=!!S.lb_imm;
+ $("lbsum").textContent=(S.lb_en?"on · OFF<"+S.lb_lo.toFixed(2)+" V, ON≥"+S.lb_hi.toFixed(2)+" V · checks battery every "+hrs(S.lb_int):"off")+pend;
+ $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",L.lb_lo==null?null:"OFF<"+L.lb_lo.toFixed(2)+" / ON≥"+L.lb_hi.toFixed(2)+" V · checks battery every "+hrs(L.lb_int)]]);
+ if(!pwrLoaded){const f=$("lbf");f.en.checked=!!S.lb_en;f.lo.value=S.lb_lo.toFixed(2);f.hi.value=S.lb_hi.toFixed(2);f.inth.value=+(S.lb_int/60).toFixed(2);f.imm.checked=!!S.lb_imm;
   const m=$("calm");m.scale.value=S.cal_scale;m.off.value=S.cal_off;lbPct();pwrLoaded=true}}
-function lbPct(){const f=$("lbf");$("lbopct").textContent=bpct(f.lo.value);$("lbhpct").textContent=bpct(f.hi.value)}
+function hrs(m){const h=m/60;return (h===1?"1 hour":(+h.toFixed(2))+" h")+(m<60?" ("+m+" min)":"")}
+function lbPct(){const f=$("lbf");$("lbopct").textContent=bpct(f.lo.value);$("lbhpct").textContent=bpct(f.hi.value);const h=+f.inth.value;$("lbih").textContent=h>=0.25&&h<=24?"Checks battery every "+hrs(Math.round(h*60)):"0.25–24 h"}
 $("lbf").oninput=lbPct;
-async function savePwr(b,msg){const r=await post("power",b);const j=await rj(r);say(msg,r.ok,r.ok?"Saved. It reaches the T-SIM at its next wake (no text sent).":(j.error||friendly(j,r.status)));if(r.ok){pwrLoaded=false;load()}}
-$("lbf").onsubmit=ev=>{ev.preventDefault();const f=ev.target,lo=+f.lo.value,hi=+f.hi.value;
- if(!(hi>=lo*1.1-0.005)){say("lbmsg",false,"ON must be at least 10% higher than OFF: with OFF at "+lo.toFixed(2)+" V, ON must be "+(Math.ceil(lo*110)/100).toFixed(2)+" V or more.");return}
- savePwr({lb_en:f.en.checked,lb_lo:lo,lb_hi:hi,lb_int:+f.int.value,lb_imm:f.imm.checked},"lbmsg")};
-$("calf").onsubmit=ev=>{ev.preventDefault();savePwr({measured_v:+ev.target.mv.value},"calmsg")};
-$("calm").onsubmit=ev=>{ev.preventDefault();savePwr({cal_scale:+ev.target.scale.value,cal_off:+ev.target.off.value},"calmsg")};
-$("calreset").onclick=()=>{if(confirm("Reset the T-SIM battery calibration to factory (x1, +0 V)?"))savePwr({reset_cal:true},"calmsg")};
-$("schsave").onclick=async()=>{const h=+$("sch").value;
- if(h&&!confirm("Text this T-SIM every "+h+" hours? Each check uses one incoming text and some battery."))return;
+async function savePwr(b,msg,send){if(send&&!confirm("Save and send ONE text now so the T-SIM wakes and applies these settings?"))return;
+ const r=await post("power",{...b,send:!!send});const j=await rj(r);
+ const m=!r.ok?(j.error||friendly(j,r.status)):j.unchanged?"No change: the T-SIM already uses these settings.":j.wake?(j.wake.sent?"Saved and sent — waiting for the T-SIM to wake.":"Saved. "+(j.wake.error||"Text not sent.")):"Saved. It will be applied at the T-SIM's next wake (no text sent).";
+ say(msg,r.ok&&!(j.wake&&!j.wake.sent&&!j.wake.already),m);if(r.ok){pwrLoaded=false;load()}}
+function lbBody(){const f=$("lbf"),lo=+f.lo.value,hi=+f.hi.value,h=+f.inth.value;
+ if(!(hi>=lo*1.1-0.005)){say("lbmsg",false,"ON must be at least 10% higher than OFF: with OFF at "+lo.toFixed(2)+" V, ON must be "+(Math.ceil(lo*110)/100).toFixed(2)+" V or more.");return null}
+ if(!(h>=0.25&&h<=24)){say("lbmsg",false,"Check interval must be between 0.25 and 24 hours.");return null}
+ return {lb_en:f.en.checked,lb_lo:lo,lb_hi:hi,lb_int_h:h,lb_imm:f.imm.checked}}
+$("lbf").onsubmit=ev=>{ev.preventDefault();const b=lbBody();if(b)savePwr(b,"lbmsg",true)};
+$("lbsave2").onclick=()=>{const b=lbBody();if(b)savePwr(b,"lbmsg",false)};
+$("calf").onsubmit=ev=>{ev.preventDefault();savePwr({measured_v:+ev.target.mv.value},"calmsg",true)};
+$("calsave2").onclick=()=>savePwr({measured_v:+$("calf").mv.value},"calmsg",false);
+$("calm").onsubmit=ev=>{ev.preventDefault();savePwr({cal_scale:+ev.target.scale.value,cal_off:+ev.target.off.value},"calmsg",true)};
+$("calreset").onclick=()=>{if(confirm("Reset the T-SIM battery calibration to factory (x1, +0 V)? This also sends one text so it applies now."))savePwr({reset_cal:true},"calmsg",true)};
+$("schon").onchange=()=>{$("sch").disabled=!$("schon").checked};
+$("schsave").onclick=async()=>{const h=$("schon").checked?+$("sch").value:0;
+ if(h&&!confirm("Wake the T-SIM automatically "+$("sch").selectedOptions[0].textContent.toLowerCase()+"? Each check sends one text and uses some battery."))return;
  const r=await post("settings",{schedule_hours:h});const j=await rj(r);say("schmsg",r.ok,r.ok?"Saved":friendly(j,r.status));load();};
 $("conon").onchange=async ev=>{const on=ev.target.checked;
  if(on&&!confirm("Allow console commands for this repeater? Anyone with this login can then run MeshCore CLI commands on it."))return void(ev.target.checked=false);

@@ -466,7 +466,7 @@ console.log("tag/asset version ok");
   assert.equal(DEFAULT_POWER.lb_hi >= DEFAULT_POWER.lb_lo * 1.1, true);
   assert.throws(() => validatePower({}, { lb_lo: 3.4, lb_hi: 3.7 }, 3.9), /at least 10% higher.*3\.74 V or more/);
   assert.equal(validatePower({}, { lb_lo: 3.4, lb_hi: 3.74 }, 3.9).lb_hi, 3.74);
-  assert.throws(() => validatePower({}, { lb_int: 2 }, 3.9), /5-1440/);
+  assert.throws(() => validatePower({}, { lb_int: 2 }, 3.9), /0.25 and 24 hours/); assert.equal(validatePower({}, { lb_int_h: 0.5 }, 3.9).lb_int, 30); assert.equal(validatePower({}, { lb_int_h: 1.5 }, 3.9).lb_int, 90); assert.throws(() => validatePower({}, { lb_int_h: 0.1 }, 3.9), /0.25 and 24/); assert.throws(() => validatePower({}, { lb_int_h: 25 }, 3.9), /0.25 and 24/);
   assert.throws(() => validatePower({}, { measured_v: 4.07 }, 0), /No idle battery reading/);
   assert.equal(validatePower({}, { measured_v: 4.07 }, 3.95).cal_scale, 1.0304);
   assert.throws(() => validatePower({}, { cal_scale: 2 }, 3.9), /0\.5 and 1\.5/);
@@ -505,4 +505,46 @@ console.log("tag/asset version ok");
   } else throw new Error("power API login failed");
   assert.equal(holo, h0, "power settings never text the T-SIM");
   console.log("v1.6.5 power tests OK");
+}
+
+// Save & send: one wake text, dedupe, unchanged, old-firmware guard, schedule info
+{
+  const { scheduleInfo } = await import("../src/index.js");
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const c = (await login("tsim-1", "device-one-password", "9.9.9.8")).headers.get("Set-Cookie").split(";")[0];
+  const P = (b) => call("/api/d/tsim-1/power", { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const ing = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  // old firmware: no text, PWRCFG not handed out
+  await ing({ type: "status", fw: "tsim-updater 1.6.4", battery_v: 3.9, msg: "STATUS" });
+  const s0 = JSON.parse(kv.get("state:tsim-1")); delete s0.last_send_ts; kv.set("state:tsim-1", JSON.stringify(s0));
+  let h0 = holo, j = await (await P({ lb_int_h: 1, send: true })).json();
+  assert.equal(j.wake.sent, false); assert(/1\.6\.5/.test(j.wake.error)); assert.equal(holo, h0);
+  assert(!(await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text()).includes("PWRCFG"));
+  // 1.6.5: one text, second save within 15 min sends none
+  await ing({ type: "status", fw: "tsim-updater 1.6.5", battery_v: 3.9, battery_raw_v: 3.9, msg: "STATUS" });
+  j = await (await P({ lb_int_h: 2, send: true })).json();
+  assert.equal(j.wake.sent, true); assert.equal(holo, h0 + 1);
+  j = await (await P({ lb_int_h: 3, send: true })).json();
+  assert.equal(j.wake.sent, false); assert(j.wake.already); assert.equal(holo, h0 + 1, "no second wake text");
+  const q = JSON.parse(kv.get("cmds:tsim-1")).filter((x) => x.status === "queued" && /^PWRCFG/.test(x.cmd));
+  assert.equal(q.length, 1); assert(/int=180/.test(q[0].cmd));
+  let tel = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+  assert(tel.power.wake.sent && tel.power.pending === "queued");
+  const txt = await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+  assert(txt.includes("int=180"));
+  await ing({ type: "cmd", cmd_id: q[0].id, cmd: q[0].cmd, sys: true, output: "PWRCFG applied 7" });
+  tel = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+  assert(tel.power.settings.applied_at); assert.equal(tel.power.pending, null);
+  assert(/^System: PWRCFG/.test(tel.history.find((h) => h.type === "cmd").msg));
+  // unchanged save: no queue, no text
+  const s1 = JSON.parse(kv.get("state:tsim-1")); delete s1.last_send_ts; kv.set("state:tsim-1", JSON.stringify(s1));
+  j = await (await P({ lb_int_h: 3, send: true })).json();
+  assert.equal(j.unchanged, true); assert.equal(j.wake, null); assert.equal(holo, h0 + 1);
+  // schedule: next run on an hour boundary
+  const now = Date.parse("2026-10-15T23:46:00Z");
+  const si = scheduleInfo(24, { last_sched_ts: Date.parse("2026-10-15T10:20:00Z") }, now);
+  assert.equal(si.next_run, "2026-10-16T11:00:00.000Z");
+  assert.equal(scheduleInfo(24, { last_sched_ts: Date.parse("2026-10-14T23:41:39Z") }, now).next_run, "2026-10-16T00:00:00.000Z");
+  assert.equal(scheduleInfo(0, {}, now).next_run, null);
+  console.log("save & send / schedule tests OK");
 }
