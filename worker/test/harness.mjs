@@ -247,7 +247,7 @@ assert.equal(typeof worker.scheduled, "function");
   await ing({ type: "update", msg: "TSIM OTA OK: tsim-updater 1.6.0 running (ingest accepted)", fw: "tsim-updater 1.6.0" });
   tel = await (await call("/api/d/ota-1/telemetry", { headers: { Cookie: oc } })).json();
   assert(tel.tsim.last_ota.msg.startsWith("TSIM OTA OK")); assert.equal(tel.tsim.fw, "tsim-updater 1.6.0"); assert.equal(tel.powersaving.on, false);
-  assert.equal(tel.commands[0].status, "done");
+  assert.equal(tel.commands.length, 0, "system TSIMUPDATE hidden from console"); assert.equal(JSON.parse(kv.get("cmds:ota-1"))[0].status, "done");
   // source: URL mode + checksum validation
   assert.equal((await O("tsim-source", { mode: "url", url: "" })).status, 400);
   assert.equal((await O("tsim-source", { mode: "url", url: "https://example.com/t.bin", checksum: "nothex" })).status, 400);
@@ -385,4 +385,22 @@ console.log("tag/asset version ok");
   assert.equal(sst.radio_flashed.file, "Heltec_v3_repeater-v1.17.1-d929643.bin"); assert.equal(sst.radio_flashed.flash.chip, "ESP32-S3");
   assert.equal(sst.heltec_fw, "Heltec_v3_repeater-v1.17.1-d929643");
   console.log("v1.6.4 flash-info tests OK");
+}
+
+// system commands hidden from console history
+{
+  const { userCommands, isSysCmd } = await import("../src/index.js");
+  assert(isSysCmd("TSIMUPDATE https://x abc")); assert(!isSysCmd("ver"));
+  const L = [{ id: "a", cmd: "ver", status: "done" }, { id: "b", cmd: "TSIMUPDATE https://x", sys: true }, { id: "c", cmd: "stats-core", unsolicited: true, sys: true }, { id: "d", cmd: "TSIMUPDATE y" }];
+  assert.deepEqual(userCommands(L).map((c) => c.id), ["a"]);
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "u1", cmd: "neighbors", status: "sent" }, { id: "s1", cmd: "TSIMUPDATE https://x", sys: true, status: "sent" }]));
+  const post = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  assert.equal((await post({ type: "cmd", cmd_id: "u1", cmd: "neighbors", output: "none" })).status, 200);
+  assert.equal((await post({ type: "cmd", cmd_id: "s1", cmd: "TSIMUPDATE https://x", sys: true, output: "T-SIM OTA starting" })).status, 200);
+  assert.equal((await post({ type: "cmd", cmd_id: "zz", cmd: "ver", output: "v1.17.1" })).status, 200);  // unsolicited = system
+  const all = JSON.parse(kv.get("cmds:tsim-1"));
+  assert.equal(all.length, 3); assert.equal(all.find((c) => c.id === "zz").sys, true);
+  assert.deepEqual(userCommands(all).map((c) => c.id), ["u1"]);
+  console.log("system-command console filter OK");
 }

@@ -422,8 +422,10 @@ async function handleIngest(request, env, id) {
     const out = String(t.output ?? "").slice(0, CMD_OUT_MAX);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const c = list.find((x) => x.id === cmdId);
-    if (c) { c.status = t.error ? "error" : "done"; c.output = out; c.done_at = entry.received_at; if (t.error) c.error = String(t.error).slice(0, 120); }
-    else list.unshift({ id: cmdId || randomHex(4), cmd: String(t.cmd || "?").slice(0, CMD_MAX_LEN), status: "done", output: out, done_at: entry.received_at, unsolicited: true });
+    // System (non-user) commands: T-SIM self-update, firmware-tagged sys, or anything the user never queued.
+    const sys = t.sys === true || (c && c.sys) || !c || isSysCmd(c ? c.cmd : t.cmd);
+    if (c) { if (sys) c.sys = true; c.status = t.error ? "error" : "done"; c.output = out; c.done_at = entry.received_at; if (t.error) c.error = String(t.error).slice(0, 120); }
+    else list.unshift({ id: cmdId || randomHex(4), cmd: String(t.cmd || "?").slice(0, CMD_MAX_LEN), status: "done", output: out, done_at: entry.received_at, unsolicited: true, sys: true });
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     const ran = (c ? c.cmd : String(t.cmd || "")).trim().toLowerCase();
     const reply = cleanCli(out);
@@ -464,6 +466,9 @@ async function setPowersaving(env, id, on, source) {
   await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
 
+export const isSysCmd = (cmd) => /^tsimupdate\s/i.test(String(cmd || "").trim());
+// Console history shows only what the user typed (system commands still drive state, they're just hidden).
+export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.unsolicited && !isSysCmd(c.cmd));
 // T-SIM pulls queued console commands (text/plain, one "<id>\t<command>" per line). Marks them sent.
 async function handleDeviceCommands(request, env, id) {
   const dev = await getDevice(env, id);
@@ -670,7 +675,7 @@ async function deviceApi(request, env, dev, action) {
     const source = await getSource(env, id);
     const schedule = { hours: settings.schedule_hours, last_run: s.last_sched_ts ? new Date(s.last_sched_ts).toISOString() : null,
       next_due: settings.schedule_hours ? new Date((s.last_sched_ts || Date.now()) + settings.schedule_hours * 3600e3).toISOString() : null };
-    return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: cmds || [], history: history || [], updates: {
+    return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, at: s.powersaving_at || null, source: s.powersaving_source || null },
@@ -1173,7 +1178,7 @@ async function load(){
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
  if(PS)$("consum").textContent="paused (power saving)";
- const CM=d.commands||[];$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.sys?"T-SIM update":c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3 class="mut">No commands yet</td></tr>';
+ const CM=(d.commands||[]).filter(c=>!c.sys&&!c.unsolicited);$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.sys?"T-SIM update":c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3 class="mut">No commands yet</td></tr>';
  $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"Status report":""))+'</td></tr>').join("")||'<tr><td colspan=3 class="mut">No activity yet</td></tr>';
  clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
 }

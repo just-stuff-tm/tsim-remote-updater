@@ -851,7 +851,7 @@ static void doConsoleCommands(void) {
     static char ec[960], ei[40];
     if (clean && strncasecmp(cmd, "TSIMUPDATE ", 11) == 0) {  // T-SIM self-update (Worker system command, not a Heltec CLI command)
       jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
-      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"T-SIM OTA starting\"}", FW_VERSION, ei, ec);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"T-SIM OTA starting\"}", FW_VERSION, ei, ec);
       ingestSendBig(s_mesh_body);
       heltecCliEnd();
       static char a[480]; strncpy(a, cmd + 11, sizeof(a) - 1); a[sizeof(a) - 1] = 0;
