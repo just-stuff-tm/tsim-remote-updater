@@ -8,11 +8,14 @@ const STATE = {
   list: async ({ prefix }) => ({ keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })) }),
 };
 const env = { STATE, HOLOGRAM_API_KEY: "k", ADMIN_TOKEN: "admintok", SESSION_SECRET: "sess-secret-for-tests" };
-let holo = 0, holoOk = true;
+let holo = 0, holoOk = true, ghList = 0;
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
   if (url.includes("api.github.com") && url.includes("tsim-remote-updater")) return new Response(JSON.stringify({ tag_name: "v1.6.0", assets: [
     { id: 9, name: "firmware.bin", digest: "sha256:" + "ab".repeat(32), browser_download_url: "https://github.com/just-stuff-tm/tsim-remote-updater/releases/download/v1.6.0/firmware.bin" }] }));
+  if (url.includes("api.github.com/repos/meshcore-dev/MeshCore/releases?")) { ghList++; const A = (v, h) => [{ id: 1, name: `Heltec_v3_repeater-v${v}-${h}-merged.bin`, browser_download_url: `https://g/m/${v}-merged.bin` }, { id: 2, name: `Heltec_v3_repeater-v${v}-${h}.bin`, browser_download_url: `https://github.com/meshcore-dev/MeshCore/releases/download/repeater-v${v}/Heltec_v3_repeater-v${v}-${h}.bin` }];
+    return new Response(JSON.stringify([{ tag_name: "companion-v1.18.0", published_at: "2026-10-15T10:20:19Z", assets: [] }, { tag_name: "repeater-v1.18.0", published_at: "2026-10-15T10:03:13Z", assets: A("1.18.0", "81dbae5") },
+      { tag_name: "room-server-v1.18.0", published_at: "2026-10-15T10:01:34Z", assets: [] }, { tag_name: "repeater-v1.19.0-rc1", prerelease: true, published_at: "2026-10-16T00:00:00Z", assets: A("1.19.0", "x") }, { tag_name: "repeater-v1.17.1", published_at: "2026-08-14T13:32:04Z", assets: A("1.17.1", "d929643") }])); }
   if (url.includes("api.github.com")) return new Response(JSON.stringify({ tag_name: "PowerSaving17.2", assets: [
     { id: 5, name: "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin", browser_download_url: "https://github.com/x/y/releases/download/t/Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin" }] }));
   if (url.includes("hologram")) { holo++; assert.equal(JSON.parse(init.body).deviceid, 1234567);
@@ -434,4 +437,25 @@ console.log("tag/asset version ok");
   const h = dashboardPage({ id: "tsim-1", name: "x" });
   assert(/\.sens\{filter:blur/.test(h) && /tsim_show_sensitive/.test(h) && /\["IP",sens\(L\.ip\)\]/.test(h));
   console.log("IP blur OK");
+}
+
+// MeshCore role-tagged releases: newest repeater-*, app-only asset
+{
+  const { latestRelease, pickAsset, FW_PRESETS, radioStatus } = await import("../src/index.js");
+  assert.equal(pickAsset(["Heltec_v3_repeater-v1.18.0-81dbae5-merged.bin", "Heltec_v3_repeater-v1.18.0-81dbae5.bin"], "Heltec_v3_repeater-v*.bin"), "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
+  assert.equal(pickAsset(["a-merged.bin"], "a-merged.bin"), "a-merged.bin");
+  const P = FW_PRESETS.meshcore; assert(P.enabled && P.tag_prefix === "repeater-" && !P.direct_url);
+  const rel = await latestRelease(env, P);
+  assert.equal(rel.tag, "repeater-v1.18.0"); assert.equal(rel.asset_name, "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
+  const u = radioStatus({ heltec_fw: "v1.17.1-d929643 (Build: 14-Aug-2026)" }, {}, { ...rel, checked_at: "x" });
+  assert.equal(u.state, "available"); assert.equal(u.text, "New update available: v1.18.0 (installed v1.17.1)");
+  assert.equal(radioStatus({ heltec_fw: "v1.18.0-81dbae5" }, {}, rel).state, "current");
+  // source save keeps tag_prefix; Check uses it; cron dedupes GitHub calls
+  const sv = await admin("/admin/devices", "GET"); assert.equal(sv.status, 200);
+  kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: P.repo, asset_pattern: P.asset_pattern, tag_prefix: "repeater-", direct_url: "" }));
+  kv.delete("release:tsim-1"); const g0 = ghList;
+  await refreshReleases(env, Date.now());
+  assert.equal(JSON.parse(kv.get("release:tsim-1")).tag, "repeater-v1.18.0"); assert.equal(ghList, g0 + 1);
+  await refreshReleases(env, Date.now()); assert.equal(ghList, g0 + 1, "6h cache: no second GitHub call");
+  console.log("MeshCore repeater-* release tracking OK");
 }

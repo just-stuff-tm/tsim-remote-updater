@@ -5,7 +5,7 @@
 //
 // Bindings: KV STATE; secrets HOLOGRAM_API_KEY, ADMIN_TOKEN, SESSION_SECRET; optional GITHUB_TOKEN.
 
-const DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", direct_url: "" };
+const DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 export function globToRegex(g) {
   return new RegExp("^" + String(g).split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
@@ -17,6 +17,10 @@ export function validateSource(b) {
   if (b.asset_pattern !== undefined) {
     o.asset_pattern = String(b.asset_pattern).trim();
     if (!o.asset_pattern || o.asset_pattern.length > 120 || /[\s/]/.test(o.asset_pattern)) throw new Error("asset pattern: 1-120 chars, no spaces or slashes");
+  }
+  if (b.tag_prefix !== undefined) {
+    o.tag_prefix = String(b.tag_prefix).trim();
+    if (!/^[A-Za-z0-9._-]{0,40}$/.test(o.tag_prefix)) throw new Error("tag prefix: up to 40 letters, digits, . _ -");
   }
   if (b.direct_url !== undefined) {
     o.direct_url = String(b.direct_url).trim();
@@ -159,16 +163,30 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 // ---------- GitHub / Hologram ----------
 // Fallback when the GitHub API rate-limits shared Worker IPs (403/429): read the public release page.
-async function latestReleaseHtml(REPO, ASSET_RE) {
+// Asset choice: matches the pattern; "-merged" full-flash images are skipped unless the pattern asks for them.
+export function pickAsset(names, pattern) {
+  const re = globToRegex(pattern), wantMerged = /merged/i.test(pattern);
+  return names.find((n) => re.test(n) && (wantMerged || !/-merged\.bin$/i.test(n)));
+}
+async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
+  let tag = "";
+  if (prefix) {  // releases list page, newest first
+    const r = await fetch(`https://github.com/${REPO}/releases`, { headers: { "User-Agent": UA } });
+    if (!r.ok) throw new Error(`GitHub releases page ${r.status}`);
+    const tags = [...(await r.text()).matchAll(/\/releases\/tag\/([^"/?#]+)"/g)].map((m) => decodeURIComponent(m[1]));
+    tag = tags.find((t) => t.startsWith(prefix)) || "";
+    if (!tag) return { skipped: `no release tagged ${prefix}* on the first releases page` };
+  } else {
   const r = await fetch(`https://github.com/${REPO}/releases/latest`, { headers: { "User-Agent": UA }, redirect: "manual" });
   const loc = r.headers.get("Location") || "";
-  const tag = decodeURIComponent((loc.match(/\/releases\/tag\/([^/?#]+)/) || [])[1] || "");
+  tag = decodeURIComponent((loc.match(/\/releases\/tag\/([^/?#]+)/) || [])[1] || "");
+  }
   if (!tag) throw new Error(`GitHub releases/latest ${r.status}`);
   const a = await fetch(`https://github.com/${REPO}/releases/expanded_assets/${encodeURIComponent(tag)}`, { headers: { "User-Agent": UA } });
   if (!a.ok) throw new Error(`GitHub assets ${a.status}`);
   const page = await a.text();
   const names = [...page.matchAll(/\/releases\/download\/[^"]+?\/([^"/]+)"/g)].map((m) => decodeURIComponent(m[1]));
-  const name = names.find((n) => ASSET_RE.test(n));
+  const name = pattern ? pickAsset(names, pattern) : names.find((n) => ASSET_RE.test(n));
   if (!name) return { skipped: `no upgrade asset in ${tag}` };
   return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html" };
 }
@@ -177,13 +195,22 @@ export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
   const REPO = src.repo, ASSET_RE = globToRegex(src.asset_pattern);
   const headers = { "User-Agent": UA, Accept: "application/vnd.github+json" };
   if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
-  const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers });
-  if (r.status === 403 || r.status === 429) return latestReleaseHtml(REPO, ASSET_RE);
+  const prefix = src.tag_prefix || "";
+  // Repos that tag per role (MeshCore: repeater-/companion-/room-server-) need the newest release with the prefix,
+  // not /releases/latest (which may be another role).
+  const r = await fetch(prefix ? `https://api.github.com/repos/${REPO}/releases?per_page=30` : `https://api.github.com/repos/${REPO}/releases/latest`, { headers });
+  if (r.status === 403 || r.status === 429) return latestReleaseHtml(REPO, ASSET_RE, prefix, src.asset_pattern);
   if (r.status === 404) throw new Error(`GitHub repo ${REPO} not found or has no releases`);
   if (!r.ok) throw new Error(`GitHub API ${r.status}`);
-  const rel = await r.json();
+  let rel = await r.json();
+  if (prefix) {
+    rel = (Array.isArray(rel) ? rel : []).filter((x) => !x.draft && !x.prerelease && String(x.tag_name || "").startsWith(prefix))
+      .sort((a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0))[0];
+    if (!rel) return { skipped: `no release tagged ${prefix}* in the newest 30` };
+  }
   if (rel.draft || rel.prerelease) return { skipped: `draft/prerelease ${rel.tag_name}` };
-  const asset = (rel.assets || []).find((a) => ASSET_RE.test(a.name));
+  const an = pickAsset((rel.assets || []).map((a) => a.name), src.asset_pattern);
+  const asset = (rel.assets || []).find((a) => a.name === an);
   if (!asset) return { skipped: `no upgrade asset in ${rel.tag_name}` };
   return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null };
 }
@@ -328,9 +355,8 @@ export async function heltecImageRisk(url, tsimFw) {
   return null;
 }
 export const FW_PRESETS = {
-  easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", direct_url: "" },
-  meshcore: { label: "Stock MeshCore repeater v1.17.1", enabled: false, repo: "meshcore-dev/MeshCore", asset_pattern: "Heltec_v3_repeater-v*.bin",
-    direct_url: "https://github.com/meshcore-dev/MeshCore/releases/download/repeater-v1.17.1/Heltec_v3_repeater-v1.17.1-d929643.bin" },
+  easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" },
+  meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
 };
 
 // Resolve what "latest" means for this device's update source.
@@ -703,7 +729,7 @@ async function deviceApi(request, env, dev, action) {
     let src; try { src = validateSource({ ...(await getSource(env, id)), ...b }); } catch (e) { return json({ error: e.message }, 400); }
     await putJson(env, `source:${id}`, src);
     await env.STATE.delete(`release:${id}`);
-    await logActivity(env, id, { type: "action", msg: `Update source changed: ${src.enabled ? src.repo + " " + src.asset_pattern : "disabled"}${src.direct_url ? " (direct URL set)" : ""}` });
+    await logActivity(env, id, { type: "action", msg: `Update source changed: ${src.enabled ? src.repo + " " + (src.tag_prefix ? src.tag_prefix + "* " : "") + src.asset_pattern : "disabled"}${src.direct_url ? " (direct URL set)" : ""}` });
     return json({ saved: true, source: src });
   }
   if (action === "check") {
@@ -908,7 +934,7 @@ function statuses(latest, mesh, s, hist, rel, tsimRel) {
 const REFRESH_MS = 6 * 3600e3;
 export async function refreshReleases(env, now = Date.now()) {
   const cache = new Map(), out = [];
-  const get = async (src) => { const k = src.repo + "|" + src.asset_pattern; if (!cache.has(k)) cache.set(k, latestRelease(env, src).catch((e) => ({ skipped: "error: " + e.message }))); return cache.get(k); };
+  const get = async (src) => { const k = src.repo + "|" + src.asset_pattern + "|" + (src.tag_prefix || ""); if (!cache.has(k)) cache.set(k, latestRelease(env, src).catch((e) => ({ skipped: "error: " + e.message }))); return cache.get(k); };
   for (const id of await listDeviceIds(env)) {
     try {
       const src = await getSource(env, id), cur = await kvJson(env, `release:${id}`);
@@ -1095,8 +1121,9 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <form id="srcf">
 <label class="tog"><input type="checkbox" name="enabled"> Use the latest GitHub release</label>
 <label>GitHub repo (owner/name)<input name="repo" placeholder="IoTThinks/EasySkyMesh"></label>
-<label>File name pattern (* = anything)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
-<label>Direct link (used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
+<label>Release tag starts with (optional, e.g. repeater-)<input name="tag_prefix" placeholder="repeater-"></label>
+<label>File name pattern (* = anything; -merged files skipped unless named)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
+<label>Direct link (optional override, used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
@@ -1205,8 +1232,8 @@ async function load(){
 }
 function setPresets(p){PRE=p;const s=$("preset");for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
 $("preset").onchange=ev=>{const v=PRE[ev.target.value],f=$("srcf");if(!v){$("presetnote").textContent="";return}
- f.enabled.checked=v.enabled;f.repo.value=v.repo;f.asset_pattern.value=v.asset_pattern;f.direct_url.value=v.direct_url;
- $("presetnote").textContent=ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). Its newest GitHub release is often the companion build, so this preset uses a direct link. Press Save to use it.":"Press Save to use it."};
+ f.enabled.checked=v.enabled;f.repo.value=v.repo;f.asset_pattern.value=v.asset_pattern;f.tag_prefix.value=v.tag_prefix||"";f.direct_url.value=v.direct_url;
+ $("presetnote").textContent=ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). It follows the newest release tagged repeater-* (MeshCore also publishes companion and room-server releases). Press Save to use it.":"Press Save to use it."};
 let tsimLoaded=false;
 function showTsim(s){const f=$("tsimf");$("tsimsum").textContent=s.mode==="url"?"direct link":s.repo+" · "+s.asset;
  if(!tsimLoaded){f.mode.value=s.mode;f.repo.value=s.repo||"";f.asset.value=s.asset||"";f.url.value=s.url||"";f.checksum.value=s.checksum||"";tsimLoaded=true}}
@@ -1214,11 +1241,11 @@ $("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const r=await post("tsim-source",{mode:f.mode.value,repo:f.repo.value,asset:f.asset.value,url:f.url.value,checksum:f.checksum.value});
  const j=await rj(r);say("tsimmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
 let srcLoaded=false;
-function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+s.asset_pattern:(s.direct_url?"direct link":"not set");
+function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+(s.tag_prefix?s.tag_prefix+"* · ":"")+s.asset_pattern:(s.direct_url?"direct link":"not set");
  const off=!s.enabled&&!s.direct_url;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
- if(!srcLoaded){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.direct_url.value=s.direct_url||"";srcLoaded=true;}}
+ if(!srcLoaded){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.tag_prefix.value=s.tag_prefix||"";f.direct_url.value=s.direct_url||"";srcLoaded=true;}}
 $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
- const r=await post("source",{enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,direct_url:f.direct_url.value});
+ const r=await post("source",{enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,tag_prefix:f.tag_prefix.value,direct_url:f.direct_url.value});
  const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
 $("schsave").onclick=async()=>{const h=+$("sch").value;
  if(h&&!confirm("Text this T-SIM every "+h+" hours? Each check uses one incoming text and some battery."))return;
