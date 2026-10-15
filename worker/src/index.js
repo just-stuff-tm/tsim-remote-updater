@@ -240,6 +240,8 @@ async function manualSend(env, dev, body, label, onSuccess) {
 // ---------- update progress (built from the telemetry events the firmware already posts) ----------
 export const STEPS = ["Waiting for T-SIM to wake", "Downloading", "Verifying", "Writing / flashing", "Rebooting", "Done"];
 const PROGRESS_TIMEOUT_MS = 15 * 60e3;
+const STALL_MS = 10 * 60e3;        // no progress / check-in for this long after start = stalled
+const DEDUPE_MS = 5 * 60e3;        // a second Update press within this window is refused (no extra text)
 export function friendlyFail(msg) {
   const m = String(msg || "");
   const R = [[/no network|PDP down/i, "The T-SIM couldn't get an LTE data connection."], [/download/i, "The firmware file couldn't be downloaded."],
@@ -278,10 +280,15 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
       else if (/FAIL/.test(m)) { state = "failed"; reason = friendlyFail(m); finished = h.received_at; }
     }
   }
-  if (state === "running" && now - startAt > PROGRESS_TIMEOUT_MS) { state = "timeout";
-    reason = step === 0 ? "The T-SIM never woke up to start the update. Check its power and signal, then try again." :
-      step === 4 && kind === "tsim" ? "The T-SIM didn't check in after rebooting. It has probably rolled back to its previous firmware." :
-      "No progress reported for 15 minutes. Press Request status to see what the T-SIM is doing."; }
+  const cancel = kind === "tsim" ? st.tsim_cancel : st.heltec_cancel;
+  if (state === "running" && cancel && Date.parse(cancel.at) >= startAt)
+    return { state: "cancelled", step, steps: STEPS, times, target, started_at: times[0], finished_at: cancel.at, pct: 0,
+      reason: cancel.note || "Cancel requested." };
+  const lastAt = Math.max(startAt, ...mine.map((h) => Date.parse(h.received_at) || 0), st.last_checkin_ts || 0);
+  if (state === "running" && now - lastAt > STALL_MS) { state = "timeout";
+    reason = step === 0 ? "The T-SIM never woke up to start the update. It may be out of power or have lost its cell connection. Press Retry to text it again." :
+      step === 4 && kind === "tsim" ? "The T-SIM didn't check in after rebooting. It has probably rolled back to its previous firmware. Press Retry to try again." :
+      "The update started but stopped reporting for 10 minutes, most likely a lost cell connection mid-download. Press Retry to start it again."; }
   return { state, step, steps: STEPS, times, target, started_at: times[0], finished_at: finished, reason, pct: Math.round((step / 5) * 100) };
 }
 
@@ -418,6 +425,7 @@ async function handleIngest(request, env, id) {
   }
   const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
   await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type });
+  if (entry.type === "update") { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_checkin_ts = Date.now(); await putJson(env, `state:${id}`, s2); }
   await logActivity(env, id, entry);
   if (entry.type === "update" && entry.msg && /^TSIM OTA/.test(entry.msg)) {
     const st = (await kvJson(env, `state:${id}`)) || {};
@@ -619,6 +627,22 @@ function sameOrigin(request) {
   return o === new URL(request.url).origin;
 }
 
+// ---------- update dedupe / retry ----------
+async function bodyRetry(request) { try { const b = await request.clone().json(); return b && b.retry === true; } catch { return false; } }
+// Returns a friendly refusal if an update of this kind is already queued/running (so a double press never sends a 2nd text).
+export async function dupeCheck(env, id, kind, retry, now = Date.now()) {
+  const st = (await kvJson(env, `state:${id}`)) || {};
+  const p = computeProgress(kind, (await kvJson(env, `telem:${id}:history`)) || [], st, now);
+  const who = kind === "tsim" ? "T-SIM" : "radio";
+  if (p.state === "running") {
+    const mins = Math.max(1, Math.round((now - Date.parse(p.started_at)) / 60e3));
+    if (now - Date.parse(p.started_at) < DEDUPE_MS || p.step > 0 || !retry)
+      return `A ${who} update was already requested ${mins} min ago and is ${p.step ? "in progress" : "waiting for the T-SIM to wake"}. No new text was sent. Use Cancel first if you want to stop it.`;
+  }
+  if (retry && !["timeout", "failed", "cancelled"].includes(p.state)) return null;
+  return null;
+}
+
 // ---------- device API ----------
 async function deviceApi(request, env, dev, action) {
   const id = dev.id;
@@ -717,20 +741,46 @@ async function deviceApi(request, env, dev, action) {
     await logActivity(env, id, { type: "action", msg: `T-SIM firmware source: ${src.mode === "url" ? "URL" : src.repo + " " + src.asset}${src.checksum ? " (checksum set)" : ""}` });
     return json({ saved: true, source: src });
   }
+  if (action === "update-cancel") {
+    let b = {}; try { b = await request.json(); } catch {}
+    const kind = b.kind === "tsim" ? "tsim" : b.kind === "heltec" ? "heltec" : null;
+    if (!kind) return json({ error: "kind must be tsim or heltec" }, 400);
+    const st = (await kvJson(env, `state:${id}`)) || {};
+    const hist = (await kvJson(env, `telem:${id}:history`)) || [];
+    const p = computeProgress(kind, hist, st);
+    if (p.state !== "running" && p.state !== "timeout") return json({ cancelled: false, error: "No update is in progress." }, 409);
+    let cleared = 0;
+    if (kind === "tsim") {
+      const list = (await kvJson(env, `cmds:${id}`)) || [];
+      for (const c of list) if (c.status === "queued" && c.sys) { c.status = "cancelled"; cleared++; }
+      if (cleared) await putJson(env, `cmds:${id}`, list);
+    }
+    const note = kind === "tsim"
+      ? (cleared ? "Cancelled before the T-SIM picked it up. Nothing will be installed." : "Cancel requested. The T-SIM had already started, so it may finish the current step.")
+      : (p.step === 0 ? "Cancel requested. The update text was already delivered, so the T-SIM may still run it when it wakes." : "Cancel requested. The device may finish the current step.");
+    st[kind === "tsim" ? "tsim_cancel" : "heltec_cancel"] = { at: new Date().toISOString(), cleared, note };
+    await putJson(env, `state:${id}`, st);
+    await logActivity(env, id, { type: "action", msg: `${kind === "tsim" ? "T-SIM" : "Radio"} update cancelled by user (${cleared ? "queued command removed" : "device may finish current step"})` });
+    return json({ cancelled: true, cleared, note });
+  }
   if (action === "tsim-check" || action === "tsim-update") {
     let rel;
-    try { ({ rel } = await resolveTsimTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
+    const retry = action === "tsim-update" ? await bodyRetry(request) : false;
+    if (action === "tsim-update") { const d = await dupeCheck(env, id, "tsim", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409); }
+    const prevSent = ((await kvJson(env, `state:${id}`)) || {}).tsim_update_sent;
+    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, checksum: prevSent.checksum, asset_name: prevSent.asset_name, tag: prevSent.tag };
+    else try { ({ rel } = await resolveTsimTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const rec = { ...rel, checked_at: new Date().toISOString() };
-    await putJson(env, `tsimrel:${id}`, rec);
+    if (!(retry && prevSent && prevSent.url)) await putJson(env, `tsimrel:${id}`, rec);
     if (action === "tsim-check") return json({ sent: false, latest_available: rec });
     const cmd = buildTsimCommand(rel.url, rel.checksum);
     if (cmd.length > 450) return json({ sent: false, error: "firmware URL too long" }, 400);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     for (const c of list) if (c.status === "queued" && c.sys) c.status = "cancelled";  // only one pending self-update
     const entry = { id: randomHex(4), cmd, sys: true, status: "queued", queued_at: new Date().toISOString() };
-    const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware update (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})`, async (st) => {
-      st.tsim_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, checksum: rel.checksum || null };
+    const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware ${retry ? "update retry" : "update"} (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})`, async (st) => {
+      st.tsim_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, checksum: rel.checksum || null, url: rel.url, retry };
     });
     if (o.sent) { list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
     return json({ ...o, release: rec, queued: o.sent ? entry : null }, code);
@@ -739,13 +789,17 @@ async function deviceApi(request, env, dev, action) {
   if (action === "reboot") { const [o, c] = await manualSend(env, dev, "REBOOT", "REBOOT"); return json(o, c); }
   if (action === "update-latest") {
     let rel;
-    try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
+    const retry = await bodyRetry(request);
+    const d = await dupeCheck(env, id, "heltec", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409);
+    const prevSent = ((await kvJson(env, `state:${id}`)) || {}).last_update_sent;
+    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag };
+    else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const risk = await heltecImageRisk(rel.url, ((await kvJson(env, `telem:${id}:latest`)) || {}).fw);
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
-    await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
-    const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${rel.asset_name}`, async (st) => {
-      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag };
+    if (!(retry && prevSent && prevSent.url)) await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
+    const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${retry ? "retry " : ""}${rel.asset_name}`, async (st) => {
+      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, retry };
     });
     return json({ ...o, release: rel }, c);
   }
@@ -888,7 +942,7 @@ const ago=s=>{if(!s)return "never";const d=(Date.now()-new Date(s))/1000;return 
 const kv=rows=>rows.map(([k,v])=>'<div class="kv"><span>'+e(k)+'</span><span>'+e(v??"—")+'</span></div>').join("");
 const STALE_MS=26*3600e3;
 const sig=c=>c==null||c<0||c==99?null:(c>=20?"Excellent":c>=15?"Good":c>=10?"OK":"Weak")+" ("+c+")";
-const PSTATE={running:["Updating…","run"],done:["Updated","ok"],failed:["Update failed","failed"],timeout:["No response","failed"]};
+const PSTATE={running:["Updating…","run"],done:["Updated","ok"],failed:["Update failed","failed"],timeout:["Stalled","failed"],cancelled:["Cancelled","mut"]};
 function ubadge(u,label){if(!u)return"";const c=u.state==="available"?"run":u.state==="current"?"":"mut";const w=u.state==="available"?"update available":u.state==="current"?"up to date":u.state==="unknown"?"version unknown":"not checked";return '<span class="badge '+c+'" title="'+e(u.text)+'">'+e(label+": "+w)+'</span>'}
 function utext(u){if(!u)return null;return u.state==="available"?"⬆ "+u.text:u.state==="current"?"✓ "+u.text:u.text}
 function pbadge(p,label){if(!p||p.state==="idle")return"";if(p.state==="done"&&p.finished_at&&Date.now()-new Date(p.finished_at)>36e5)return"";const s=PSTATE[p.state]||[p.state,"mut"];return '<span class="badge '+(s[1]==="ok"?"":s[1])+'">'+e(label+": "+s[0]+(p.state==="running"?" "+p.pct+"%":""))+'</span>'}
@@ -1041,12 +1095,13 @@ let first=true,pending={},PRE={};
 function prog(p,label,pend){
  if(pend&&(!p||p.state==="idle"||(p.started_at&&new Date(p.started_at)<pend)))p={state:"running",step:0,pct:0,steps:["Waiting for T-SIM to wake","Downloading","Verifying","Writing / flashing","Rebooting","Done"],times:{0:pend.toISOString()}};
  if(!p||p.state==="idle")return '<p class="small mut">No update in progress.</p>';
+ if(p.state==="cancelled")return '<div style="margin-top:10px"><div class="row"><b class="small">Update cancelled '+e(t(p.finished_at)||"")+'</b><span class="badge mut">Cancelled</span></div><p class="small mut">'+e(p.reason||"")+'</p></div>';
  const fail=p.state==="failed"||p.state==="timeout",cls=p.state==="done"?"done":fail?"failed":"";
- const head=p.state==="done"?"Update finished "+t(p.finished_at):p.state==="running"?"Update in progress":p.state==="timeout"?"No response from the T-SIM":"Update failed "+t(p.finished_at);
+ const head=p.state==="done"?"Update finished "+t(p.finished_at):p.state==="running"?"Update in progress":p.state==="timeout"?"Update stalled":"Update failed "+t(p.finished_at);
  const rows=p.steps.map((s,i)=>{let c="";if(p.state==="done"||i<p.step)c="ok";else if(i===p.step)c=fail?"bad":"cur";
   if(i===5&&fail)return '<li class="bad"><span>Failed</span><span>'+e(t(p.finished_at)||"")+'</span></li>';
   return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
- return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":fail?"Failed":p.pct+"%")+'</span></div>'+
+ return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"Failed":p.pct+"%")+'</span></div>'+
   '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+
   (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+'<ol class="steps">'+rows+'</ol></div>'}
 async function load(){
@@ -1065,6 +1120,7 @@ async function load(){
  for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
  $("p-heltec").innerHTML=prog(PG.heltec,"Heltec",pending.heltec);$("p-tsim").innerHTML=prog(PG.tsim,"T-SIM",pending.tsim);
  const busy=["heltec","tsim"].some(k=>pending[k]||(PG[k]||{}).state==="running");
+ setUpd("update-latest","heltec",PG.heltec,pending.heltec);setUpd("tsim-update","tsim",PG.tsim,pending.tsim);
  const C=M.core||{},R=M.radio||{},P=M.packets||{};
  $("meshat").textContent=M.received_at?"· snapshot "+ago(M.received_at)+(M.test?" · TEST DATA":""):"· no snapshot yet (press Request status)";
  $("m-node").innerHTML=kv([["Name",M.node_name],["Firmware",M.heltec_fw],["Clock",M.clock],["Battery",C.battery_mv==null?null:(C.battery_mv/1000).toFixed(2)+" V"],["Uptime",up(C.uptime_secs)],["Queue / errors",C.queue_len==null?null:C.queue_len+" / "+C.errors]]);
@@ -1120,8 +1176,25 @@ $("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued comman
 $("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await rj(r);say("conmsg",r.ok,r.ok?"Cancelled "+j.cancelled+" queued command"+(j.cancelled==1?"":"s"):friendly(j,r.status));load();};
 const OKMSG={status:"Text sent. The T-SIM will wake and report within ~2 minutes.",reboot:"Text sent. The Heltec will restart when the T-SIM wakes (~2 minutes).",
  "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it on the LoRa radio tab.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it on the T-SIM tab."};
+const ULBL={"update-latest":"Update radio firmware","tsim-update":"Update T-SIM firmware"},UKIND={"update-latest":"heltec","tsim-update":"tsim"};
+// Dynamic update buttons: Update (idle/done) -> Cancel (queued/running) -> Retry (failed/stalled/cancelled)
+function setUpd(a,kind,p,pend){const s=pend&&(!p||p.state==="idle"||p.state==="done")?"running":(p&&p.state)||"idle";
+ const mode=s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"update";
+ document.querySelectorAll('button[data-a="'+a+'"]').forEach(b=>{if(b.dataset.busy)return;b.dataset.mode=mode;
+  b.textContent=mode==="cancel"?"Cancel "+(kind==="tsim"?"T-SIM":"radio")+" update":mode==="retry"?"Retry "+(kind==="tsim"?"T-SIM":"radio")+" update":ULBL[a];
+  b.className=mode==="cancel"?"g":"w"})}
+async function updClick(b,a){const kind=UKIND[a],mode=b.dataset.mode||"update";
+ if(mode==="cancel"){if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return null;
+  const r=await post("update-cancel",{kind});const j=await rj(r);if(r.ok){delete pending[kind];toast(j.note,"ok")}else toast(friendly(j,r.status),"bad");return true}
+ if(mode==="retry"){if(!confirm("Retry the same update? This sends one text to wake the T-SIM."))return null;
+  const r=await post(a,{retry:true});const j=await rj(r);if(j.sent){pending[kind]=new Date();toast("Retry sent. "+OKMSG[a],"ok")}else toast(friendly(j,r.status),"bad");return true}
+ return false}
 document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
- const a=b.dataset.a;if(b.dataset.c&&!confirm(b.dataset.c))return;
+ const a=b.dataset.a;if(b.dataset.busy)return;
+ if(UKIND[a]&&b.dataset.mode&&b.dataset.mode!=="update"){b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
+  try{await updClick(b,a)}catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
+  delete b.dataset.busy;b.textContent=old;b.disabled=false;load();return}
+ if(b.dataset.c&&!confirm(b.dataset.c))return;b.dataset.busy=1;
  b.disabled=true;const old=b.textContent;b.textContent="Working…";
  try{
   if(a==="check"){const[r1,r2]=await Promise.all([post("check"),post("tsim-check")]);const[j1,j2]=await Promise.all([rj(r1),rj(r2)]);
@@ -1131,7 +1204,7 @@ document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
    if(j.sent){toast(OKMSG[a],"ok");if(a==="update-latest")pending.heltec=new Date();if(a==="tsim-update")pending.tsim=new Date();}
    else toast(friendly(j,r.status),"bad");}
  }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
- b.textContent=old;b.disabled=false;load();
+ delete b.dataset.busy;b.textContent=old;b.disabled=false;load();
 });
 function tab(){const k=(location.hash||"#ov").slice(1),v=["ov","radio","tsim","act"].includes(k)?k:"ov";
  document.querySelectorAll(".pane").forEach(p=>p.hidden=p.id!=="t-"+v);document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===v))}

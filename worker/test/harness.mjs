@@ -102,6 +102,7 @@ assert.equal(JSON.parse(kv.get("state:tsim-1")).last_update_sent.tag, "PowerSavi
   // disabled + no direct URL -> check/update refused
   assert.equal((await post({ enabled: false, direct_url: "" })).status, 200);
   assert.equal((await auth("/api/d/tsim-1/check", { method: "POST" })).status, 404);
+  { const s0 = JSON.parse(kv.get("state:tsim-1")); delete s0.last_update_sent; kv.set("state:tsim-1", JSON.stringify(s0)); }  // previous update finished
   assert.equal((await auth("/api/d/tsim-1/update-latest", { method: "POST" })).status, 404);
   // disabled + direct URL -> used for check and update
   assert.equal((await post({ direct_url: "https://example.com/fw/My_fw-1.bin" })).status, 200);
@@ -237,7 +238,7 @@ assert.equal(typeof worker.scheduled, "function");
   assert.equal(j.latest_available.tag, "v1.6.0"); assert.equal(j.latest_available.checksum, "sha256:" + "ab".repeat(32));
   // console is OFF, yet the system command is delivered
   j = await (await O("tsim-update")).json(); assert(j.sent); assert.equal(j.body, "CMD"); assert.equal(holo, h0 + 1);
-  assert.equal((await O("tsim-update")).status, 429);
+  { const h1 = holo; const rd = await O("tsim-update"); assert.equal(rd.status, 409); const jd = await rd.json(); assert(jd.duplicate && /already requested/.test(jd.error)); assert.equal(holo, h1, "dedupe sends no text"); }
   const txt = await (await call("/api/dev/ota-1/commands", { headers: { "X-Device-Key": key } })).text();
   assert.equal(txt.split("\t")[1].trim(), "TSIMUPDATE https://github.com/just-stuff-tm/tsim-remote-updater/releases/download/v1.6.0/firmware.bin sha256:" + "ab".repeat(32));
   // OTA progress is tracked; system cmd output does not touch powersaving state
@@ -256,6 +257,44 @@ assert.equal(typeof worker.scheduled, "function");
   const t2 = await (await call("/api/dev/ota-1/commands", { headers: { "X-Device-Key": key } })).text();
   assert(t2.includes("TSIMUPDATE https://example.com/t.bin md5:" + "c".repeat(32)));
   assert.equal((await admin("/admin/devices/ota-1", "DELETE")).status, 200); assert.equal(kv.get("tsimsrc:ota-1"), undefined);
+}
+// dynamic update buttons: cancel / stall / retry
+{
+  await admin("/admin/devices", "POST", { id: "dyn-1", hologram_device_id: "1234567" });
+  await admin("/admin/devices/dyn-1/reset-password", "POST", { password: "dyn-device-password" });
+  const r = await login("dyn-1", "dyn-device-password", "5.5.5.5"); const dc = r.headers.get("Set-Cookie").split(";")[0];
+  const D = (a, body) => call("/api/d/dyn-1/" + a, { method: "POST", headers: { Cookie: dc, "Content-Type": "application/json" }, body: body && JSON.stringify(body) });
+  const tel = async () => (await call("/api/d/dyn-1/telemetry", { headers: { Cookie: dc } })).json();
+  const key = JSON.parse(kv.get("device:dyn-1")).ingest_key;
+  const resetGap = () => { const s = JSON.parse(kv.get("state:dyn-1")); s.last_send_ts = 0; kv.set("state:dyn-1", JSON.stringify(s)); };
+  let h0 = holo;
+  let j = await (await D("tsim-update")).json(); assert(j.sent); assert.equal(holo, h0 + 1);
+  assert.equal((await tel()).progress.tsim.state, "running");
+  // cancel before pickup: queued cmd cleared, device gets nothing, no SMS
+  j = await (await D("update-cancel", { kind: "tsim" })).json(); assert(j.cancelled && j.cleared === 1); assert.equal(holo, h0 + 1);
+  assert.equal((await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text().then ? await (await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text() : "", "");
+  let t = await tel(); assert.equal(t.progress.tsim.state, "cancelled"); assert(/Nothing will be installed/.test(t.progress.tsim.reason));
+  assert.equal((await D("update-cancel", { kind: "tsim" })).status, 409);
+  // retry re-queues the SAME file with one text
+  resetGap(); const url0 = JSON.parse(kv.get("state:dyn-1")).tsim_update_sent.url;
+  j = await (await D("tsim-update", { retry: true })).json(); assert(j.sent); assert.equal(holo, h0 + 2);
+  const txt = await (await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text(); assert(txt.includes(url0));
+  // device started -> cancel just marks requested
+  await call("/ingest/dyn-1", { method: "POST", headers: { "X-Device-Key": key }, body: JSON.stringify({ type: "update", msg: "TSIM OTA start: x" }) });
+  j = await (await D("update-cancel", { kind: "tsim" })).json(); assert(j.cancelled && j.cleared === 0 && /may finish/.test(j.note));
+  // stall detection: >10 min with no progress
+  const st = JSON.parse(kv.get("state:dyn-1")); delete st.tsim_cancel; kv.set("state:dyn-1", JSON.stringify(st));
+  const hist = JSON.parse(kv.get("telem:dyn-1:history"));
+  const p = computeProgress("tsim", hist, { ...st, last_checkin_ts: 0 }, Date.now() + 11 * 60e3);
+  assert.equal(p.state, "timeout"); assert(/cell connection/.test(p.reason));
+  // radio: dedupe + cancel (no SMS) + retry same file
+  resetGap(); h0 = holo;
+  j = await (await D("update-latest")).json(); assert(j.sent); assert.equal(holo, h0 + 1);
+  assert.equal((await D("update-latest")).status, 409); assert.equal(holo, h0 + 1);
+  j = await (await D("update-cancel", { kind: "heltec" })).json(); assert(j.cancelled && /already delivered/.test(j.note)); assert.equal(holo, h0 + 1);
+  resetGap(); j = await (await D("update-latest", { retry: true })).json(); assert(j.sent && j.body.startsWith("UPDATE ")); assert.equal(holo, h0 + 2);
+  const page = await (await call("/d/dyn-1", { headers: { Cookie: dc } })).text(); assert(page.includes("setUpd(") && page.includes("update-cancel"));
+  console.log("dynamic update button tests ok");
 }
 console.log("ALL TESTS PASSED");
 // origin handling
