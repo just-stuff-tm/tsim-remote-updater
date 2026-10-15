@@ -44,7 +44,7 @@ flowchart LR
 
 ![Wiring](docs/wiring_7672.svg)
 
-**Recommended wiring (since Oct 2026):** the Heltec V3 is powered **directly from the same 1S Li-ion battery** through its own JST battery connector (both + and −). There is **no 3V3 link** between the boards. The T-SIM does the solar charging. The boards share GND and the four signal wires below. Benefit: the repeater measures and reports the **true battery voltage** over the mesh. (The drawing above still shows the old 3V3 wire under its red banner; this table is what to follow.)
+**Recommended wiring (since Oct 2026):** the Heltec V3 is powered **directly from the same 1S Li-ion battery** through its own JST battery connector (both + and −). There is **no 3V3 link** between the boards. The T-SIM does the solar charging. The boards share GND and the four signal wires below. Benefit: the repeater measures and reports the **true battery voltage** over the mesh.
 
 | Wire    | T-SIM side            | Heltec V3 side                 |
 |---------|-----------------------|--------------------------------|
