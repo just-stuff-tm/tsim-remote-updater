@@ -427,3 +427,11 @@ console.log("tag/asset version ok");
   assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, true, "fresh no-reply after a confirmed answer asserts it");
   console.log("power-saving state tests OK");
 }
+
+// IP blur
+{
+  const { dashboardPage } = await import("../src/index.js");
+  const h = dashboardPage({ id: "tsim-1", name: "x" });
+  assert(/\.sens\{filter:blur/.test(h) && /tsim_show_sensitive/.test(h) && /\["IP",sens\(L\.ip\)\]/.test(h));
+  console.log("IP blur OK");
+}
