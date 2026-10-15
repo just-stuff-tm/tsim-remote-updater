@@ -44,16 +44,26 @@ flowchart LR
 
 ![Wiring](docs/wiring_7672.svg)
 
-| Wire   | T-SIM pin | Heltec V3 pin |
-|--------|-----------|---------------|
-| Power  | 3V3       | 3V3           |
-| Ground | GND       | GND           |
-| Serial | GPIO42    | GPIO44 (RX)   |
-| Serial | GPIO41    | GPIO43 (TX)   |
-| Reset  | GPIO1     | RST / EN      |
-| Boot   | GPIO2     | GPIO0 / PRG   |
+**Recommended wiring (since Oct 2026):** the Heltec V3 is powered **directly from the same 1S Li-ion battery** through its own JST battery connector (both + and −). There is **no 3V3 link** between the boards. The T-SIM does the solar charging. The boards share GND and the four signal wires below. Benefit: the repeater measures and reports the **true battery voltage** over the mesh. (The drawing above still shows the old 3V3 wire under its red banner; this table is what to follow.)
 
-On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9. Put 100 µF + 10 µF across the Heltec 3V3/GND. Don't power both boards from USB at the same time while 3V3 is linked.
+| Wire    | T-SIM side            | Heltec V3 side                 |
+|---------|-----------------------|--------------------------------|
+| Battery | battery + / − (18650) | JST battery connector + / −    |
+| Ground  | GND                   | GND (shared)                   |
+| Serial  | GPIO42 (TX)           | GPIO44 (RX)                    |
+| Serial  | GPIO41 (RX)           | GPIO43 (TX)                    |
+| Reset   | GPIO1                 | RST / EN                       |
+| Boot    | GPIO2                 | GPIO0 / PRG                    |
+| ~~3V3~~ | **not connected**     | **not connected**              |
+
+- **Check the JST polarity with a multimeter before plugging in.** The Heltec battery socket is 1.25 mm pitch and JST battery-lead polarity is *not* standardized; a reversed lead can destroy the board.
+- **Never plug USB into the Heltec while it is wired to the battery.** Its on-board charger would then charge the shared cell, in parallel with the T-SIM's charger. Unplug the battery lead first if you need Heltec USB.
+- Put an inline **fuse on the battery +** lead (e.g. 2–3 A) close to the cell.
+- Optional: **10 µF + 100 nF ceramic** capacitors across 3V3/GND on each board, close to the module.
+- Optional: **1 kΩ series resistors** in the TX/RX lines to limit current if one board is unpowered or misconfigured.
+- The T-SIM can **reset** the Heltec (RST line) but cannot **power-cycle** it, since the Heltec is fed straight from the battery.
+
+On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9.
 
 
 ## Battery calibration and low-battery protection (T-SIM firmware 1.6.5+)

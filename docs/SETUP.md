@@ -80,7 +80,7 @@ pio run
 > **Other repeater boards:** any ESP32-family MeshCore board can be remotely flashed. nRF52 boards (RAK4631, T-Echo, T114, …) can only be rebooted and checked, not flashed. Set the file name pattern to your board's firmware. See "Supported repeater boards" in the README.
 
 
-See the wiring table and picture in the [README](../README.md#wiring). Put the SIM in the T-SIM, attach the LTE antenna, the 18650 and (later) the solar panel. Flash your repeater firmware onto the Heltec first with the normal MeshCore web flasher.
+See the wiring table in the [README](../README.md#wiring). Recommended: power the Heltec from the same 1S battery via its JST battery connector (check polarity with a meter first, it is not standardized), **no 3V3 link** between the boards, shared GND plus TX/RX/RST/BOOT, a fuse on battery +, and never plug USB into the Heltec while it is battery-wired. Put the SIM in the T-SIM, attach the LTE antenna, the 18650 and (later) the solar panel. Flash your repeater firmware onto the Heltec first with the normal MeshCore web flasher.
 
 ## 6. Flash the T-SIM
 
