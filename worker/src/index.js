@@ -155,7 +155,7 @@ const SEC_HEADERS = {
   "Cache-Control": "no-store",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
-  "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+  "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' https://unpkg.com; style-src 'unsafe-inline' https://unpkg.com; img-src https://tile.openstreetmap.org https://unpkg.com data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 };
 const html = (body, status = 200, headers = {}) => new Response(body, { status, headers: { ...SEC_HEADERS, ...headers } });
 const redirect = (loc, headers = {}) => new Response(null, { status: 303, headers: { Location: loc, ...headers } });
@@ -492,6 +492,14 @@ async function handleIngest(request, env, id) {
     await logActivity(env, id, { type: "mesh", msg: `Mesh snapshot: ${n} neighbors${mesh.error ? " (" + mesh.error.slice(0, 80) + ")" : ""}`, ...(entry.test ? { test: true } : {}) });
     return json({ ok: true });
   }
+  if (t.type === "gps") {
+    const g = parseGps(t, (await kvJson(env, `gps:${id}`)) || {}, entry.received_at);
+    await putJson(env, `gps:${id}`, g);
+    const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
+    await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at, ...(t.fw ? { fw: String(t.fw).slice(0, 60) } : {}) });
+    await logActivity(env, id, { type: "event", msg: g.attempt.fix ? `Location fix (${g.attempt.trigger === "auto" ? "on check-in" : "requested"}): ${g.fix.sats ?? "?"} satellites` : `Location: no fix (${g.attempt.msg.slice(0, 100)})` });
+    return json({ ok: true });
+  }
   if (entry.type === "cmd") {
     const cmdId = String(t.cmd_id || "").slice(0, 16);
     const out = String(t.output ?? "").slice(0, CMD_OUT_MAX);
@@ -574,7 +582,7 @@ async function setPowersaving(env, id, on, source) {
   await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on === null ? "unknown (no CLI reply since the firmware change)" : on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
 
-export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg)\s/i.test(String(cmd || "").trim());
+export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
 // ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
 export const LB_RATIO = 1.10;
@@ -612,6 +620,67 @@ export function validatePower(cur, b, rawIdle) {
   return o;
 }
 export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
+// ---------- GPS / location (T-SIM firmware 1.6.7+) ----------
+export const GPS_FW = "1.6.7";
+export const DEFAULT_GPS = { auto: false, timeout_s: 90 };
+const isGpsCmd = (cmd) => /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
+export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}`;
+export function validateGps(cur, b) {
+  const o = { ...DEFAULT_GPS, ...cur };
+  if (b.auto !== undefined) o.auto = b.auto === true;
+  if (b.timeout_s !== undefined) {
+    const s = Math.round(Number(b.timeout_s));
+    if (!(s >= 30 && s <= 300)) throw new Error("Fix timeout must be between 30 and 300 seconds.");
+    o.timeout_s = s;
+  }
+  return { auto: o.auto, timeout_s: o.timeout_s };
+}
+const num = (v, lo, hi) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi ? v : null;
+// Ingest {"type":"gps"} -> stored record. Keeps the last good fix when an attempt finds none.
+export function parseGps(t, prev = {}, receivedAt = new Date().toISOString()) {
+  const lat = num(t.lat, -90, 90), lon = num(t.lon, -180, 180);
+  const fix = t.fix === true && lat != null && lon != null && !(lat === 0 && lon === 0);
+  const attempt = { at: receivedAt, fix, sats: num(t.sats, 0, 200), secs: num(t.secs, 0, 3600), trigger: t.trigger === "auto" ? "auto" : "cmd",
+    src: String(t.src || "").slice(0, 12), msg: String(t.msg || "").slice(0, 200) };
+  const out = { attempt, fix: prev.fix || null };
+  if (fix) out.fix = { lat: Math.round(lat * 1e6) / 1e6, lon: Math.round(lon * 1e6) / 1e6, alt: num(t.alt, -1000, 20000), sats: attempt.sats,
+    hdop: num(t.hdop, 0, 99), utc: /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(String(t.utc || "")) ? t.utc : null, received_at: receivedAt, trigger: attempt.trigger };
+  return out;
+}
+export const GPS_STEPS = ["Waiting for T-SIM to wake", "Searching for satellites", "Done"];
+// req: {id, at, timeout_s}; cmds: command list; gps: stored record.
+export function gpsProgress(req, cmds = [], gps = {}, now = Date.now()) {
+  if (!req || !req.id) return { state: "idle" };
+  const c = (cmds || []).find((x) => x.id === req.id);
+  const at = Date.parse(req.at), a = gps && gps.attempt;
+  const base = { started_at: req.at, steps: GPS_STEPS, times: { 0: req.at } };
+  if (a && Date.parse(a.at) >= at) {
+    const p = { ...base, step: 2, pct: 100, finished_at: a.at, fix: a.fix, times: { ...base.times, ...(c && c.sent_at ? { 1: c.sent_at } : {}), 2: a.at } };
+    return a.fix ? { ...p, state: "done" } : { ...p, state: "failed", reason: a.msg || "No fix" };
+  }
+  if (c && c.status === "cancelled") return { ...base, state: "cancelled", step: 0, pct: 0, finished_at: req.cancelled_at || req.at, reason: "Cancelled before the T-SIM picked it up." };
+  if (c && c.status === "error") return { ...base, state: "failed", step: 1, pct: 50, finished_at: c.done_at, reason: c.error || c.output || "Failed" };
+  if (c && c.status === "done") return { ...base, state: "failed", step: 1, pct: 50, finished_at: c.done_at, reason: c.output || "The T-SIM finished without reporting a location." };
+  if (c && c.status === "sent") {
+    const lim = ((req.timeout_s || 90) + 240) * 1000;
+    const p = { ...base, step: 1, pct: 50, times: { ...base.times, 1: c.sent_at } };
+    return now - Date.parse(c.sent_at) > lim ? { ...p, state: "timeout", reason: "The T-SIM took the request but no location came back." } : { ...p, state: "running" };
+  }
+  if (now - at > PROGRESS_TIMEOUT_MS) return { ...base, state: "timeout", step: 0, pct: 0, reason: "The T-SIM didn't wake to pick up the request." };
+  return { ...base, state: "running", step: 0, pct: 10 };
+}
+// "set lat"/"set lon" pair sent to the repeater CLI.
+export function locProgress(req, cmds = []) {
+  if (!req || !req.ids) return { state: "idle" };
+  const cs = req.ids.map((i) => (cmds || []).find((x) => x.id === i)).filter(Boolean);
+  const res = { lat: req.lat, lon: req.lon, at: req.at, outputs: cs.map((c) => ({ cmd: c.cmd, status: c.status, output: cleanCli(c.output || c.error || "") })) };
+  if (cs.some((c) => c.status === "cancelled")) return { ...res, state: "cancelled" };
+  if (cs.length === req.ids.length && cs.every((c) => c.status === "done" || c.status === "error")) {
+    const ok = cs.every((c) => c.status === "done" && /\bok\b/i.test(c.output || ""));
+    return { ...res, state: ok ? "done" : "failed", finished_at: cs.map((c) => c.done_at).sort().pop() };
+  }
+  return { ...res, state: cs.some((c) => c.status === "sent") ? "sending" : "queued" };
+}
 // Console history shows only what the user typed (system commands still drive state, they're just hidden).
 export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.unsolicited && !isSysCmd(c.cmd));
 // T-SIM pulls queued console commands (text/plain, one "<id>\t<command>" per line). Marks them sent.
@@ -625,7 +694,8 @@ async function handleDeviceCommands(request, env, id) {
   const sysOnly = new URL(request.url).searchParams.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || ""))).reverse().slice(0, CMD_MAX_PENDING);
+  const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd))).reverse().slice(0, CMD_MAX_PENDING);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
   return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
@@ -825,7 +895,11 @@ async function deviceApi(request, env, dev, action) {
     const source = await getSource(env, id);
     const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
-    return json({ device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    const [gps, gcfg, greq, lreq] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`)]);
+    const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
+    const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
+      supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
+    return json({ gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -989,6 +1063,61 @@ async function deviceApi(request, env, dev, action) {
     if (o.sent) { list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
     return json({ ...o, release: rec, queued: o.sent ? entry : null }, code);
   }
+  if (action === "gps-fix" || action === "gps-cancel") {
+    const [cmds, gps, greq, gcfg, lat] = await Promise.all([kvJson(env, `cmds:${id}`), kvJson(env, `gps:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `telem:${id}:latest`)]);
+    const list = cmds || [];
+    const p = gpsProgress(greq, list, gps || {});
+    if (action === "gps-cancel") {
+      if (p.state !== "running" && p.state !== "timeout") return json({ cancelled: false, error: "No location request is in progress." }, 409);
+      const c = list.find((x) => x.id === greq.id);
+      if (c && c.status === "queued") { c.status = "cancelled"; await putJson(env, `cmds:${id}`, list); await putJson(env, `gpsreq:${id}`, { ...greq, cancelled_at: new Date().toISOString() }); return json({ cancelled: true, note: "Cancelled. Nothing was sent to the T-SIM." }); }
+      await putJson(env, `gpsreq:${id}`, {});  // already picked up: stop tracking it
+      return json({ cancelled: true, note: "Stopped waiting. The T-SIM had already started, so a location may still arrive." });
+    }
+    if (!fwAtLeast(lat && lat.fw, GPS_FW)) return json({ sent: false, error: `Location needs T-SIM firmware ${GPS_FW} or newer. Update the T-SIM firmware first.` }, 409);
+    const retry = await bodyRetry(request);
+    if (p.state === "running") return json({ sent: false, duplicate: true, error: `A location request is already ${p.step ? "running" : "waiting for the T-SIM to wake"}. No new text was sent. Use Cancel first if you want to stop it.` }, 409);
+    const entry = { id: randomHex(4), cmd: "GPSFIX", sys: true, status: "queued", queued_at: new Date().toISOString() };
+    const [o, code] = await manualSend(env, dev, "CMD", retry ? "Get location retry" : "Get location");
+    if (o.sent) {
+      for (const c of list) if (c.status === "queued" && /^gpsfix\b/i.test(c.cmd || "")) c.status = "cancelled";
+      list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+      await putJson(env, `gpsreq:${id}`, { id: entry.id, at: entry.queued_at, timeout_s: { ...DEFAULT_GPS, ...(gcfg || {}) }.timeout_s, retry });
+    }
+    return json({ ...o, queued: o.sent ? entry : null }, code);
+  }
+  if (action === "gps-settings") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const cur = { ...DEFAULT_GPS, ...((await kvJson(env, `gpscfg:${id}`)) || {}) };
+    let g; try { g = validateGps(cur, b); } catch (e) { return json({ error: e.message }, 400); }
+    await putJson(env, `gpscfg:${id}`, g);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    for (const c of list) if (c.status === "queued" && /^gpscfg\s/i.test(c.cmd || "")) c.status = "cancelled";  // newest settings win
+    const entry = { id: randomHex(4), cmd: gpsCfgCmd(g), sys: true, status: "queued", queued_at: new Date().toISOString() };
+    list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await logActivity(env, id, { type: "action", msg: `Location settings: auto on check-in ${g.auto ? "ON" : "off"}, timeout ${g.timeout_s}s (applied at next wake)` });
+    return json({ saved: true, settings: g, queued: entry });
+  }
+  if (action === "set-location") {
+    let b = {}; try { b = await request.json(); } catch {}
+    if (b.confirm !== true) return json({ error: "confirm required" }, 400);
+    const [gps, cmds, lreq, pst] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `cmds:${id}`), kvJson(env, `locreq:${id}`), loadState(env, id)]);
+    const f = gps && gps.fix;
+    if (!f) return json({ error: "No GPS location yet. Press Get location on the T-SIM tab first." }, 409);
+    if (pst.heltec_powersaving === true) return json({ error: PS_NOTE, powersaving: true }, 409);
+    const list = cmds || [];
+    const lp = locProgress(lreq, list);
+    if (lp.state === "queued" || lp.state === "sending") return json({ error: "The repeater location is already being set. Wait for the result." }, 409);
+    const now = new Date().toISOString();
+    const a = { id: randomHex(4), cmd: `set lat ${f.lat.toFixed(6)}`, sys: true, loc: true, status: "queued", queued_at: now };
+    const o2 = { id: randomHex(4), cmd: `set lon ${f.lon.toFixed(6)}`, sys: true, loc: true, status: "queued", queued_at: now };
+    const [o, code] = await manualSend(env, dev, "CMD", "Set repeater location");
+    if (o.sent) {
+      list.unshift(a); list.unshift(o2); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+      await putJson(env, `locreq:${id}`, { ids: [a.id, o2.id], at: now, lat: f.lat, lon: f.lon });
+    }
+    return json({ ...o, queued: o.sent ? [a, o2] : null }, code);
+  }
   if (action === "status") { const [o, c] = await manualSend(env, dev, "STATUS", "STATUS"); return json(o, c); }
   if (action === "reboot") { const [o, c] = await manualSend(env, dev, "REBOOT", "REBOOT"); return json(o, c); }
   if (action === "update-latest") {
@@ -1140,7 +1269,7 @@ main{max-width:1040px;margin:auto;padding:14px}.grid{display:grid;gap:12px;grid-
 .kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line)}.kv:last-child{border:0}.kv span:first-child{color:var(--mut)}.kv span:last-child{text-align:right;word-break:break-word}
 button,.btn{border:0;border-radius:10px;padding:11px 14px;font-size:15px;font-weight:500;background:var(--acc);color:#fff;cursor:pointer}button:disabled{opacity:.5;cursor:default}
 button.w{background:var(--bad)}button.g{background:#57606a}button.sm{padding:6px 12px;font-size:13px}
-.acts{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:12px 0}
+.map{height:220px;border-radius:8px;margin-top:10px;border:1px solid var(--line)}.acts{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:12px 0}
 section{margin:22px 0}h2{font-size:17px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mut);font-weight:500}
 .tw{overflow-x:auto}.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;background:var(--ok)}
@@ -1291,6 +1420,11 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
 <button type="submit">Save &amp; send now</button> <button type="button" class="g" id="lbsave2">Save without sending</button><span id="lbmsg" class="msg"></span>
 <p class="small mut">"Save &amp; send now" texts the T-SIM once so it wakes and applies the settings within a few minutes. "Save without sending" waits for its next wake (useful to batch several changes).</p></form></div></details>
+<details class="card" id="locbox"><summary><b>Repeater location</b><small id="locsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Copies the T-SIM's GPS position to the repeater with the MeshCore commands <code>set lat</code> and <code>set lon</code>, so its adverts show where it is. This is never done automatically. Anyone on the mesh can then see the position.</p>
+<div id="locinfo"></div>
+<button type="button" id="locbtn" class="w">Set repeater location</button> <span id="locmsg" class="msg"></span>
+<div id="locres" class="small"></div></div></details>
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
@@ -1313,6 +1447,17 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Device</h3><div id="c-tsim"></div></div>
 <div class="card"><h3>Power</h3><div id="c-power"></div></div>
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
+</div></section>
+<section><h2>Location <small class="mut small" id="gpsat"></small></h2><div class="card">
+<div class="acts" style="margin-top:0"><button type="button" id="gpsbtn" data-mode="get">Get location</button></div>
+<p class="small mut" id="gpsnote" hidden>Location needs T-SIM firmware 1.6.7 or newer. Update the T-SIM firmware first.</p>
+<div id="c-gps"></div><div id="gpsmapw" hidden><div id="gpsmap" class="map sens"></div><p class="small mut" style="margin:4px 0 0">Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors</p></div><div id="p-gps"></div>
+<details class="small" style="margin-top:10px"><summary>Location settings</summary>
+<form id="gpsf" style="margin-top:8px"><label class="tog"><input type="checkbox" name="auto"> Auto-update location on every check-in (uses extra battery: GPS runs up to the timeout each check-in)</label>
+<label>Fix timeout (seconds, 30–300)<input name="to" type="number" min="30" max="300" step="5"></label>
+<button type="submit" class="g">Save</button> <span id="gpsmsg" class="msg"></span>
+<p class="small mut">Settings are applied at the T-SIM's next wake (no text is sent).</p></form></details>
+<p class="small mut">Uses the modem's built-in GPS. Needs a GNSS antenna on the T-SIM's GPS/GNSS u.FL connector (not the LTE one) with a view of the sky. The first fix after a long time off can take 1–2 minutes. Coordinates are hidden until you press the eye.</p>
 </div></section>
 <section><h2>Settings</h2>
 <details class="card" id="calbox"><summary><b>Battery calibration</b><small id="calsum" class="mut"></small></summary><div class="in">
@@ -1372,7 +1517,7 @@ var DS={};
 async function load(){
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  $("seen").textContent=seen?(stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale?" stale":"");
  $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
@@ -1504,8 +1649,70 @@ document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
  }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  delete b.dataset.busy;b.textContent=old;b.disabled=false;load();
 });
+/* ---- location (GPS) ---- */
+let GPS={},gpsLoaded=false,LMAP=null,LMK=null,gpsPend=null;
+const GSTEP=["Waiting for T-SIM to wake","Searching for satellites","Done"];
+function llTxt(f){return f.lat.toFixed(6)+", "+f.lon.toFixed(6)}
+function acc(h){if(h==null||h<0)return null;const q=h<=1?"excellent":h<=2?"good":h<=5?"fair":"poor";return "HDOP "+h.toFixed(1)+" ("+q+", about ±"+Math.max(3,Math.round(h*5))+" m)"}
+function copyLL(){const f=GPS.fix;if(!f)return;const s=llTxt(f);(navigator.clipboard?navigator.clipboard.writeText(s):Promise.reject()).then(()=>toast("Coordinates copied","ok"),()=>toast(s,"ok"))}
+function loadLeaflet(){if(window.L)return Promise.resolve();if(loadLeaflet.p)return loadLeaflet.p;
+ const c=document.createElement("link");c.rel="stylesheet";c.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";c.integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";c.crossOrigin="";document.head.appendChild(c);
+ return loadLeaflet.p=new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";s.integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";s.crossOrigin="";s.onload=ok;s.onerror=bad;document.head.appendChild(s)})}
+function showMap(f){$("gpsmapw").hidden=false;loadLeaflet().then(()=>{const ll=[f.lat,f.lon];
+ if(!LMAP){LMAP=L.map("gpsmap",{scrollWheelZoom:false,attributionControl:false}).setView(ll,15);L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19}).addTo(LMAP);LMK=L.marker(ll).addTo(LMAP)}
+ else if(showMap.k!==ll.join()){LMK.setLatLng(ll);LMAP.setView(ll,LMAP.getZoom())}showMap.k=ll.join();setTimeout(()=>LMAP.invalidateSize(),50)}).catch(()=>{$("gpsmap").innerHTML='<p class="small mut" style="padding:10px">Map couldn’t load (no internet?). Coordinates above still work.</p>'})}
+function gprog(p){if(gpsPend&&(!p||p.state==="idle"||p.state==="done"||p.state==="failed"||p.state==="cancelled")&&!(p&&p.started_at&&new Date(p.started_at)>=gpsPend))p={state:"running",step:0,pct:10,times:{0:gpsPend.toISOString()}};
+ if(!p||p.state==="idle")return "";
+ if(p.state==="cancelled")return '<p class="small mut">Location request cancelled '+e(t(p.finished_at))+'.</p>';
+ const fail=p.state==="failed"||p.state==="timeout";
+ const head=p.state==="done"?"Location updated "+t(p.finished_at):p.state==="running"?"Getting location…":p.state==="timeout"?"Location request stalled":"No GPS fix "+t(p.finished_at);
+ const rows=GSTEP.map((s,i)=>{const c=p.state==="done"||i<p.step?"ok":i===p.step?(fail?"bad":"cur"):"";return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
+ return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(p.state==="done"?"":fail?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"No fix":p.pct+"%")+'</span></div>'+
+  '<div class="bar '+(p.state==="done"?"done":fail?"failed":"")+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+
+  (p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small"><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
+function gpsMode(p){const s=gpsPend&&!(p&&p.started_at&&new Date(p.started_at)>=gpsPend)?"running":(p&&p.state)||"idle";return s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"get"}
+function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progress;
+ if(gpsPend&&P&&P.started_at&&new Date(P.started_at)>=gpsPend)gpsPend=null;
+ $("gpsnote").hidden=G.supported!==false;
+ $("gpsat").textContent=F?"fix "+t(F.utc||F.received_at):"";
+ const cp=F?{h:'<span class="sens">'+e(llTxt(F))+'</span> <button type="button" class="eye" onclick="sensToggle()" title="Show">👁</button> <button type="button" class="g sm" onclick="copyLL()">Copy</button>'}:null;
+ $("c-gps").innerHTML=F?kv([["Coordinates",cp],["Fix time",t(F.utc||F.received_at)+(F.trigger==="auto"?" (on check-in)":"")],["Satellites",F.sats],["Accuracy",acc(F.hdop)],["Altitude",F.alt==null?null:Math.round(F.alt)+" m"],
+  ...(A&&!A.fix&&new Date(A.at)>new Date(F.received_at)?[["Last attempt","No fix "+t(A.at)+(A.sats!=null?" · "+A.sats+" satellites seen":"")]]:[])])
+  :'<p class="small mut">'+(A?"No fix yet. Last attempt "+e(t(A.at))+(A.sats!=null?" saw "+A.sats+" satellites":"")+". Check the GNSS antenna and that it can see the sky.":"No location yet. Press Get location.")+'</p>';
+ if(F)showMap(F);else $("gpsmapw").hidden=true;
+ $("p-gps").innerHTML=gprog(P);
+ const b=$("gpsbtn");if(!b.dataset.busy){const m=gpsMode(P);b.dataset.mode=m;b.textContent=m==="cancel"?"Cancel location request":m==="retry"?"Retry location":"Get location";b.className=m==="cancel"?"g":"";b.disabled=G.supported===false&&m!=="cancel"}
+ if(!gpsLoaded&&G.settings){const f=$("gpsf");f.auto.checked=!!G.settings.auto;f.to.value=G.settings.timeout_s;gpsLoaded=true}
+ $("gpsmsg").textContent=G.settings_pending?"Waiting for the T-SIM's next wake to apply.":$("gpsmsg").textContent;
+ // LoRa tab: repeater location
+ const LP=G.location||{};$("locsum").textContent=LP.state==="done"?"set "+t(LP.finished_at):LP.state==="queued"||LP.state==="sending"?"sending…":"";
+ $("locinfo").innerHTML=kv([["GPS position",F?{h:'<span class="sens">'+e(llTxt(F))+'</span> <button type="button" class="eye" onclick="sensToggle()" title="Show">👁</button>'}:"No GPS fix yet (T-SIM tab › Get location)"],["Fix time",F?t(F.utc||F.received_at):null]]);
+ const lb=$("locbtn");if(!lb.dataset.busy)lb.disabled=!F||LP.state==="queued"||LP.state==="sending";
+ $("locres").innerHTML=LP.state&&LP.state!=="idle"?'<p class="'+(LP.state==="done"?"ok":LP.state==="failed"?"err":"mut")+'" style="margin:8px 0 4px"><b>'+e(LP.state==="done"?"Repeater location set "+t(LP.finished_at):LP.state==="failed"?"Repeater didn’t confirm the location":LP.state==="cancelled"?"Cancelled":"Waiting for the T-SIM to wake and send it…")+'</b></p>'+
+  (LP.outputs||[]).map(o=>'<div><code>'+e(o.cmd)+'</code> → '+e(o.status==="done"||o.status==="error"?(o.output||"(no reply)"):o.status)+'</div>').join(""):"";
+ sensApply()}
+$("gpsbtn").onclick=async()=>{const b=$("gpsbtn");if(b.dataset.busy)return;const m=b.dataset.mode||"get";
+ if(m==="cancel"){if(!confirm("Cancel the location request? No text is sent."))return}
+ else if(!confirm((m==="retry"?"Try again? ":"")+"Text the T-SIM to wake and read its GPS position? It takes up to "+(GPS.settings?GPS.settings.timeout_s:90)+" s to find satellites, then the location appears here."))return;
+ b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
+ try{const r=await post(m==="cancel"?"gps-cancel":"gps-fix",m==="retry"?{retry:true}:undefined);const j=await rj(r);if(r.status===401){location.href="/";return}
+  if(m==="cancel"){if(r.ok){gpsPend=null;toast(j.note,"ok")}else toast(friendly(j,r.status),"bad")}
+  else if(j.sent){gpsPend=new Date();toast("Text sent. The T-SIM will wake and look for satellites; the location appears here in a few minutes.","ok")}
+  else toast(friendly(j,r.status),"bad")}
+ catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
+ delete b.dataset.busy;b.textContent=old;b.disabled=false;load()};
+$("gpsf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target,to=+f.to.value;
+ if(!(to>=30&&to<=300))return say("gpsmsg",false,"Fix timeout must be between 30 and 300 seconds.");
+ if(f.auto.checked&&!GPS.settings?.auto&&!confirm("Read GPS on every check-in? Each check-in then runs GPS for up to "+to+" s, which uses more battery."))return;
+ const r=await post("gps-settings",{auto:f.auto.checked,timeout_s:to});const j=await rj(r);say("gpsmsg",r.ok,r.ok?"Saved. Applied at the T-SIM's next wake.":friendly(j,r.status));if(r.ok){gpsLoaded=false;load()}};
+$("locbtn").onclick=async()=>{const b=$("locbtn"),F=GPS.fix;if(!F||b.dataset.busy)return;
+ if(!confirm("Set the repeater's advertised location to "+llTxt(F)+"? This texts the T-SIM once and sends 'set lat' and 'set lon' to the repeater. Everyone on the mesh can then see this position."))return;
+ b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
+ try{const r=await post("set-location",{confirm:true});const j=await rj(r);say("locmsg",!!j.sent,j.sent?"Text sent. The result appears here within a few minutes.":friendly(j,r.status))}
+ catch(x){say("locmsg",false,"Couldn't reach the dashboard. Check your internet connection and try again.")}
+ delete b.dataset.busy;b.textContent=old;load()};
 function tab(){const k=(location.hash||"#ov").slice(1),v=["ov","radio","tsim","act"].includes(k)?k:"ov";
- document.querySelectorAll(".pane").forEach(p=>p.hidden=p.id!=="t-"+v);document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===v))}
+ document.querySelectorAll(".pane").forEach(p=>p.hidden=p.id!=="t-"+v);if(v==="tsim"&&LMAP)setTimeout(()=>LMAP.invalidateSize(),50);document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===v))}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{history.replaceState(null,"","#"+b.dataset.t);tab();scrollTo(0,0)});
 addEventListener("hashchange",tab);tab();
 load();

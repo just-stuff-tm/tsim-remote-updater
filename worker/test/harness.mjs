@@ -594,3 +594,99 @@ console.log("tag/asset version ok");
   if (h.length !== 2 || h[1].msg !== "UPDATE retry text sent") throw new Error("merge log failed");
   console.log("sent overlay tests OK");
 }
+
+// ---- GPS / location (v1.6.7) ----
+{
+  const m = await import("../src/index.js");
+  // pure helpers
+  const g1 = m.parseGps({ type: "gps", fix: true, lat: 35.123456789, lon: -80.5, alt: 210.4, sats: 9, hdop: 0.9, utc: "2026-10-16T17:00:00Z", trigger: "cmd", msg: "GPS fix" }, {}, "2026-10-16T17:00:05Z");
+  assert.equal(g1.fix.lat, 35.123457); assert.equal(g1.fix.sats, 9); assert.equal(g1.fix.utc, "2026-10-16T17:00:00Z");
+  const g2 = m.parseGps({ type: "gps", fix: false, sats: 3, msg: "GPS no fix after 90s (sats seen 3)" }, g1, "2026-10-16T18:00:00Z");
+  assert.equal(g2.fix.lat, 35.123457, "no-fix keeps last good fix"); assert.equal(g2.attempt.fix, false); assert.equal(g2.attempt.sats, 3);
+  assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null); assert.equal(m.parseGps({ fix: true, lat: 95, lon: 1 }).fix, null);
+  assert.equal(m.gpsCfgCmd(m.DEFAULT_GPS), "GPSCFG auto=0 to=90");
+  assert.throws(() => m.validateGps({}, { timeout_s: 10 }), /30 and 300/);
+  assert(m.isSysCmd("GPSFIX") && m.isSysCmd("GPSCFG auto=1 to=90") && !m.isSysCmd("set lat 1"));
+  const req = { id: "g1", at: "2026-10-16T17:00:00Z", timeout_s: 90 }, T = Date.parse("2026-10-16T17:01:00Z");
+  assert.equal(m.gpsProgress(null).state, "idle");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "queued" }], {}, T).state, "running");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "queued" }], {}, T + 20 * 60e3).state, "timeout");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "sent", sent_at: "2026-10-16T17:00:30Z" }], {}, T).step, 1);
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "sent", sent_at: "2026-10-16T17:00:30Z" }], {}, T + 10 * 60e3).state, "timeout");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "done" }], { attempt: { at: "2026-10-16T17:02:00Z", fix: true } }, T).state, "done");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "done" }], { attempt: { at: "2026-10-16T17:02:00Z", fix: false, msg: "no fix" } }, T).state, "failed");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "done" }], { attempt: { at: "2026-10-16T16:00:00Z", fix: true } }, T).state, "failed", "older attempt is not this request's result");
+  assert.equal(m.gpsProgress(req, [{ id: "g1", status: "cancelled" }], {}, T).state, "cancelled");
+  assert.equal(m.locProgress({ ids: ["a", "b"] }, [{ id: "a", status: "done", output: "  -> OK" }, { id: "b", status: "done", output: "  -> OK" }]).state, "done");
+  assert.equal(m.locProgress({ ids: ["a", "b"] }, [{ id: "a", status: "done", output: "  -> OK" }, { id: "b", status: "sent" }]).state, "sending");
+  assert.equal(m.locProgress({ ids: ["a", "b"] }, [{ id: "a", status: "done", output: "  -> OK" }, { id: "b", status: "error", error: "no reply" }]).state, "failed");
+
+  // API flow
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const c = (await login("tsim-1", "device-one-password", "5.5.5.5")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a, b) => call("/api/d/tsim-1/" + a, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: b === undefined ? undefined : JSON.stringify(b) });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const unthrottle = () => { const s = JSON.parse(kv.get("state:tsim-1") || "{}"); delete s.last_send_ts; kv.set("state:tsim-1", JSON.stringify(s)); const x = JSON.parse(kv.get("sent:tsim-1") || "{}"); delete x.last_send_ts; kv.set("sent:tsim-1", JSON.stringify(x)); };
+  kv.set("cmds:tsim-1", "[]"); kv.delete("gps:tsim-1"); kv.delete("gpsreq:tsim-1"); kv.delete("locreq:tsim-1");
+  const st0 = JSON.parse(kv.get("state:tsim-1") || "{}"); st0.heltec_powersaving = false; kv.set("state:tsim-1", JSON.stringify(st0));
+  await ingest({ type: "status", fw: "tsim-updater 1.6.6", msg: "STATUS" });
+  unthrottle(); let h0 = holo;
+  let r = await P("gps-fix"); assert.equal(r.status, 409); assert(/1\.6\.7/.test((await r.json()).error)); assert.equal(holo, h0, "old firmware: no text");
+  // old firmware never receives GPS commands even if queued
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "zz", cmd: "GPSFIX", sys: true, status: "queued" }]));
+  assert(!(await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text()).includes("GPSFIX"));
+  kv.set("cmds:tsim-1", "[]");
+  await ingest({ type: "status", fw: "tsim-updater 1.6.7", msg: "STATUS" });
+  let tel = await TEL(); assert.equal(tel.gps.supported, true); assert.equal(tel.gps.fix, null); assert.equal(tel.gps.progress.state, "idle"); assert.equal(tel.gps.settings.auto, false);
+  unthrottle(); h0 = holo;
+  r = await P("gps-fix"); let j = await r.json(); assert.equal(j.sent, true); assert.equal(holo, h0 + 1); assert.equal(j.queued.cmd, "GPSFIX");
+  unthrottle();
+  r = await P("gps-fix"); assert.equal(r.status, 409); assert((await r.json()).duplicate); assert.equal(holo, h0 + 1, "double press: no second text");
+  tel = await TEL(); assert.equal(tel.gps.progress.state, "running"); assert.equal(tel.gps.progress.step, 0);
+  assert.equal(m.userCommands(JSON.parse(kv.get("cmds:tsim-1"))).length, 0, "GPSFIX hidden from console");
+  const txt = await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+  assert(txt.includes("\tGPSFIX"));
+  tel = await TEL(); assert.equal(tel.gps.progress.step, 1);
+  r = await P("gps-cancel"); j = await r.json(); assert(j.cancelled && /already started/.test(j.note));
+  // result still lands and is stored
+  await ingest({ type: "gps", fw: "tsim-updater 1.6.7", fix: true, lat: 35.1234567, lon: -80.7654321, alt: 200, sats: 8, hdop: 1.1, utc: "2026-10-16T17:00:00Z", secs: 40, src: "CGNSSINFO", trigger: "cmd", msg: "GPS fix" });
+  await ingest({ type: "cmd", cmd_id: j.id || JSON.parse(kv.get("cmds:tsim-1"))[0].id, cmd: "GPSFIX", sys: true, output: "GPS fix 35.123457,-80.765432" });
+  tel = await TEL(); assert.equal(tel.gps.fix.lat, 35.123457); assert.equal(tel.gps.fix.sats, 8);
+  // fresh request -> done once the gps record arrives
+  unthrottle(); r = await P("gps-fix"); j = await r.json(); assert.equal(j.sent, true);
+  // cancel while still queued -> cancelled, never handed out
+  r = await P("gps-cancel"); assert((await r.json()).cancelled); tel = await TEL(); assert.equal(tel.gps.progress.state, "cancelled");
+  assert(!(await (await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } })).text()).includes("GPSFIX"));
+  // retry
+  unthrottle(); r = await P("gps-fix", { retry: true }); j = await r.json(); assert.equal(j.sent, true);
+  await call("/api/dev/tsim-1/commands?sys=1", { headers: { "X-Device-Key": dev.ingest_key } });
+  await new Promise((ok) => setTimeout(ok, 5));
+  await ingest({ type: "gps", fw: "tsim-updater 1.6.7", fix: false, sats: 2, secs: 90, src: "CGNSSINFO", trigger: "cmd", msg: "GPS no fix after 90s (sats seen 2)" });
+  tel = await TEL(); assert.equal(tel.gps.progress.state, "failed"); assert.equal(tel.gps.fix.lat, 35.123457, "last good fix kept");
+  // settings: queued GPSCFG, newest wins, no text
+  h0 = holo;
+  assert.equal((await P("gps-settings", { timeout_s: 5 })).status, 400);
+  assert.equal((await P("gps-settings", { auto: true, timeout_s: 120 })).status, 200);
+  assert.equal((await P("gps-settings", { auto: true, timeout_s: 60 })).status, 200);
+  let cl = JSON.parse(kv.get("cmds:tsim-1")).filter((x) => /^GPSCFG/.test(x.cmd) && x.status === "queued");
+  assert.equal(cl.length, 1); assert.equal(cl[0].cmd, "GPSCFG auto=1 to=60"); assert.equal(holo, h0);
+  tel = await TEL(); assert.equal(tel.gps.settings.auto, true); assert.equal(tel.gps.settings_pending, "queued");
+  // set repeater location: confirm required, queues set lat / set lon (sys, run even with console off)
+  assert.equal((await P("set-location", {})).status, 400);
+  await P("settings", { console_enabled: false });
+  unthrottle(); h0 = holo;
+  r = await P("set-location", { confirm: true }); j = await r.json(); assert.equal(j.sent, true); assert.equal(holo, h0 + 1);
+  assert.deepEqual(j.queued.map((x) => x.cmd), ["set lat 35.123457", "set lon -80.765432"]);
+  unthrottle(); assert.equal((await P("set-location", { confirm: true })).status, 409, "no double send");
+  const out = await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+  assert(out.indexOf("set lat 35.123457") >= 0 && out.indexOf("set lat") < out.indexOf("set lon"), "lat then lon");
+  for (const q of j.queued) await ingest({ type: "cmd", cmd_id: q.id, cmd: q.cmd, output: "  -> OK" });
+  tel = await TEL(); assert.equal(tel.gps.location.state, "done"); assert.equal(tel.gps.location.outputs[0].output, "OK");
+  assert.equal(tel.commands.length, 0, "location commands hidden from console history");
+  // page has the new UI + CSP allows Leaflet/OSM only
+  const pr = await call("/d/tsim-1", { headers: { Cookie: c } }); const html = await pr.text();
+  assert(html.includes('id="gpsbtn"') && html.includes('id="locbtn"') && html.includes('id="gpsmap" class="map sens"') && html.includes("sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="));
+  assert(/img-src https:\/\/tile\.openstreetmap\.org/.test(pr.headers.get("Content-Security-Policy")));
+  console.log("GPS / location tests OK");
+}

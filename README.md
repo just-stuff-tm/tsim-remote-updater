@@ -35,6 +35,7 @@ flowchart LR
 | Heltec WiFi LoRa 32 V3 (915 MHz for US) | Runs the MeshCore repeater firmware | [Amazon](https://link.amazon/B0czhvm4K) |
 | Hologram SIM | Any plan; incoming SMS to the SIM is free | hologram.io |
 | 18650 Li-ion cell, small 5–6 V solar panel, LTE + LoRa antennas, weatherproof box | | |
+| GNSS (GPS) antenna, u.FL (optional) | Only for the location feature. Use an active GNSS patch antenna on the T-SIM's **GPS/GNSS** u.FL connector (not the LTE one), facing the sky | |
 | 100 µF + 10 µF capacitors, 6 jumper wires | | |
 
 *As an Amazon Associate I earn from qualifying purchases.*
@@ -95,6 +96,15 @@ Only the Heltec V3 has been tested on real hardware. The other boards are expect
 - The T-SIM decides by reading the file contents (not the name), and refuses anything that isn't an ESP32 image or a classic-ESP32 image aimed at a different chip. It can't tell an S3 file from a C3 file, so make sure the file is for your board.
 
 **T-SIM side:** the controller must be a **LilyGO T-SIM7670G / T-SIM7672G** (ESP32-S3 + SIM767x). The firmware's modem pins and AT commands are for that board. Other modems would need code changes.
+
+## Location / GPS (T-SIM firmware 1.6.7+)
+
+The SIM7672G modem has a built-in GNSS receiver. It needs a **GNSS antenna on the T-SIM's GPS/GNSS u.FL connector**, ideally with a clear view of the sky. Without one you'll only see "no fix".
+
+- **Get location** (T-SIM tab › Location): texts the T-SIM once (`CMD`). It picks up a `GPSFIX` system command, powers GNSS on (`AT+CGNSSPWR=1`, falling back to `AT+CGPS=1` on older SIMCom firmware), polls `AT+CGNSSINFO` / `AT+CGPSINFO` until it gets a fix or hits the timeout (default 90 s, 30–300 s), then powers GNSS off again and posts the result. The card shows the coordinates (with a Copy button), the fix time, the satellite count, accuracy (HDOP), altitude and a small OpenStreetMap map (Leaflet, no API key). If there's no fix it reports "no fix" with the number of satellites it saw, and keeps the last good fix. The button switches between Get location, Cancel and Retry, and a second press while a request is running sends nothing.
+- **Auto-update location on check-in** (Location settings, off by default): when this is on, every `STATUS` check-in also runs a fix. Each one keeps GNSS on for up to the timeout, so it costs battery. Settings are sent as a `GPSCFG` system command at the next wake, without a text.
+- **Set repeater location** (LoRa radio tab › Settings, optional): after you confirm, it sends the MeshCore CLI commands `set lat <deg>` and `set lon <deg>` with the latest fix to the repeater and shows its replies. It never runs automatically.
+- **Privacy:** coordinates and the map are blurred by default. The eye button shows them, and the dashboard remembers your choice in this browser, the same way as the cellular IP. The location is stored in the Worker's KV for your devices only. The map loads tiles from openstreetmap.org, so OSM sees the map area you view. Once you set it on the repeater, the position goes out in its adverts and anyone on the mesh can see it.
 
 ## Costs and notes
 
@@ -224,6 +234,7 @@ The repeater page shows firmware, last seen (with a **stale** badge after 26 hou
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
 | `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
+| `GPSFIX` / `GPSCFG auto=0\|1 to=<s>` | T-SIM location fix / location settings (≥ 1.6.7). Never texted directly: the dashboard queues them as system commands and wakes the T-SIM with `CMD` (or they ride along with the next `STATUS`) |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 
 Underscores in URLs are sent as `%5F` because SMS (GSM-7) can drop `_`. Use `*-upgrade.bin` images (they keep the repeater's identity). `freshInstall-merged.bin` images wipe its name, keys and settings. Any other text is ignored. The T-SIM never sends texts.

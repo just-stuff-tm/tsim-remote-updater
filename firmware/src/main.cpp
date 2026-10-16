@@ -834,6 +834,8 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
 // CMD wake: pull queued console commands from the Worker, run each on the Heltec CLI, post outputs.
 static bool doTsimUpdate(const char *args);
 static void pwrApplyCfg(const char *args, char *out, size_t cap);
+static void gpsApplyCfg(const char *args, char *out, size_t cap);
+static void gpsReport(const char *trigger, char *out, size_t cap);
 static void doConsoleCommands(bool sys_only = false) {
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
@@ -865,6 +867,15 @@ static void doConsoleCommands(bool sys_only = false) {
       static char po[400]; pwrApplyCfg(cmd + 7, po, sizeof(po));
       static char pe[600]; jsonEsc(pe, sizeof(pe), po); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, pe);
+      ingestSendBig(s_mesh_body);
+      ran++;
+      continue;
+    }
+    if (clean && (strcasecmp(cmd, "GPSFIX") == 0 || strncasecmp(cmd, "GPSCFG ", 7) == 0)) {  // v1.6.7 GNSS (Worker system commands)
+      static char go[300];
+      if (cmd[3] == 'F' || cmd[3] == 'f') { heltecCliEnd(); gpsReport("cmd", go, sizeof(go)); } else gpsApplyCfg(cmd + 7, go, sizeof(go));
+      static char ge[400]; jsonEsc(ge, sizeof(ge), go); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, ge);
       ingestSendBig(s_mesh_body);
       ran++;
       continue;
@@ -1749,6 +1760,110 @@ static size_t pwrJson(char *dst, size_t cap) {  // extra status fields
                   s_lb_off, s_lb_on, (unsigned)s_lb_int_min, s_lb_imm ? "true" : "false");
 }
 
+
+// -------------------- GPS / GNSS (v1.6.7) --------------------
+// SIM7672G built-in GNSS. Needs a GNSS antenna on the modem's GPS/GNSS u.FL connector.
+// On demand (GPSFIX system command) and optionally on each STATUS check-in (GPSCFG auto=1, default off).
+// Powers GNSS on, polls for a fix up to the timeout, reads lat/lon/alt/sats/HDOP, powers GNSS off.
+static bool s_gps_auto = false;
+static uint32_t s_gps_to = 90;          // seconds
+static bool s_gps_done = false;         // a fix attempt already ran this wake
+struct GpsFix { bool fix; double lat, lon; float alt, hdop; int sats; char utc[24]; char src[12]; uint32_t secs; };
+static void gpsLoad() {
+  Preferences p; p.begin("tsimgps", true);
+  s_gps_auto = p.getBool("auto", false); s_gps_to = p.getUInt("to", 90);
+  p.end();
+  if (s_gps_to < 30 || s_gps_to > 300) s_gps_to = 90;
+}
+static void gpsApplyCfg(const char *args, char *out, size_t cap) {
+  Preferences p; p.begin("tsimgps", false);
+  char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+  char *save = nullptr; int n = 0;
+  for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
+    char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
+    if (!strcmp(k, "auto")) { s_gps_auto = atoi(v) != 0; p.putBool("auto", s_gps_auto); n++; }
+    else if (!strcmp(k, "to")) { uint32_t s = (uint32_t)atoi(v); if (s >= 30 && s <= 300) { s_gps_to = s; p.putUInt("to", s); n++; } }
+  }
+  p.end();
+  snprintf(out, cap, "GPSCFG applied %d: auto=%d to=%u", n, (int)s_gps_auto, (unsigned)s_gps_to);
+  logf("%s", out);
+}
+// "ddmm.mmmm" (or "dddmm.mmmm") -> degrees; plain decimal degrees are passed through.
+static double gpsDeg(const char *s, bool lon) {
+  const char *dot = strchr(s, '.');
+  int intd = dot ? (int)(dot - s) : (int)strlen(s);
+  double v = atof(s);
+  if (intd >= (lon ? 5 : 4)) { double d = floor(v / 100.0); return d + (v - d * 100.0) / 60.0; }
+  return v;
+}
+// Parses one +CGNSSINFO / +CGPSINFO payload (text after the colon). Returns true with a fix.
+// SIM7672: mode,GPS-SVs,BEIDOU-SVs,GLONASS-SVs,GALILEO-SVs,lat,N/S,lon,E/W,date,UTC,alt,speed,course,PDOP,HDOP,VDOP
+// CGPSINFO: lat,N/S,lon,E/W,date,UTC,alt,speed,course
+static bool gpsParse(const char *line, bool cgnss, GpsFix &g) {
+  char buf[200]; strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+  char *nl = strpbrk(buf, "\r\n"); if (nl) *nl = 0;
+  const char *tok[24]; int n = 0; char *p = buf;
+  while (*p == ' ') p++;
+  tok[n++] = p;
+  for (; *p && n < 24; p++) if (*p == ',') { *p = 0; tok[n++] = p + 1; }
+  int ns = -1;
+  for (int i = 1; i + 2 < n; i++) if ((!strcmp(tok[i], "N") || !strcmp(tok[i], "S")) && (!strcmp(tok[i + 2], "E") || !strcmp(tok[i + 2], "W"))) { ns = i; break; }
+  if (cgnss) {  // satellites in view/used: sum the constellation counts before lat
+    int s = 0, last = ns > 0 ? ns - 1 : (n < 5 ? n : 5);
+    for (int i = 1; i < last && i < 6; i++) s += atoi(tok[i]);
+    if (s > g.sats) g.sats = s;
+  }
+  if (ns < 1 || !tok[ns - 1][0] || !tok[ns + 1][0]) return false;
+  g.lat = gpsDeg(tok[ns - 1], false) * (tok[ns][0] == 'S' ? -1 : 1);
+  g.lon = gpsDeg(tok[ns + 1], true) * (tok[ns + 2][0] == 'W' ? -1 : 1);
+  if (!(g.lat >= -90 && g.lat <= 90 && g.lon >= -180 && g.lon <= 180) || (g.lat == 0 && g.lon == 0)) return false;
+  const char *d = ns + 3 < n ? tok[ns + 3] : "", *t = ns + 4 < n ? tok[ns + 4] : "";
+  if (strlen(d) >= 6 && strlen(t) >= 6)
+    snprintf(g.utc, sizeof(g.utc), "20%.2s-%.2s-%.2sT%.2s:%.2s:%.2sZ", d + 4, d + 2, d, t, t + 2, t + 4);
+  g.alt = ns + 5 < n ? atof(tok[ns + 5]) : 0;
+  g.hdop = (cgnss && ns + 9 < n) ? atof(tok[ns + 9]) : -1;
+  g.fix = true;
+  return true;
+}
+static const char *gpsLine(const char *tag) { const char *p = strstr(s_at_resp, tag); return p ? p + strlen(tag) : nullptr; }
+static bool gpsAcquire(GpsFix &g) {
+  memset(&g, 0, sizeof(g)); g.hdop = -1;
+  uint32_t t0 = millis();
+  bool cgnss = modemAT("AT+CGNSSPWR=1", 10000);
+  if (cgnss) strcpy(g.src, "CGNSSINFO");
+  else if (modemAT("AT+CGPS=1", 5000)) strcpy(g.src, "CGPSINFO");   // older SIMCom command set
+  else { strcpy(g.src, "none"); return false; }
+  delay(2000);
+  while (millis() - t0 < s_gps_to * 1000UL) {
+    if (modemAT(cgnss ? "AT+CGNSSINFO" : "AT+CGPSINFO", 3000)) {
+      const char *l = gpsLine(cgnss ? "+CGNSSINFO:" : "+CGPSINFO:");
+      if (l && gpsParse(l, cgnss, g)) break;
+    }
+    delay(5000);
+  }
+  g.secs = (millis() - t0) / 1000UL;
+  modemAT(cgnss ? "AT+CGNSSPWR=0" : "AT+CGPS=0", 5000);
+  logf("GPS: %s src=%s sats=%d secs=%u", g.fix ? "fix" : "no fix", g.src, g.sats, (unsigned)g.secs);
+  return g.fix;
+}
+// Runs a fix attempt and posts {"type":"gps",...}. Summary text -> out.
+static void gpsReport(const char *trigger, char *out, size_t cap) {
+  s_gps_done = true;
+  GpsFix g; gpsAcquire(g);
+  if (g.fix) snprintf(out, cap, "GPS fix %.6f,%.6f alt=%.0fm sats=%d hdop=%.1f in %us", g.lat, g.lon, g.alt, g.sats, g.hdop, (unsigned)g.secs);
+  else if (!strcmp(g.src, "none")) snprintf(out, cap, "GPS unavailable: modem did not accept the GNSS power command");
+  else snprintf(out, cap, "GPS no fix after %us (sats seen %d). Check the GNSS antenna and sky view.", (unsigned)g.secs, g.sats);
+  static char body[600];
+  if (g.fix)
+    snprintf(body, sizeof(body), "{\"type\":\"gps\",\"fw\":\"%s\",\"fix\":true,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sats\":%d,\"hdop\":%.1f,"
+             "\"utc\":\"%s\",\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"}",
+             FW_VERSION, g.lat, g.lon, g.alt, g.sats, g.hdop, g.utc, (unsigned)g.secs, g.src, trigger, out);
+  else
+    snprintf(body, sizeof(body), "{\"type\":\"gps\",\"fw\":\"%s\",\"fix\":false,\"sats\":%d,\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"}",
+             FW_VERSION, g.sats, (unsigned)g.secs, g.src, trigger, out);
+  ingestSendBig(body);
+}
+
 // -------------------- STATUS --------------------
 static float readAdcVolts(int pin, float divider) {
   uint32_t mv = 0;
@@ -1788,7 +1903,7 @@ static void doStatusReport(void) {
   snprintf(s_text_body, sizeof(s_text_body),
     "%s | %s\nbat=%.2fV (%d%%) solar=%.2fV\n%s\n%s\n%s\n%s\n%s\nmodem: %.80s\n"
     "uptime=%lus wake=%d heap=%u\nLittleFS free=%u/%u\nlast: %s\n"
-    "APN=%s awake=%lus cmds=REBOOT|UPDATE|TSIMUPDATE|STATUS|CMD|TESTDL",
+    "APN=%s awake=%lus cmds=REBOOT|UPDATE|TSIMUPDATE|STATUS|CMD|TESTDL|GPSFIX",
     FW_VERSION, FW_BUILD_DATE, bat, batPercent(bat), sol,
     csq, cpsi, cops, cereg, ip, cgmr,
     (unsigned long)(millis()/1000UL), (int)s_wake_cause, (unsigned)ESP.getFreeHeap(),
@@ -1896,6 +2011,7 @@ static bool handleCommand(const char *from, const char *body) {
   if (strcasecmp(s_cmdbuf, "STATUS") == 0) {
     doStatusReport();
     doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
+    if (s_gps_auto && !s_gps_done) { static char go[300]; gpsReport("auto", go, sizeof(go)); }  // v1.6.7 optional location on check-in
     meshSnapshot();
     return true;
   }
@@ -2200,6 +2316,7 @@ void setup() {
   analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
   analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
   pwrLoad();
+  gpsLoad();
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
   if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_ext0_failed && !otaPendingVerify()) {
