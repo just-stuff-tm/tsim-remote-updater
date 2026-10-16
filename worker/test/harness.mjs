@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -758,15 +758,15 @@ console.log("tag/asset version ok");
   assert.equal((await P("rpt-read", {})).status, 403);
   await P("settings", { console_enabled: true });
   unthrottle(); h0 = holo;
-  j = await (await P("rpt-read", {})).json(); assert.equal(j.queued, RPT_READ_KEYS.length); assert(j.queued > CMDS_PER_WAKE); assert.equal(holo, h0 + 1, "one text");
-  assert.equal(j.wakes_needed, Math.ceil(RPT_READ_KEYS.length / CMDS_PER_WAKE));
+  j = await (await P("rpt-read", {})).json(); assert.equal(j.queued, rptReadAllKeys({}).length); assert(j.queued > CMDS_PER_WAKE); assert.equal(holo, h0 + 1, "one text");
+  assert.equal(j.wakes_needed, Math.ceil(rptReadAllKeys({}).length / CMDS_PER_WAKE));
   assert.equal((await (await P("rpt-read", {})).json()).queued, 0, "no duplicates");
   let batch = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
   assert.equal(batch.length, CMDS_PER_WAKE); assert.equal(batch[0][1], "get name");
-  const reply = { "get name": "  -> > Hilltop", "get owner.info": "  -> > Just Stuff", "get role": "  -> > repeater", "get public.key": "  -> > ABCD", "get lat": "  -> > 40.89", "get lon": "  -> > -77.47", "get radio": "  -> > 910.525,62.5,7,5", "get tx": "  -> > 22", "get radio.rxgain": "  -> > on", "get radio.fem.rxgain": "  -> Error: unsupported" };
+  const reply = { "get name": "  -> > Hilltop", "get owner.info": "  -> > Just Stuff", "get role": "  -> > repeater", "get public.key": "  -> Error: unsupported", "ver": "  -> v1.18.0-abc (Build: 1-Oct-2026)", "board": "  -> Heltec V3", "get lat": "  -> > 40.89", "get lon": "  -> > -77.47", "get radio": "  -> > 910.525,62.5,7,5", "get tx": "  -> > 22", "get radio.rxgain": "  -> > on", "get radio.fem.rxgain": "  -> Error: unsupported" };
   for (const [bid, bc] of batch) await ingest({ type: "cmd", cmd_id: bid, cmd: bc, output: reply[bc] || "  -> > 1" });
   tl = await TEL();
-  assert.equal(tl.rpt.vals.name.value, "Hilltop"); assert.equal(tl.rpt.vals.radio.value, "910.525,62.5,7,5"); assert.equal(tl.rpt.vals["radio.fem.rxgain"].unsupported, true);
+  assert.equal(tl.rpt.vals.name.value, "Hilltop"); assert.equal(tl.rpt.vals.radio.value, "910.525,62.5,7,5"); assert.equal(tl.rpt.vals["public.key"].unsupported, true); assert.equal(tl.rpt.vals.board.value, "Heltec V3");
   assert(tl.rpt.queued.repeat === "queued"); assert(!tl.commands.some((x) => x.cmd === "get name"), "settings commands hidden from console history");
   // save: risky needs confirm, typed password, validation
   assert.equal((await P("rpt-save", { changes: { radio: "910.525,250,10,5" } })).status, 409);
@@ -788,13 +788,40 @@ console.log("tag/asset version ok");
   for (const m of ph2.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
   await P("commands", { cancel: true });
   console.log("repeater settings tests OK");
+  // ---------- regions / ACL / tools ----------
+  assert.equal(parseSettingReply("gps", "  -> on, active, fix, 8 sats").value, "on");
+  assert.equal(parseSettingReply("gps advert", "  -> > prefs").value, "prefs"); assert.equal(parseSettingReply("gps advert share", "OK").key, "gps.advert");
+  assert.equal(buildSettingCmd("gps.advert", "share"), "gps advert share"); assert.equal(buildSettingCmd("bridge.source", "logRx"), "set bridge.source logRx");
+  assert(!rptReadAllKeys({}).includes("bridge.enabled") && rptReadAllKeys({}).includes("bridge.type") && !rptReadAllKeys({}).includes("pwrmgt.bootmv"));
+  assert(rptReadAllKeys({ "bridge.type": { value: "rs232" } }).includes("bridge.enabled")); assert(rptReadAllKeys({}).length <= 40);
+  assert.deepEqual(buildRptOp({ op: "region.put", name: "#PA", parent: "#USA", flood: true }).map((x) => x.cmd).slice(0, 3), ["region put #PA #USA", "region allowf #PA", "region save"]);
+  assert.equal(buildRptOp({ op: "region.default", name: "" })[0].cmd, "region default <null>");
+  assert.throws(() => buildRptOp({ op: "region.put", name: "bad name" })); assert.throws(() => buildRptOp({ op: "erase" })); assert.throws(() => buildRptOp({ op: "acl.set", pubkey: "zz", perm: 1 }));
+  assert.equal(buildRptOp({ op: "acl.set", pubkey: "abcd1234", perm: 3 })[0].risk, true); assert.equal(buildRptOp({ op: "tempradio", f: 910.525, bw: 250, sf: 10, cr: 5, mins: 10 })[0].cmd, "tempradio 910.525,250,10,5,10");
+  await P("commands", { cancel: true }); unthrottle();
+  assert.equal((await P("rpt-ops", { ops: [{ op: "acl.set", pubkey: "abcd1234", perm: 3 }] })).status, 409, "admin perm needs confirm");
+  assert.equal((await P("rpt-ops", { ops: [{ op: "poweroff" }] })).status, 400);
+  r = await P("rpt-ops", { ops: [{ op: "region.put", name: "#PA", flood: false }, { op: "clock.sync" }] }); j = await r.json(); assert.equal(r.status, 200);
+  let fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.deepEqual(fl.map((x) => x[1]).slice(0, 3), ["region put #PA", "region denyf #PA", "region save"]);
+  const tl1 = fl.find((x) => x[1].startsWith("time ")); assert(/^time \d{10}$/.test(tl1[1]) && Math.abs(+tl1[1].slice(5) - Date.now() / 1000) < 10, "time filled at fetch");
+  for (const [bid, bc] of fl) await ingest({ type: "cmd", cmd_id: bid, cmd: bc, output: bc === "region" ? "  -> *  F\n  #USA F\n    #PA" : bc === "region home" ? "  -> > #PA" : "  -> OK" });
+  tl = await TEL(); assert(tl.rpt.lists.regions.raw.includes("#PA")); assert.equal(tl.rpt.lists.home.raw, "#PA"); assert(tl.rpt.lists.ops.some((o) => o.cmd === "time (now)"));
+  assert.equal(tl.rpt.ops_pending, 0); assert(!tl.commands.some((x) => x.cmd.startsWith("region")), "tool commands hidden from console");
+  unthrottle(); r = await P("rpt-ops", { ops: [{ op: "read", what: "acl" }] }); assert.equal(r.status, 200);
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  await ingest({ type: "cmd", cmd_id: fl[0][0], cmd: fl[0][1], output: "  -> Error: unsupported" });
+  tl = await TEL(); assert(tl.rpt.lists.acl.error);
+  const ph3 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(ph3.includes('id="rgadd"') && ph3.includes('id="acladd"') && ph3.includes('id="tmpr"')); for (const m of ph3.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  console.log("regions / ACL / tools tests OK");
   // 1.6.9: whole Read all batch in one wake
   assert.equal(cmdsPerWake("tsim-updater 1.6.8"), 10); assert.equal(cmdsPerWake("tsim-updater 1.6.9"), 40); assert.equal(cmdsPerWake(null), 10);
   await ingest({ type: "status", fw: "tsim-updater 1.6.9" });
   tl = await TEL(); assert.equal(tl.rpt.per_wake, 40);
   unthrottle(); j = await (await P("rpt-read", {})).json(); assert.equal(j.wakes_needed, 1);
   const big = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n");
-  assert.equal(big.length, RPT_READ_KEYS.length, "all reads in one fetch"); assert(big.join("\n").length < 6000);
+  assert.equal(big.length, rptReadAllKeys(JSON.parse(kv.get("rptcfg:tsim-1"))).length, "all reads in one fetch"); assert(big.join("\n").length < 6000);
   // byte cap: long commands never overflow the T-SIM buffer
   const lst = JSON.parse(kv.get("cmds:tsim-1")); for (let i = 0; i < 40; i++) lst.unshift({ id: "x" + i, cmd: "set owner.info " + "y".repeat(150), status: "queued", queued_at: new Date().toISOString(), cfg: true });
   kv.set("cmds:tsim-1", JSON.stringify(lst));

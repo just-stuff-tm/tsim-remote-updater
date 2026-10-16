@@ -535,7 +535,13 @@ async function handleIngest(request, env, id) {
       a.error = adc.error || null; a.at = entry.received_at;
       await putJson(env, `adc:${id}`, a);
     }
-    const rs = c && c.cfg ? parseSettingReply(c.cmd, t.error && !out ? "" : out) : null;
+    if (c && c.op) {
+      const L = (await kvJson(env, `rptlist:${id}`)) || {}, txt = cleanCli(out);
+      if (c.list) L[c.list] = { raw: txt.slice(0, 1500), at: entry.received_at, error: t.error ? String(t.error).slice(0, 120) : (/^(error|err\b|\?\?)|unsupported|unknown command/i.test(txt) ? txt.slice(0, 120) : null) };
+      else { L.ops = [{ cmd: c.cmd.replace("{{now}}", "(now)"), reply: (txt || t.error || "no reply").slice(0, 200), at: entry.received_at, error: !!t.error || /^(error|err\b|\?\?)/i.test(txt) }, ...(L.ops || [])].slice(0, 10); }
+      await putJson(env, `rptlist:${id}`, L);
+    }
+    const rs = c && c.cfg && !c.op ? parseSettingReply(c.cmd, t.error && !out ? "" : out) : null;
     if (rs) {
       const cv = (await kvJson(env, `rptcfg:${id}`)) || {}, prevV = cv[rs.key] || {};
       if (rs.op === "get") cv[rs.key] = rs.value != null ? { value: rs.value, at: entry.received_at } : { ...prevV, unsupported: !!rs.unsupported, error: rs.error || null, at: entry.received_at, value: rs.unsupported ? null : prevV.value };
@@ -625,7 +631,7 @@ export const RPT_SETTINGS = [
   { cat: "Identity", items: [
     { k: "name", label: "Node name", type: "text", max: 31, help: "Shown in adverts. Up to 23 bytes when location is shared, 31 otherwise." },
     { k: "owner.info", label: "Owner info", type: "text", max: 90, help: "Free text; | becomes a new line. Firmware 1.12+." },
-    { k: "role", label: "Role", ro: true }, { k: "public.key", label: "Public key", ro: true, mono: true } ] },
+    { k: "role", label: "Role", ro: true }, { k: "board", label: "Hardware", ro: true, get: "board" }, { k: "ver", label: "Firmware", ro: true, get: "ver" }, { k: "public.key", label: "Public key", ro: true, mono: true } ] },
   { cat: "Location", note: "Coordinates in adverts are public. The Repeater location card can copy the T-SIM's GPS position here.", items: [
     { k: "lat", label: "Latitude", type: "num", min: -90, max: 90, step: 0.000001, unit: "°" },
     { k: "lon", label: "Longitude", type: "num", min: -180, max: 180, step: 0.000001, unit: "°" } ] },
@@ -657,21 +663,38 @@ export const RPT_SETTINGS = [
   { cat: "Power & battery", items: [
     { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, help: "On = the repeater sleeps between transmissions and stops answering this dashboard's console." },
     { k: "adc.multiplier", label: "Battery multiplier", ro: true, help: "Calibrate it from a multimeter reading in Repeater battery calibration." } ] },
+  { cat: "GPS", note: "Only on repeaters built with GPS support; others answer \"not supported\".", items: [
+    { k: "gps", label: "GPS receiver", type: "sel", opts: ONOFF, get: "gps", set: "gps ", first: true },
+    { k: "gps.advert", label: "Location in adverts", type: "sel", opts: [["none", "Don't share"], ["share", "Live GPS position"], ["prefs", "Saved lat/lon"]], get: "gps advert", set: "gps advert " } ] },
+  { cat: "Bridge", dep: "bridge.type", note: "Only on repeaters built with a bridge (RS-232 or ESP-NOW). Hidden when the repeater doesn't report one.", items: [
+    { k: "bridge.type", label: "Bridge type", ro: true },
+    { k: "bridge.enabled", label: "Bridge enabled", type: "sel", opts: ONOFF, dep: "bridge.type" },
+    { k: "bridge.delay", label: "Bridge delay", type: "num", min: 0, max: 10000, step: 10, unit: "ms", dep: "bridge.type" },
+    { k: "bridge.source", label: "Bridge packets", type: "sel", opts: [["logTx", "Transmitted (logTx)"], ["logRx", "Received (logRx)"]], dep: "bridge.type" },
+    { k: "bridge.baud", label: "RS-232 speed", type: "sel", opts: ["9600", "19200", "38400", "57600", "115200"].map((x) => [x, x + " baud"]), dep: "bridge.type" },
+    { k: "bridge.channel", label: "ESP-NOW channel", type: "num", min: 1, max: 14, step: 1, dep: "bridge.type" },
+    { k: "bridge.secret", label: "ESP-NOW secret", type: "secret", max: 15, risk: true, dep: "bridge.type" } ] },
+  { cat: "Diagnostics", noAll: true, note: "Read-only. Power-management values exist only on nRF52 boards; others answer \"not supported\".", items: [
+    { k: "pwrmgt.support", label: "Power management", ro: true }, { k: "pwrmgt.source", label: "Power source", ro: true },
+    { k: "pwrmgt.bootreason", label: "Boot / shutdown reason", ro: true }, { k: "pwrmgt.bootmv", label: "Boot voltage", ro: true },
+    { k: "bootloader.ver", label: "Bootloader", ro: true }, { k: "eth.status", label: "Ethernet", ro: true, get: "eth.status" } ] },
   { cat: "Passwords", risk: true, note: "Anyone who knows these can log in to the repeater over the mesh. Passwords are sent over SMS/LTE to the T-SIM and stored in this dashboard's command history.", items: [
     { k: "guest.password", label: "Guest password", type: "secret", max: 60, risk: true },
     { k: "password", label: "Admin password (change only)", type: "secret", max: 60, wo: true, risk: true, typed: "CHANGE", help: "Can't be read back. Default on new nodes: password." } ] },
 ];
-export const RPT_INDEX = Object.fromEntries(RPT_SETTINGS.flatMap((c) => c.items.map((i) => [i.k, { ...i, cat: c.cat }])));
-export const rptGetCmd = (k) => (k === "powersaving" ? "powersaving" : "get " + k);
+export const RPT_INDEX = Object.fromEntries(RPT_SETTINGS.flatMap((c) => c.items.map((i) => [i.k, { ...i, cat: c.cat, noAll: !!c.noAll }])));
+export const rptGetCmd = (k) => (RPT_INDEX[k] && RPT_INDEX[k].get) || (k === "powersaving" ? "powersaving" : "get " + k);
+const rptSetPrefix = (i) => i.set || (i.k === "powersaving" ? "powersaving " : i.k === "password" ? "password " : "set " + i.k + " ");
 export const RPT_READ_KEYS = Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => i.k);
+// "Read all": everything except diagnostics, and bridge settings only once the repeater reported a bridge type.
+export const rptReadAllKeys = (vals = {}) => Object.values(RPT_INDEX).filter((i) => !i.wo && !i.noAll && (!i.dep || (vals[i.dep] && vals[i.dep].value != null))).map((i) => i.k);
+const RPT_GETMAP = Object.fromEntries(Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => [rptGetCmd(i.k).toLowerCase(), i.k]));
+const RPT_SETS = Object.values(RPT_INDEX).filter((i) => !i.ro).map((i) => [rptSetPrefix(i).toLowerCase(), i.k]).sort((a, b) => b[0].length - a[0].length);
 // Parse a reply to a settings get/set command: { key, op, value?, unsupported?, error? } or null.
 export function parseSettingReply(cmd, out) {
-  const c = String(cmd || "").trim(); let m, key, op;
-  if (/^powersaving$/i.test(c)) { key = "powersaving"; op = "get"; }
-  else if ((m = c.match(/^powersaving (on|off)$/i))) { key = "powersaving"; op = "set"; }
-  else if ((m = c.match(/^password\s/i))) { key = "password"; op = "set"; }
-  else if ((m = c.match(/^(get|set) (\S+)/i)) && RPT_INDEX[m[2].toLowerCase()]) { key = m[2].toLowerCase(); op = m[1].toLowerCase(); }
-  else return null;
+  const c = String(cmd || "").trim(), lc = c.toLowerCase(); let key, op;
+  if (RPT_GETMAP[lc]) { key = RPT_GETMAP[lc]; op = "get"; }
+  else { const hit = RPT_SETS.find(([pre]) => lc.startsWith(pre)); if (!hit) return null; key = hit[1]; op = "set"; }
   const r = cleanCli(out);
   if (!r) return { key, op, error: "No reply from the repeater" };
   if (/unsupported|unknown (config|command)|^\?\?|not supported/i.test(r)) return { key, op, unsupported: true };
@@ -679,6 +702,7 @@ export function parseSettingReply(cmd, out) {
   if (op === "set") return { key, op, ok: true, msg: key === "password" ? "Admin password changed" : r.slice(0, 120) };
   let v = r.replace(/^>\s*/, "").trim();
   if (key === "powersaving") { const p = v.match(/\b(on|off)\b/i); v = p ? p[1].toLowerCase() : v; }
+  if (RPT_INDEX[key].first) v = v.split(/[\s,]+/)[0].toLowerCase();
   return { key, op, value: v.slice(0, 200) };
 }
 const fmtNum = (n) => String(+(+n).toFixed(6));
@@ -703,14 +727,43 @@ export function buildSettingCmd(k, v) {
   }
   if (s.type === "sel") {
     const x = String(v); if (!s.opts.some((o) => o[0] === x)) throw new Error(`Pick a value for ${label}`);
-    return k === "powersaving" ? `powersaving ${x}` : `set ${k} ${x}`;
+    return rptSetPrefix(s) + x;
   }
   const t = String(v ?? "");
   if (!/^[\x20-\x7e]*$/.test(t)) throw new Error(`${label}: use plain letters, numbers and symbols (no emoji or accents)`);
   if (t.length > s.max) throw new Error(`${label} is too long (max ${s.max})`);
   if (k === "password") { if (t.length < 4 || /\s/.test(t)) throw new Error("Admin password: at least 4 characters, no spaces"); return `password ${t}`; }
   if (k === "name" && !t.trim()) throw new Error("Node name can't be empty");
-  return `set ${k} ${t}`.trimEnd();
+  if (s.type === "secret" && !t) throw new Error(`${label} can't be empty`);
+  return (rptSetPrefix(s) + t).trimEnd();
+}
+// Lists and one-off operations (regions, ACL, sensors, logging, clock, maintenance). Returns [{cmd, list?, risk?}].
+const RGN = /^(\*|[#A-Za-z0-9_.\-]{1,30})$/, HEX = /^[0-9A-Fa-f]{2,64}$/;
+export const RPT_LIST_READS = { regions: [["region", "regions"], ["region home", "home"], ["region default", "default"]], acl: [["get acl", "acl"]], sensors: [["sensor list", "sensors"]], log: [["log", "log"]] };
+export function buildRptOp(o) {
+  const op = String(o && o.op || ""), need = (re, v, what) => { v = String(v ?? "").trim(); if (!re.test(v)) throw new Error(`Invalid ${what}`); return v; };
+  const rg = (v) => need(RGN, v, "region name (letters, numbers, # . _ - ; max 30)");
+  const refresh = [["region", "regions"], ["region home", "home"], ["region default", "default"]].map(([cmd, list]) => ({ cmd, list }));
+  switch (op) {
+    case "read": { const r = RPT_LIST_READS[o.what]; if (!r) throw new Error("Unknown list"); return r.map(([cmd, list]) => ({ cmd, list })); }
+    case "region.put": { const n = rg(o.name), par = o.parent ? rg(o.parent) : ""; return [{ cmd: `region put ${n}${par ? " " + par : ""}` }, { cmd: `region ${o.flood === false ? "denyf" : "allowf"} ${n}` }, { cmd: "region save" }, ...refresh]; }
+    case "region.remove": return [{ cmd: `region remove ${rg(o.name)}`, risk: true }, { cmd: "region save" }, ...refresh];
+    case "region.flood": return [{ cmd: `region ${o.allow ? "allowf" : "denyf"} ${rg(o.name)}`, risk: o.name === "*" }, { cmd: "region save" }, ...refresh];
+    case "region.home": return [{ cmd: `region home ${rg(o.name)}` }, { cmd: "region save" }, ...refresh];
+    case "region.default": return [{ cmd: `region default ${o.name ? rg(o.name) : "<null>"}` }, { cmd: "region save" }, ...refresh];
+    case "acl.set": { const pk = need(HEX, o.pubkey, "public key (hex)"), pm = Number(o.perm); if (![0, 1, 2, 3].includes(pm)) throw new Error("Pick a permission"); return [{ cmd: `setperm ${pk} ${pm}`, risk: pm === 3 }, { cmd: "get acl", list: "acl" }]; }
+    case "acl.remove": return [{ cmd: `setperm ${need(HEX, o.pubkey, "public key (hex)")}`, risk: true }, { cmd: "get acl", list: "acl" }];
+    case "sensor.set": { const k = need(/^[A-Za-z0-9_.]{1,32}$/, o.key, "sensor setting name"), v = need(/^[\x21-\x7e][\x20-\x7e]{0,59}$/, o.value, "value"); return [{ cmd: `sensor set ${k} ${v}` }, { cmd: "sensor list", list: "sensors" }]; }
+    case "log.start": return [{ cmd: "log start" }]; case "log.stop": return [{ cmd: "log stop" }];
+    case "log.erase": return [{ cmd: "log erase", risk: true }];
+    case "clock.sync": return [{ cmd: "time {{now}}" }, { cmd: "clock" }];
+    case "gps.sync": return [{ cmd: "gps sync" }]; case "gps.setloc": return [{ cmd: "gps setloc" }];
+    case "advert": return [{ cmd: "advert" }]; case "advert.zerohop": return [{ cmd: "advert.zerohop" }];
+    case "discover.neighbors": return [{ cmd: "discover.neighbors" }]; case "clear.stats": return [{ cmd: "clear stats", risk: true }];
+    case "neighbor.remove": return [{ cmd: `neighbor.remove ${need(HEX, o.prefix, "node ID prefix (hex)")}`, risk: true }];
+    case "tempradio": { const r = buildSettingCmd("radio", [o.f, o.bw, o.sf, o.cr].join(",")).slice(10), m = Number(o.mins); if (!(Number.isInteger(m) && m >= 1 && m <= 1440)) throw new Error("Minutes must be 1–1440"); return [{ cmd: `tempradio ${r},${m}`, risk: true }]; }
+    default: throw new Error("Unknown action");
+  }
 }
 export const RPT_ACTIONS = { advert: "Send a flood advert", "advert.zerohop": "Send a zero-hop advert" };
 // Firmware runs at most this many queued commands per wake (CMD_MAX_RUN in firmware/src/main.cpp).
@@ -891,7 +944,8 @@ async function handleDeviceCommands(request, env, id) {
   pending.length = 0; pending.push(...fits);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
-  return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
+  const nowS = Math.floor(Date.now() / 1000) + 2;
+  return new Response(pending.map((c) => `${c.id}\t${c.cmd.replace("{{now}}", String(nowS))}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
 }
 
 // ---------- admin ----------
@@ -1089,13 +1143,14 @@ async function deviceApi(request, env, dev, action) {
     const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const [gps, gcfg, greq, lreq, nicks, adcSt] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`), kvJson(env, `adc:${id}`)]);
-    const rptq = {}; for (const c of cmds || []) if (c.cfg && (c.status === "queued" || c.status === "sent")) { const ps = parseSettingReply(c.cmd, "x"); if (ps && !rptq[ps.key]) rptq[ps.key] = c.status; }
-    const rptVals = (await kvJson(env, `rptcfg:${id}`)) || {};
+    const rptq = {}; for (const c of cmds || []) if (c.cfg && !c.op && (c.status === "queued" || c.status === "sent")) { const ps = parseSettingReply(c.cmd, "x"); if (ps && !rptq[ps.key]) rptq[ps.key] = c.status; }
+    const rptVals = (await kvJson(env, `rptcfg:${id}`)) || {}, rptLists = (await kvJson(env, `rptlist:${id}`)) || {};
+    const rptOpsQ = (cmds || []).filter((c) => c.op && (c.status === "queued" || c.status === "sent")).length;
     const adcq = (cmds || []).filter((c) => /^(get|set) adc\.multiplier\b/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ rpt: { vals: rptVals, queued: rptq, per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1201,7 +1256,7 @@ async function deviceApi(request, env, dev, action) {
     if (b.wake === true) { const [o, c] = await manualSend(env, dev, "CMD", "CMD (console)"); wake = { ...o, status: c }; }
     return json({ queued: entry, wake });
   }
-  if (action === "rpt-read" || action === "rpt-save" || action === "rpt-action") {
+  if (action === "rpt-read" || action === "rpt-save" || action === "rpt-action" || action === "rpt-ops") {
     const settings = await getSettings(env, id);
     if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; repeater settings use it." }, 403);
     if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE + ". Turn power saving off first.", powersaving: true }, 409);
@@ -1210,7 +1265,7 @@ async function deviceApi(request, env, dev, action) {
     const queuedCmds = new Set(list.filter((c) => c.status === "queued").map((c) => c.cmd));
     let add = [];
     if (action === "rpt-read") {
-      const keys = Array.isArray(b.keys) && b.keys.length ? b.keys.map(String) : RPT_READ_KEYS;
+      const keys = Array.isArray(b.keys) && b.keys.length ? b.keys.map(String) : rptReadAllKeys((await kvJson(env, `rptcfg:${id}`)) || {});
       for (const k of keys) { if (!RPT_READ_KEYS.includes(k)) return json({ error: `Unknown setting "${k}"` }, 400); const cmd = rptGetCmd(k); if (!queuedCmds.has(cmd)) add.push({ cmd }); }
       if (!add.length) return json({ queued: 0, note: "already queued" });
     } else if (action === "rpt-save") {
@@ -1229,14 +1284,19 @@ async function deviceApi(request, env, dev, action) {
       if (errs.length) return json({ error: errs.join(". ") }, 400);
       add.sort((x, y) => (/^powersaving on/.test(x.cmd) ? 1 : 0) - (/^powersaving on/.test(y.cmd) ? 1 : 0));  // power saving last, so the rest still runs
     } else {
-      if (!RPT_ACTIONS[b.act]) return json({ error: "Unknown action" }, 400);
-      add = [{ cmd: b.act }];
+      const ops = action === "rpt-action" ? [{ op: b.act }] : Array.isArray(b.ops) ? b.ops.slice(0, 10) : [];
+      if (!ops.length) return json({ error: "Nothing to do" }, 400);
+      try { for (const o of ops) add.push(...buildRptOp(o)); } catch (e) { return json({ error: e.message }, 400); }
+      if (add.some((a) => a.risk) && b.risk_ok !== true) return json({ error: "This change needs confirmation", risky: true }, 409);
+      if (add.some((a) => a.cmd.length > CMD_MAX_LEN)) return json({ error: "Command too long" }, 400);
+      const seen = new Set(); add = add.filter((a) => (a.list ? (seen.has(a.cmd) ? false : seen.add(a.cmd)) : true));
+      add = add.map((a) => ({ ...a, op: true }));
     }
     if (list.filter((c) => c.status === "queued").length + add.length > CFG_MAX_QUEUE) return json({ error: `Too many queued commands (max ${CFG_MAX_QUEUE}). Wait for the current ones or cancel them in Repeater console.` }, 429);
     const now = new Date().toISOString();
-    for (const a of add) list.unshift({ id: randomHex(4), cmd: a.cmd, status: "queued", queued_at: now, cfg: action !== "rpt-action", ...(a.val !== undefined ? { val: a.val } : {}) });
+    for (const a of add) list.unshift({ id: randomHex(4), cmd: a.cmd, status: "queued", queued_at: now, cfg: true, ...(a.op ? { op: true } : {}), ...(a.list ? { list: a.list } : {}), ...(a.val !== undefined ? { val: a.val } : {}) });
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
-    await logActivity(env, id, { type: "action", msg: action === "rpt-read" ? `Repeater settings: reading ${add.length} value(s)` : action === "rpt-save" ? `Repeater settings: ${add.map((a) => a.cmd.startsWith("password") || a.cmd.includes("guest.password") ? a.cmd.split(" ").slice(0, 2).join(" ") + " ••••" : a.cmd).join("; ").slice(0, 200)}` : `Repeater: ${RPT_ACTIONS[b.act]}` });
+    await logActivity(env, id, { type: "action", msg: action === "rpt-read" ? `Repeater settings: reading ${add.length} value(s)` : action === "rpt-save" ? `Repeater settings: ${add.map((a) => a.cmd.startsWith("password") || a.cmd.includes("guest.password") ? a.cmd.split(" ").slice(0, 2).join(" ") + " ••••" : a.cmd).join("; ").slice(0, 200)}` : `Repeater: ${add.map((a) => a.cmd.replace("{{now}}", "(now)")).join("; ").slice(0, 200)}` });
     const [o, c] = await manualSend(env, dev, "CMD", "CMD (repeater settings)");
     return json({ queued: add.length, wakes_needed: Math.ceil((list.filter((x) => x.status === "queued").length) / cmdsPerWake(((await kvJson(env, `telem:${id}:latest`)) || {}).fw)), wake: { ...o, status: c } });
   }
@@ -1553,7 +1613,7 @@ details.card>summary::after{content:"▸";color:var(--mut)}details[open].card>su
 .sens{filter:blur(5px);user-select:none;transition:filter .15s}.showsens .sens{filter:none;user-select:auto}.eye{border:0;background:none;padding:0 2px;cursor:pointer;font-size:13px;width:auto;min-width:0}
 .term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:10px 12px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}.term .pr{color:#3fb950}.term .ts{color:#8b949e;font-size:11px}.term .to{color:#e6edf3;margin:0 0 6px 14px}.term .te{color:#ff7b72;margin:0 0 6px 14px}
 .term-in{background:#0d1117;border-radius:8px;padding:4px 8px;align-items:center}.term-in .pr{color:#3fb950;font-family:ui-monospace,monospace}.term-in input{background:transparent;color:#e6edf3;border:0;flex:1}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.rscat{margin-top:10px}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
+.rscat{margin-top:10px}.nowrap{white-space:nowrap}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
 .psnote{background:#d1242f1a;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px;font-size:13px}.dim{opacity:.45}
 .tog{display:flex;gap:8px;align-items:center;margin:8px 0;color:var(--fg);font-size:15px}.tog input{width:auto;margin:0}
 pre.o{margin:0;max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px}code{font-size:12px}
@@ -1689,7 +1749,32 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <button type="button" class="g" data-rsact="advert">Send flood advert</button><button type="button" class="g" data-rsact="advert.zerohop">Send zero-hop advert</button></div>
 <div id="rsq" class="small"></div><span id="rsmsg" class="msg"></span>
 <div id="rsgrid"></div>
-<p class="small mut">Battery multiplier: use <a href="#" onclick="document.getElementById('adcbox').open=true;document.getElementById('adcbox').scrollIntoView();return false">Repeater battery calibration</a>. Not shown here on purpose: factory reset (erase), private key, OTA, regions and ACL (use the console).</p>
+<div id="rtools">
+<details class="card rscat"><summary><b>Regions &amp; scopes</b> <small id="rgst"></small></summary><div class="in">
+<p class="small mut">Regions decide which scoped floods this repeater forwards. Changes are saved on the repeater (<code>region save</code>) automatically. Hop limit for unscoped floods: Repeating &amp; routing › Max hops, unscoped floods.</p>
+<button type="button" class="g sm" data-rd="regions">Read regions</button> <button type="button" class="g sm" data-t="rgclear">Clear default scope</button>
+<div id="rglist"></div>
+<form id="rgadd" class="row small"><input name="n" placeholder="#Region" maxlength="30" style="flex:1"><select name="p" id="rgparent"></select><label class="tog"><input type="checkbox" name="fl" checked> allow flooding</label><button type="submit" class="g sm">Add region</button></form>
+<details class="small"><summary>Repeater's reply</summary><pre class="o" id="rgraw"></pre></details></div></details>
+<details class="card rscat risky"><summary><b>Access list (ACL)</b> <span class="badge warnb">careful</span> <small id="aclst"></small></summary><div class="in">
+<p class="small warn">Permissions for companions that log in to this repeater. Admin can change everything, including passwords and radio.</p>
+<button type="button" class="g sm" data-rd="acl">Read access list</button><div id="acllist"></div>
+<form id="acladd" class="row small"><input name="pk" class="mono" placeholder="companion public key (hex)" maxlength="64" style="flex:1"><select name="pm"><option value="0">Guest</option><option value="1">Read-only</option><option value="2">Read-write</option><option value="3">Admin</option></select><button type="submit" class="g sm">Add / update</button></form>
+<details class="small"><summary>Repeater's reply</summary><pre class="o" id="aclraw"></pre></details></div></details>
+<details class="card rscat"><summary><b>Sensors</b> <small id="snst"></small></summary><div class="in">
+<p class="small mut">Only on repeaters built with sensor support.</p><button type="button" class="g sm" data-rd="sensors">Read sensors</button><div id="snlist"></div></div></details>
+<details class="card rscat"><summary><b>Clock, GPS &amp; logging</b> <small id="logst"></small></summary><div class="in">
+<div class="acts" style="margin-top:0"><button type="button" class="g sm" data-t="clocksync">Set clock to now</button><button type="button" class="g sm" data-t="gpssync">Sync clock from GPS</button><button type="button" class="g sm" data-t="gpssetloc">Set location from GPS</button></div>
+<p class="small mut">Receive log (stored on the repeater):</p><div class="acts" style="margin-top:0"><button type="button" class="g sm" data-t="logstart">Start log</button><button type="button" class="g sm" data-t="logstop">Stop log</button><button type="button" class="g sm" data-rd="log">Show log</button><button type="button" class="g sm" data-t="logerase">Erase log</button></div>
+<pre class="o" id="lograw"></pre></div></details>
+<details class="card rscat risky"><summary><b>Maintenance</b></summary><div class="in">
+<div class="acts" style="margin-top:0"><button type="button" class="g sm" data-t="disc">Discover neighbors</button><button type="button" class="g sm" data-t="clrstats">Clear stats</button></div>
+<form id="nbrm" class="row small"><input name="p" class="mono" placeholder="neighbor ID prefix (hex)" maxlength="64" style="flex:1"><button type="submit" class="g sm">Remove neighbor</button></form>
+<p class="small warn">Temporary radio settings (not saved; the repeater leaves your mesh until the time runs out or it reboots):</p>
+<form id="tmpr" class="rsradio small"><label>MHz<input name="f" type="number" step="0.001" min="300" max="2500" required></label><label>kHz<input name="bw" type="number" step="0.1" min="7.8" max="500" required></label><label>SF<input name="sf" type="number" min="5" max="12" required></label><label>CR<input name="cr" type="number" min="5" max="8" required></label><label>Minutes<input name="m" type="number" min="1" max="1440" value="10" required></label><button type="submit" class="w sm">Apply temporarily</button></form>
+<p class="small mut">Console-only on purpose: factory reset (erase), OTA, private key, power off.</p></div></details>
+<div id="opsres" class="small"></div><span id="rtmsg" class="msg"></span></div>
+<p class="small mut">Battery multiplier: use <a href="#" onclick="document.getElementById('adcbox').open=true;document.getElementById('adcbox').scrollIntoView();return false">Repeater battery calibration</a>. Console-only on purpose: factory reset (erase), private key, OTA and power off.</p>
 </div></section>
 <section><h2>Settings</h2>
 <details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
@@ -1950,7 +2035,7 @@ function rsInput(i){const id=rsId(i.k);
  if(i.type==="radio")return '<select id="rs-preset" data-k="radio"><option value="">Preset… (or enter values below)</option>'+RP.map(g=>'<optgroup label="'+e(g[0])+'">'+g[1].map(p=>'<option value="'+p.slice(1,5).join(",")+'" data-ph="'+(p[5]||"")+'">'+e(p[0])+' · '+p[1]+' MHz / '+p[2]+' kHz / SF'+p[3]+' / CR'+p[4]+'</option>').join("")+'</optgroup>').join("")+'</select>'+
   '<div class="rsradio"><label>Freq (MHz)<input id="rs-radio-f" data-k="radio" type="number" min="300" max="2500" step="0.001"></label><label>BW (kHz)<select id="rs-radio-bw" data-k="radio"><option value=""></option>'+["7.8","10.4","15.6","20.8","31.25","41.7","62.5","125","250","500"].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>SF<select id="rs-radio-sf" data-k="radio"><option value=""></option>'+[5,6,7,8,9,10,11,12].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>CR<select id="rs-radio-cr" data-k="radio"><option value=""></option>'+[5,6,7,8].map(x=>'<option>'+x+'</option>').join("")+'</select></label></div><div id="rs-phnote" class="small mut"></div>';
  return '<input id="'+id+'" data-k="'+i.k+'" type="'+(i.type==="secret"?"password":"text")+'" maxlength="'+i.max+'" autocomplete="off" autocapitalize="none"'+(i.wo?' placeholder="new password"':'')+'>'}
-function rsBuild(){$("rsgrid").innerHTML=RS.map((c,ci)=>'<details class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
+function rsBuild(){$("rsgrid").innerHTML=RS.map((c,ci)=>'<details id="rscat'+ci+'" class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
  c.items.map(i=>'<div class="rsrow"><div class="rsl">'+e(i.label)+(i.risk?' <span class="warn" title="Risky change">⚠</span>':'')+'</div><div class="rsi">'+rsInput(i)+'</div><div class="small" id="rsst-'+i.k+'"></div>'+(i.help?'<div class="small mut">'+e(i.help)+'</div>':'')+'</div>').join("")+
  '<button type="button" class="g sm" data-rsread="'+ci+'">Read this group</button></div></details>').join("");
  $("rsgrid").addEventListener("input",ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(!k)return;
@@ -1975,6 +2060,7 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
      const m=[].find.call($("rs-preset").options,o=>o.value&&o.value.split(",").map(Number).join()===p.map(Number).join());$("rs-preset").value=m?m.value:""}}}
    else if(!i.wo){const el=$(rsId(i.k));if(el&&!el.closest(".rsrow").classList.contains("dirty"))el.value=i.type==="sel"?String(v.value).toLowerCase():i.type==="num"?String(+v.value):v.value}}
   st.innerHTML=q?'<span class="mut">⏳ '+(q==="sent"?"sent to the T-SIM, waiting for the reply":"queued for the next wake")+'</span>':v.unsupported?'<span class="mut">Not supported by this repeater'+(v.at?" · "+e(t(v.at)):"")+'</span>':v.error?'<span class="err">'+e(v.error)+(v.at?" · "+e(t(v.at)):"")+'</span>':v.at?'<span class="mut">'+(v.set?"Changed "+e(t(v.at))+(v.msg?" · "+e(v.msg):""):"Read "+e(t(v.at)))+'</span>':i.wo?"":'<span class="mut">Not read yet</span>'}
+ RS.forEach((c,ci)=>{if(c.dep)$("rscat"+ci).hidden=!(RV[c.dep]&&RV[c.dep].value!=null)});showTools(d);
  RS.forEach((c,ci)=>{const ks=c.items.filter(i=>!i.wo).map(i=>i.k),ats=ks.map(k=>RV[k]&&RV[k].at).filter(Boolean).sort();$("rssum"+ci).textContent=ats.length?"read "+ago(ats[ats.length-1]):"not read"});
  const nq=Object.values(RQ).filter(x=>x==="queued").length,ns=Object.values(RQ).filter(x=>x==="sent").length;
  $("rsq").innerHTML=nq||ns?(ns?"⏳ "+ns+" sent, waiting for replies. ":"")+(nq?nq+" queued"+(ns?"":' <button type="button" class="g sm" id="rscont">Send next batch (1 text)</button>'):""):"";
@@ -1983,7 +2069,7 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
 async function rsRead(keys,what){const w=Math.ceil(keys.length/PERWAKE);
  if(!confirm("Read "+(what||"all repeater settings")+"? This queues "+keys.length+" commands and sends one text now."+(w>1?"\\n\\nThe T-SIM runs "+PERWAKE+" commands per wake, so this needs "+w+" wakes: after the first batch, press \\"Send next batch\\" for the rest.":"")))return;
  const r=await post("rpt-read",{keys});const j=await rj(r);say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(j.queued?"Queued "+j.queued+" reads. "+(j.wake&&j.wake.sent?"Text sent; values appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Already queued."):(j.error||friendly(j,r.status)));load()}
-$("rsreadall").onclick=()=>rsRead(RS.flatMap(c=>c.items.filter(i=>!i.wo).map(i=>i.k)));
+$("rsreadall").onclick=()=>rsRead(RS.filter(c=>!c.noAll).flatMap(c=>c.items.filter(i=>!i.wo&&(!i.dep||(RV[i.dep]&&RV[i.dep].value!=null))).map(i=>i.k)));
 $("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const changes={};ch.forEach(i=>changes[i.k]=rsCur(i));
  const risky=ch.filter(i=>i.risk),lines=ch.map(i=>"• "+i.label+": "+(i.type==="secret"?"(hidden)":i.type==="radio"?changes[i.k].replace(/,/g," / ")+"  (MHz / kHz / SF / CR)":changes[i.k])+(i.risk?"  ⚠":""));
  let msg="Send these changes to the repeater now (one text)?\\n\\n"+lines.join("\\n");
@@ -1999,6 +2085,44 @@ const CH=()=>{try{return JSON.parse(localStorage.getItem("clihist")||"[]")}catch
 $("cmd").addEventListener("keydown",ev=>{const h=CH();if(ev.key==="ArrowUp"&&h.length){chi=Math.min(chi+1,h.length-1);$("cmd").value=h[chi];ev.preventDefault()}else if(ev.key==="ArrowDown"){chi=Math.max(chi-1,-1);$("cmd").value=chi<0?"":h[chi];ev.preventDefault()}});
 function cliRemember(c){const h=CH().filter(x=>x!==c);h.unshift(c);localStorage.setItem("clihist",JSON.stringify(h.slice(0,50)));chi=-1}
 $("clipick").onchange=ev=>{const v=ev.target.value;if(!v)return;$("cmd").value=v;$("cmd").focus();ev.target.value=""};
+
+function rgParse(raw){const out=[];const st=[];String(raw||"").split("\\n").forEach(l=>{if(!l.trim()||/^(err|error|\\?\\?)/i.test(l.trim()))return;const ind=(l.match(/^\\s*/)[0].length)>>1,tok=l.trim().split(/\\s+/),name=tok[0].replace(/^->\\s*/,"");if(!name||!/^(\\*|[#A-Za-z0-9_.\\-]+)$/.test(name))return;
+ st.length=ind;const parent=ind?st[ind-1]:"";st[ind]=name;out.push({name,flood:/\\bF\\b/.test(tok.slice(1).join(" ")),parent,depth:ind})});return out}
+function aclParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{const m=l.match(/([0-9A-Fa-f]{8,64})\\W+(?:perm(?:issions)?\\W*)?([0-3])\\b/);if(m)r.push({pk:m[1],perm:+m[2]})});return r}
+function snParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{const m=l.trim().match(/^([A-Za-z0-9_.]+)=(.*)$/);if(m)r.push({k:m[1],v:m[2]})});return r}
+const PERM=["Guest","Read-only","Read-write","Admin"];
+function lstat(L,k){const x=L[k];return x?(x.error?'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(x.error)?"Not supported by this repeater":x.error)+'</span> · '+e(t(x.at)):'<span class="mut">Read '+e(t(x.at))+'</span>'):'<span class="mut">Not read yet</span>'}
+function showTools(d){const R=d.rpt||{},L=R.lists||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);$("rtools").classList.toggle("dim",PS||!S.console_enabled);
+ const rg=rgParse(L.regions&&!L.regions.error?L.regions.raw:"");
+ $("rgst").innerHTML=lstat(L,"regions")+(L.home&&!L.home.error?' · home: <b>'+e(L.home.raw.replace(/^>\\s*/,"")||"none")+'</b>':"")+(L.default&&!L.default.error?' · default scope: <b>'+e(L.default.raw.replace(/^>\\s*/,"")||"none")+'</b>':"");
+ $("rglist").innerHTML=rg.length?'<table class="small"><thead><tr><th>Region</th><th>Flooding</th><th></th></tr></thead><tbody>'+rg.map(r=>'<tr><td style="padding-left:'+(r.depth*14)+'px">'+e(r.name)+'</td><td>'+(r.flood?'<span class="ok">allowed</span>':'<span class="mut">blocked</span>')+'</td><td class="nowrap"><button type="button" class="g sm" data-rg="flood" data-n="'+e(r.name)+'" data-a="'+(r.flood?0:1)+'">'+(r.flood?"Block":"Allow")+'</button> <button type="button" class="g sm" data-rg="home" data-n="'+e(r.name)+'">Home</button> <button type="button" class="g sm" data-rg="default" data-n="'+e(r.name)+'">Default</button>'+(r.name==="*"?"":' <button type="button" class="g sm" data-rg="remove" data-n="'+e(r.name)+'">✕</button>')+'</td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.regions?"No regions defined.":"Press Read regions.")+'</p>';
+ $("rgparent").innerHTML='<option value="">(top level, *)</option>'+rg.map(r=>'<option>'+e(r.name)+'</option>').join("");
+ $("rgraw").textContent=L.regions?L.regions.raw:"";
+ const acl=aclParse(L.acl&&!L.acl.error?L.acl.raw:"");$("aclst").innerHTML=lstat(L,"acl");
+ $("acllist").innerHTML=acl.length?'<table class="small"><tbody>'+acl.map(a=>'<tr><td class="mono">'+e(a.pk.slice(0,16))+(a.pk.length>16?"…":"")+'</td><td>'+PERM[a.perm]+'</td><td><button type="button" class="g sm" data-acl="'+e(a.pk)+'">Remove</button></td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.acl&&!L.acl.error?"No entries.":"")+'</p>';$("aclraw").textContent=L.acl?L.acl.raw:"";
+ const sn=snParse(L.sensors&&!L.sensors.error?L.sensors.raw:"");$("snst").innerHTML=lstat(L,"sensors");
+ $("snlist").innerHTML=sn.length?sn.map(x=>'<div class="row small"><code>'+e(x.k)+'</code><input data-snk="'+e(x.k)+'" value="'+e(x.v)+'" maxlength="60" style="flex:1"><button type="button" class="g sm" data-sns="'+e(x.k)+'">Set</button></div>').join(""):'<p class="small mut">'+(L.sensors&&!L.sensors.error?"No sensors.":"")+'</p>';
+ $("logst").innerHTML=lstat(L,"log");$("lograw").textContent=L.log?L.log.raw:"";
+ const O=L.ops||[];$("opsres").innerHTML=(R.ops_pending?'<div class="mut">⏳ '+R.ops_pending+' tool command(s) waiting to run</div>':'')+O.map(o=>'<div><code>'+e(o.cmd)+'</code> → <span class="'+(o.error?"err":"")+'">'+e(o.reply)+'</span> <span class="mut">'+e(t(o.at))+'</span></div>').join("")}
+async function rop(ops,q,risk){if(q&&!confirm(q))return;const r=await post("rpt-ops",{ops,risk_ok:!!risk});const j=await rj(r);
+ say("rtmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?"Queued "+j.queued+" command"+(j.queued>1?"s":"")+". "+(j.wake&&j.wake.sent?"Text sent; results appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):(j.error||friendly(j,r.status)));load()}
+$("rtools").addEventListener("click",ev=>{const b=ev.target.closest("button");if(!b)return;const n=b.dataset.n;
+ if(b.dataset.rd)return rop([{op:"read",what:b.dataset.rd}],"Read "+b.textContent.replace(/^Read /,"").toLowerCase()+" from the repeater? One text is sent now.");
+ if(b.dataset.rg==="flood")return rop([{op:"region.flood",name:n,allow:b.dataset.a==="1"}],(b.dataset.a==="1"?"Allow":"Block")+" flooding for region "+n+" and save?"+(n==="*"?"\\n\\n⚠ The * wildcard controls packets with no region: blocking it drops all unscoped traffic.":""),n==="*");
+ if(b.dataset.rg==="home")return rop([{op:"region.home",name:n}],"Make "+n+" this repeater's home region and save?");
+ if(b.dataset.rg==="default")return rop([{op:"region.default",name:n}],"Make "+n+" the default scope and save?");
+ if(b.dataset.rg==="remove")return rop([{op:"region.remove",name:n}],"⚠ Remove region "+n+" and save? Child regions must be removed first.",true);
+ if(b.dataset.acl)return rop([{op:"acl.remove",pubkey:b.dataset.acl}],"⚠ Remove "+b.dataset.acl.slice(0,16)+"… from the access list? It loses its permissions on this repeater.",true);
+ if(b.dataset.sns){const v=document.querySelector('[data-snk="'+b.dataset.sns+'"]').value;return rop([{op:"sensor.set",key:b.dataset.sns,value:v}],"Set sensor "+b.dataset.sns+" to "+v+"?")}
+ const A={logstart:["log.start","Start capturing the receive log on the repeater?"],logstop:["log.stop","Stop capturing the receive log?"],logerase:["log.erase","⚠ Erase the captured log on the repeater? This can't be undone.",1],
+  clocksync:["clock.sync","Set the repeater's clock to the current time? (The time is filled in when the T-SIM collects the command.)"],gpssync:["gps.sync","Sync the repeater clock from its GPS?"],gpssetloc:["gps.setloc","Set the repeater's saved location from its GPS?"],
+  disc:["discover.neighbors","Ask nearby repeaters to identify themselves (zero-hop discovery)?"],clrstats:["clear.stats","⚠ Reset the repeater's packet and radio statistics to zero?",1],rgclear:["region.default","Clear the default scope region and save?"]}[b.dataset.t];
+ if(A)return rop([{op:A[0],name:""}],A[1],!!A[2])});
+$("rgadd").onsubmit=ev=>{ev.preventDefault();const f=ev.target,n=f.n.value.trim();if(!n)return;rop([{op:"region.put",name:n,parent:f.p.value,flood:f.fl.checked}],"Add region "+n+(f.p.value?" under "+f.p.value:"")+" ("+(f.fl.checked?"flooding allowed":"flooding blocked")+") and save?").then(()=>f.n.value="")};
+$("acladd").onsubmit=ev=>{ev.preventDefault();const f=ev.target,pk=f.pk.value.trim(),pm=+f.pm.value;rop([{op:"acl.set",pubkey:pk,perm:pm}],(pm===3?"⚠ ":"")+"Give "+pk.slice(0,16)+(pk.length>16?"…":"")+" "+PERM[pm]+" permission on this repeater?"+(pm===3?"\\n\\nAdmin can change every setting, including passwords and radio.":""),pm===3).then(()=>f.pk.value="")};
+$("nbrm").onsubmit=ev=>{ev.preventDefault();const p=ev.target.p.value.trim();rop([{op:"neighbor.remove",prefix:p}],"⚠ Remove every neighbor whose ID starts with "+p+" from the repeater's neighbor list?",true)};
+$("tmpr").onsubmit=ev=>{ev.preventDefault();const f=ev.target;const o={op:"tempradio",f:f.f.value,bw:f.bw.value,sf:f.sf.value,cr:f.cr.value,mins:+f.m.value};
+ if(!confirm("⚠ Switch the radio to "+o.f+" MHz / "+o.bw+" kHz / SF"+o.sf+" / CR"+o.cr+" for "+o.mins+" min?\\n\\nThe repeater leaves your mesh for that time (until it reverts or reboots). Not saved."))return;rop([o],null,true)};
 
 $("conf").onsubmit=ev=>{ev.preventDefault();queue(false)};$("qwake").onclick=()=>queue(true);
 $("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("conmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load();};
