@@ -525,7 +525,17 @@ async function handleIngest(request, env, id) {
       const p = (await kvJson(env, `power:${id}`)) || {};
       if (c && c.cmd === (p.last_cmd || pwrCfgCmd({ ...DEFAULT_POWER, ...p }))) { p.applied_at = entry.received_at; p.applied_output = out.slice(0, 300); p.wake = null; await putJson(env, `power:${id}`, p); }
     }
-    else if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
+    const adc = c ? parseAdcReply(c.cmd, out) : null;
+    if (adc) {
+      const a = (await kvJson(env, `adc:${id}`)) || {};
+      if (adc.supported !== undefined) a.supported = adc.supported;
+      if (adc.supported === false) a.mult = null;
+      if (adc.mult !== undefined && (adc.mult !== null || adc.set === 0)) a.mult = adc.mult;
+      if (adc.set !== undefined) { a.set = adc.set; a.set_at = entry.received_at; }
+      a.error = adc.error || null; a.at = entry.received_at;
+      await putJson(env, `adc:${id}`, a);
+    }
+    if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
     else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
     else if (!t.error && ran === "powersaving on" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving on");
     else if (!t.error && reply) await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : "console: CLI answered");
@@ -591,6 +601,27 @@ async function setPowersaving(env, id, on, source) {
   await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on === null ? "unknown (no CLI reply since the firmware change)" : on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
 
+// ---------- Heltec (repeater) battery calibration via MeshCore "adc.multiplier" ----------
+export const ADC_UNSUPPORTED = "This repeater's firmware/board doesn't support battery calibration (it answered \"Error: unsupported\"). Stock MeshCore for the Heltec V3 doesn't implement it yet; the reading can only be corrected in firmware.";
+// Parse a reply to "get adc.multiplier" / "set adc.multiplier X". Returns null if it isn't recognisable.
+export function parseAdcReply(cmd, out) {
+  const c = String(cmd || "").trim().toLowerCase(), r = cleanCli(out);
+  if (!/^(get|set) adc\.multiplier\b/.test(c)) return null;
+  if (/error/i.test(r)) return /unsupported/i.test(r) ? { supported: false } : { error: r.slice(0, 120) };
+  if (c.startsWith("get")) { const m = r.match(/(-?\d+(?:\.\d+)?)/); return m ? { supported: true, mult: +m[1] } : null; }
+  if (/default/i.test(r)) return { supported: true, set: 0, mult: null };
+  const m = r.match(/set to\s*(\d+(?:\.\d+)?)/i); return m ? { supported: true, set: +m[1], mult: +m[1] } : (/^ok/i.test(r) ? { supported: true } : null);
+}
+export const clampAdc = (v) => Math.round(Math.min(10, Math.max(0, Number(v) || 0)) * 1000) / 1000;
+export function calcAdcMultiplier(cur, meterV, reportedV) {
+  cur = Number(cur); meterV = Number(meterV); reportedV = Number(reportedV);
+  if (!(cur > 0)) throw new Error("The current multiplier isn't known yet. Press \"Read current value\" first.");
+  if (!(meterV >= 2.5 && meterV <= 5)) throw new Error("Enter the multimeter reading in volts (2.5–5 V).");
+  if (!(reportedV >= 1)) throw new Error("No battery reading from the repeater yet. Press Request status first.");
+  const v = clampAdc(cur * meterV / reportedV);
+  if (!(v > 0)) throw new Error("That works out to 0, which would mean \"board default\". Check the readings.");
+  return v;
+}
 export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
 // ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
@@ -936,11 +967,12 @@ async function deviceApi(request, env, dev, action) {
     const source = await getSource(env, id);
     const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
-    const [gps, gcfg, greq, lreq, nicks] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`)]);
+    const [gps, gcfg, greq, lreq, nicks, adcSt] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`), kvJson(env, `adc:${id}`)]);
+    const adcq = (cmds || []).filter((c) => /^(get|set) adc\.multiplier\b/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1045,6 +1077,34 @@ async function deviceApi(request, env, dev, action) {
     let wake = null;
     if (b.wake === true) { const [o, c] = await manualSend(env, dev, "CMD", "CMD (console)"); wake = { ...o, status: c }; }
     return json({ queued: entry, wake });
+  }
+  if (action === "adc-cal") {
+    const settings = await getSettings(env, id);
+    if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; calibration uses it." }, 403);
+    if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE + ". Calibration needs the console, so turn power saving off first.", powersaving: true }, 409);
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const a = (await kvJson(env, `adc:${id}`)) || {}, mesh = (await kvJson(env, `mesh:${id}`)) || {};
+    let cmds;
+    if (b.op === "read") cmds = ["get adc.multiplier"];
+    else if (b.op === "reset") cmds = ["set adc.multiplier 0", "get adc.multiplier"];
+    else if (b.op === "set" || b.op === "preview") {
+      if (a.supported === false) return json({ error: ADC_UNSUPPORTED, unsupported: true }, 409);
+      const mv = mesh.core && mesh.core.battery_mv;
+      if (a.set_at && mesh.received_at && mesh.received_at < a.set_at) return json({ error: "The repeater's battery reading is older than the last calibration change. Press Request status for a fresh reading, then try again." }, 409);
+      let v; try { v = calcAdcMultiplier(a.mult, b.meter_v, mv / 1000); } catch (e) { return json({ error: e.message }, 400); }
+      const info = { current: a.mult, reported_v: mv / 1000, meter_v: Number(b.meter_v), new_mult: v, reading_at: mesh.received_at || null };
+      if (b.op === "preview") return json({ preview: info });
+      cmds = ["set adc.multiplier " + v.toFixed(3), "get adc.multiplier"];
+      b.info = info;
+    } else return json({ error: "unknown op" }, 400);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    if (list.filter((c) => c.status === "queued").length + cmds.length > CMD_MAX_PENDING) return json({ error: `Too many queued console commands (max ${CMD_MAX_PENDING}). Cancel some first.` }, 429);
+    const now = new Date().toISOString();
+    for (const cmd of cmds) list.unshift({ id: randomHex(4), cmd, status: "queued", queued_at: now });
+    await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await logActivity(env, id, { type: "action", msg: b.op === "read" ? "Repeater battery calibration: reading multiplier" : b.op === "reset" ? "Repeater battery calibration: reset to board default" : `Repeater battery calibration: multimeter ${b.info.meter_v} V vs reported ${b.info.reported_v.toFixed(2)} V → multiplier ${b.info.new_mult}` });
+    const [o, c] = await manualSend(env, dev, "CMD", "CMD (battery calibration)");
+    return json({ queued: cmds, preview: b.info || null, wake: { ...o, status: c } });
   }
   if (action === "wake-cmd") {
     const settings = await getSettings(env, id);
@@ -1482,6 +1542,16 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div id="locinfo"></div>
 <button type="button" id="locbtn" class="w">Set repeater location</button> <span id="locmsg" class="msg"></span>
 <div id="locres" class="small"></div></div></details>
+<details class="card" id="adcbox"><summary><b>Repeater battery calibration</b><small id="adcsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Corrects the battery voltage the repeater reports, using MeshCore's <code>adc.multiplier</code> setting. Measure the battery with a multimeter, enter it, check the preview, then save: the new value is sent straight away (one text wakes the T-SIM, which passes it to the repeater's command line). Uses the repeater console, so "Allow console commands" must be on and the repeater must not be in power saving. Some boards (including stock MeshCore on the Heltec V3) don't support it and answer "unsupported".</p>
+<p class="psnote" id="adcps" hidden>Not available while the repeater is in power saving: its command line isn't answering. Turn power saving off (or wait for a status check that gets a reply), then calibrate.</p>
+<p class="psnote" id="adccon" hidden>Turn on "Allow console commands" under Repeater console below to use calibration.</p>
+<div id="adcinfo"></div>
+<div id="adcui"><button type="button" class="g" id="adcread">Read current value</button>
+<form id="adcf"><label>Multimeter battery voltage (V)<input name="mv" type="number" step="0.01" min="2.5" max="5" placeholder="4.07"></label>
+<div id="adcprev" class="small"></div>
+<button type="submit">Calibrate &amp; send now</button> <button type="button" class="g" id="adcreset">Reset to board default</button></form></div>
+<span id="adcmsg" class="msg"></span></div></details>
 <details class="card" id="conbox"><summary><b>Repeater console</b><small id="consum" class="mut"></small></summary><div class="in">
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
@@ -1607,6 +1677,7 @@ async function load(){unitsBtn();
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
  if(PS)$("consum").textContent="paused (power saving)";
+ showAdc(d);
  const CM=(d.commands||[]).filter(c=>!c.sys&&!c.unsolicited);$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.sys?"T-SIM update":c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3 class="mut">No commands yet</td></tr>';
  $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"Status report":""))+'</td></tr>').join("")||'<tr><td colspan=3 class="mut">No activity yet</td></tr>';
  clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
@@ -1671,6 +1742,29 @@ async function queue(wake,force){const c=$("cmd").value.trim();if(!c)return;
  if(r.status===409&&j.risky){if(confirm("'"+c+"' can change or wipe the repeater's settings. Queue it anyway?"))return queue(wake,true);return}
  say("conmsg",r.ok&&(!j.wake||j.wake.sent),r.ok?("Queued"+(j.wake?(j.wake.sent?". Text sent, the reply will appear here within a few minutes.":". The wake text wasn't sent: "+friendly(j.wake,j.wake.status)):". It runs the next time the T-SIM wakes.")):friendly(j,r.status));
  if(r.ok)$("cmd").value="";load();}
+let ADC={},ADCM={};
+function showAdc(d){const A=d.adc||{},M=d.mesh||{},C=M.core||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);ADC=A;ADCM=M;
+ const rep=C.battery_mv==null?null:C.battery_mv/1000,stale=A.set_at&&M.received_at&&M.received_at<A.set_at;
+ $("adcsum").textContent=A.supported===false?"not supported":A.pending?"sent, waiting for reply":A.mult!=null?"x"+A.mult.toFixed(3)+(A.set===0?" (board default)":""):"not read yet";
+ $("adcps").hidden=!PS;$("adccon").hidden=!!S.console_enabled||PS;$("adcui").hidden=PS||!S.console_enabled;
+ $("adcinfo").innerHTML=kv([["Repeater reports",rep==null?"no reading yet (press Request status)":rep.toFixed(2)+" V · "+t(M.received_at)+(stale?" (before the last change: press Request status)":"")],
+  ["Current multiplier",A.supported===false?{h:'<span class="err">Not supported by this repeater</span>'}:A.mult!=null?A.mult.toFixed(3)+(A.set===0?" (board default)":""):A.set===0?"board default (press Read current value)":"unknown (press Read current value)"],
+  ["Last reply",A.at?t(A.at)+(A.error?" · "+A.error:""):null],["Status",A.pending?"⏳ Sent to the T-SIM, waiting for the repeater's reply":null]]);
+ if(A.supported===false)$("adcprev").innerHTML='<span class="err">'+e(${JSON.stringify(ADC_UNSUPPORTED)})+'</span>';else adcPrev()}
+function adcPrev(){const mv=+$("adcf").mv.value,C=ADCM.core||{},rep=C.battery_mv/1000,cur=ADC.mult;if(ADC.supported===false)return;
+ if(!mv){$("adcprev").textContent="";return}
+ if(!(mv>=2.5&&mv<=5)){$("adcprev").innerHTML='<span class="err">Enter 2.5–5 V.</span>';return}
+ if(!(cur>0)){$("adcprev").textContent='Press "Read current value" first so the new multiplier can be worked out.';return}
+ if(!(rep>=1)){$("adcprev").textContent="No battery reading from the repeater yet. Press Request status first.";return}
+ const n=Math.round(Math.min(10,Math.max(0,cur*mv/rep))*1000)/1000;$("adcprev").innerHTML="Preview: repeater says "+rep.toFixed(2)+" V, meter says "+mv.toFixed(2)+" V → multiplier <b>"+cur.toFixed(3)+" → "+n.toFixed(3)+"</b>"+(n>=10||n<=0?' <span class="err">(limited to 0–10)</span>':"")}
+$("adcf").oninput=adcPrev;
+async function adcPost(b,q){if(q&&!confirm(q))return;const r=await post("adc-cal",b);const j=await rj(r);
+ say("adcmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(j.wake&&j.wake.sent?"Sent. The repeater's reply appears here within a few minutes.":"Queued, but the wake text wasn't sent: "+friendly(j.wake||{},(j.wake||{}).status)+" It runs at the next wake."):(j.error||friendly(j,r.status)));load()}
+$("adcread").onclick=()=>adcPost({op:"read"},"Text the T-SIM to read the repeater's battery multiplier?");
+$("adcf").onsubmit=async ev=>{ev.preventDefault();const mv=+ev.target.mv.value;const r=await post("adc-cal",{op:"preview",meter_v:mv});const j=await rj(r);
+ if(!r.ok)return say("adcmsg",false,j.error||friendly(j,r.status));const p=j.preview;
+ adcPost({op:"set",meter_v:mv},"Set the repeater's battery multiplier from "+p.current.toFixed(3)+" to "+p.new_mult.toFixed(3)+" (repeater "+p.reported_v.toFixed(2)+" V, meter "+p.meter_v.toFixed(2)+" V)? One text is sent now.")};
+$("adcreset").onclick=()=>adcPost({op:"reset"},"Reset the repeater's battery multiplier to the board default? One text is sent now.");
 $("conf").onsubmit=ev=>{ev.preventDefault();queue(false)};$("qwake").onclick=()=>queue(true);
 $("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("conmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load();};
 $("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await rj(r);say("conmsg",r.ok,r.ok?"Cancelled "+j.cancelled+" queued command"+(j.cancelled==1?"":"s"):friendly(j,r.status));load();};

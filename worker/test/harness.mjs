@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -706,4 +706,38 @@ console.log("tag/asset version ok");
   assert(html.includes('id="gpsbtn"') && html.includes('id="locbtn"') && html.includes('id="gpsmap" class="map sens"') && html.includes("sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="));
   assert(/img-src https:\/\/tile\.openstreetmap\.org/.test(pr.headers.get("Content-Security-Policy")));
   console.log("GPS / location tests OK");
+  // ---------- repeater battery calibration (adc.multiplier) ----------
+  assert.deepEqual(parseAdcReply("get adc.multiplier", "  -> > 5.420"), { supported: true, mult: 5.42 });
+  assert.deepEqual(parseAdcReply("get adc.multiplier", "  -> Error: unsupported"), { supported: false });
+  assert.deepEqual(parseAdcReply("set adc.multiplier 5.1", "  -> OK - multiplier set to 5.100"), { supported: true, set: 5.1, mult: 5.1 });
+  assert.deepEqual(parseAdcReply("set adc.multiplier 0", "OK - using default board multiplier"), { supported: true, set: 0, mult: null });
+  assert.equal(parseAdcReply("ver", "x"), null);
+  assert.equal(calcAdcMultiplier(5.42, 4.0, 4.2), 5.162); assert.equal(clampAdc(12), 10); assert.equal(clampAdc(-1), 0);
+  assert.throws(() => calcAdcMultiplier(0, 4, 4.2)); assert.throws(() => calcAdcMultiplier(5, 9, 4.2)); assert.throws(() => calcAdcMultiplier(5, 4, null));
+  assert.equal((await P("adc-cal", { op: "read" })).status, 403, "needs console");
+  await P("settings", { console_enabled: true });
+  await ingest({ type: "mesh", ver: "  -> v1.18.0", stats_core: '  -> {"battery_mv":4200,"uptime_secs":5}' });
+  assert.equal((await P("adc-cal", { op: "preview", meter_v: 4.0 })).status, 400, "multiplier unknown yet");
+  unthrottle(); h0 = holo;
+  r = await P("adc-cal", { op: "read" }); j = await r.json(); assert.equal(r.status, 200); assert.equal(j.wake.sent, true); assert.equal(holo, h0 + 1);
+  let tl = await TEL(); let gq = tl.commands.find((x) => x.cmd === "get adc.multiplier"); assert.equal(tl.adc.pending, "queued");
+  await ingest({ type: "cmd", cmd_id: gq.id, cmd: gq.cmd, output: "  -> > 5.420" });
+  tl = await TEL(); assert.equal(tl.adc.mult, 5.42); assert.equal(tl.adc.supported, true); assert.equal(tl.adc.pending, null);
+  j = await (await P("adc-cal", { op: "preview", meter_v: 4.0 })).json(); assert.equal(j.preview.new_mult, 5.162);
+  unthrottle(); h0 = holo;
+  j = await (await P("adc-cal", { op: "set", meter_v: 4.0 })).json(); assert.deepEqual(j.queued, ["set adc.multiplier 5.162", "get adc.multiplier"]); assert.equal(holo, h0 + 1);
+  tl = await TEL(); const sq = tl.commands.find((x) => x.cmd === "set adc.multiplier 5.162");
+  await ingest({ type: "cmd", cmd_id: sq.id, cmd: sq.cmd, output: "  -> OK - multiplier set to 5.162" });
+  tl = await TEL(); assert.equal(tl.adc.mult, 5.162);
+  assert.equal((await P("adc-cal", { op: "preview", meter_v: 4.0 })).status, 409, "stale reading after change");
+  unthrottle(); j = await (await P("adc-cal", { op: "reset" })).json(); assert.equal(j.queued[0], "set adc.multiplier 0");
+  tl = await TEL(); const rq = tl.commands.find((x) => x.cmd === "set adc.multiplier 0"); const gq2 = tl.commands.find((x) => x.cmd === "get adc.multiplier" && x.status === "queued");
+  await ingest({ type: "cmd", cmd_id: gq2.id, cmd: gq2.cmd, output: "  -> Error: unsupported" });
+  await ingest({ type: "mesh", ver: "  -> v1.18.0", stats_core: '  -> {"battery_mv":4100}' });
+  r = await P("adc-cal", { op: "set", meter_v: 4.0 }); assert.equal(r.status, 409); assert((await r.json()).unsupported);
+  const ph = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(ph.includes('id="adcbox"') && ph.includes('id="adcread"'));
+  for (const m of ph.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);  // dashboard script parses
+  await P("settings", { console_enabled: false });
+  console.log("repeater battery calibration tests OK");
 }
