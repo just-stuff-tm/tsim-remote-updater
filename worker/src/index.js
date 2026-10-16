@@ -662,6 +662,16 @@ export function parseGps(t, prev = {}, receivedAt = new Date().toISOString()) {
     hdop: num(t.hdop, 0, 99), utc: /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(String(t.utc || "")) ? t.utc : null, received_at: receivedAt, trigger: attempt.trigger };
   return out;
 }
+// Neighbor nicknames: MeshCore repeater 1.18 "neighbors" only exposes 4-byte pubkey prefixes (no names), so names are user-set.
+export function setNick(map, hash, name) {
+  const h = String(hash || "").trim().toUpperCase();
+  if (!/^[0-9A-F]{2,16}$/.test(h)) throw new Error("Node ID must be hex (from the neighbors list).");
+  const n = String(name == null ? "" : name).replace(/[\u0000-\u001f\u007f<>]/g, "").trim().slice(0, 32);
+  const o = { ...(map || {}) };
+  if (n) o[h] = n; else delete o[h];
+  if (Object.keys(o).length > 200) throw new Error("Too many nicknames (max 200).");
+  return o;
+}
 export const GPS_STEPS = ["Waiting for T-SIM to wake", "Searching for satellites", "Done"];
 // req: {id, at, timeout_s}; cmds: command list; gps: stored record.
 export function gpsProgress(req, cmds = [], gps = {}, now = Date.now()) {
@@ -759,7 +769,7 @@ async function handleAdmin(request, env, parts) {
   const dev = await getDevice(env, id);
   if (!dev) return json({ error: "no such device" }, 404);
   if (parts.length === 2 && m === "DELETE") {
-    for (const k of [`device:${id}`, `state:${id}`, `source:${id}`, `release:${id}`, `telem:${id}:latest`, `telem:${id}:history`, `mesh:${id}`, `settings:${id}`, `cmds:${id}`, `tsimsrc:${id}`, `tsimrel:${id}`]) await env.STATE.delete(k);
+    for (const k of [`device:${id}`, `state:${id}`, `source:${id}`, `release:${id}`, `telem:${id}:latest`, `telem:${id}:history`, `mesh:${id}`, `settings:${id}`, `cmds:${id}`, `tsimsrc:${id}`, `tsimrel:${id}`, `nicks:${id}`]) await env.STATE.delete(k);
     return json({ deleted: id });
   }
   if (parts.length === 3 && parts[2] === "reset-password" && m === "POST") {
@@ -910,11 +920,11 @@ async function deviceApi(request, env, dev, action) {
     const source = await getSource(env, id);
     const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
-    const [gps, gcfg, greq, lreq] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`)]);
+    const [gps, gcfg, greq, lreq, nicks] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`)]);
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1100,6 +1110,12 @@ async function deviceApi(request, env, dev, action) {
       await putJson(env, `gpsreq:${id}`, { id: entry.id, at: entry.queued_at, timeout_s: { ...DEFAULT_GPS, ...(gcfg || {}) }.timeout_s, retry });
     }
     return json({ ...o, queued: o.sent ? entry : null }, code);
+  }
+  if (action === "nick") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    let o; try { o = setNick(await kvJson(env, `nicks:${id}`), b.hash, b.name); } catch (e) { return json({ error: e.message }, 400); }
+    await putJson(env, `nicks:${id}`, o);
+    return json({ saved: true, nicks: o });
   }
   if (action === "gps-settings") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -1418,7 +1434,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Radio</h3><div id="m-radio"></div></div>
 <div class="card"><h3>Packets</h3><div id="m-pkt"></div></div>
 </div>
-<div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
+<div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><p class="small mut" style="margin:0 0 6px">The repeater only reports short node IDs. Press ✎ to give a node a name (saved on this dashboard).</p><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
 <section><h2>Settings</h2>
 <details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
 <label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
@@ -1556,7 +1572,7 @@ async function load(){
  $("m-node").innerHTML=kv([["Name",M.node_name],["Firmware",M.heltec_fw],["Clock",M.clock],["Battery",C.battery_mv==null?null:(C.battery_mv/1000).toFixed(2)+" V"],["Uptime",up(C.uptime_secs)],["Queue / errors",C.queue_len==null?null:C.queue_len+" / "+C.errors]]);
  $("m-radio").innerHTML=kv([["Noise floor",R.noise_floor==null?null:R.noise_floor+" dBm"],["Last RSSI",R.last_rssi==null?null:R.last_rssi+" dBm"],["Last SNR",R.last_snr==null?null:R.last_snr+" dB"],["TX airtime",up(R.tx_air_secs)],["RX airtime",up(R.rx_air_secs)]]);
  $("m-pkt").innerHTML=kv([["Received",P.recv],["Sent",P.sent],["Flood tx / rx",P.flood_tx==null?null:P.flood_tx+" / "+P.flood_rx],["Direct tx / rx",P.direct_tx==null?null:P.direct_tx+" / "+P.direct_rx],["RX errors",P.recv_errors]]);
- const N=M.neighbors;$("nb").innerHTML=N==null?'<tr><td colspan=3 class="mut">No data yet</td></tr>':(N.length?N.map(n=>'<tr><td><code>'+e(n.id)+'</code></td><td>'+e(n.snr)+' dB</td><td>'+e(ago(n.heard_at))+'</td></tr>').join(""):'<tr><td colspan=3 class="mut">No neighbors heard</td></tr>');
+ const N=M.neighbors,NK=d.nicks||{};NICKS=NK;$("nb").innerHTML=N==null?'<tr><td colspan=3 class="mut">No data yet</td></tr>':(N.length?N.map(n=>{const k=String(n.id||"").toUpperCase(),nm=NK[k];return '<tr><td>'+(nm?'<b>'+e(nm)+'</b> <code class="mut small">'+e(n.id)+'</code>':'<code>'+e(n.id)+'</code>')+' <button type="button" class="g sm" data-nick="'+e(k)+'" title="Name this node">✎</button></td><td>'+e(n.snr)+' dB</td><td>'+e(ago(n.heard_at))+'</td></tr>'}).join(""):'<tr><td colspan=3 class="mut">No neighbors heard</td></tr>');
  if(M.error)$("nb").innerHTML+='<tr><td colspan=3 class="err">'+e(M.error)+'</td></tr>';
  const sc=d.schedule||{};const HL={6:"every 6 hours",12:"every 12 hours",24:"once a day",168:"once a week"},lr=sc.last_run;
  $("schsum").textContent=S.schedule_hours?"On · "+(HL[S.schedule_hours]||"every "+S.schedule_hours+" h")+" · next "+t(sc.next_run)+" ET":"Off";
@@ -1714,6 +1730,11 @@ function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progre
  $("locres").innerHTML=LP.state&&LP.state!=="idle"?'<p class="'+(LP.state==="done"?"ok":LP.state==="failed"?"err":"mut")+'" style="margin:8px 0 4px"><b>'+e(LP.state==="done"?"Repeater location set "+t(LP.finished_at):LP.state==="failed"?"Repeater didn’t confirm the location":LP.state==="cancelled"?"Cancelled":"Waiting for the T-SIM to wake and send it…")+'</b></p>'+
   (LP.outputs||[]).map(o=>'<div><code>'+e(o.cmd)+'</code> → '+e(o.status==="done"||o.status==="error"?(o.output||"(no reply)"):o.status)+'</div>').join(""):"";
  sensApply()}
+let NICKS={};
+$("nb").onclick=async(ev)=>{const b=ev.target.closest("[data-nick]");if(!b)return;const k=b.dataset.nick;
+ const n=prompt("Name for node "+k+" (shown on this dashboard only; leave empty to remove):",NICKS[k]||"");if(n===null)return;
+ const r=await post("nick",{hash:k,name:n});const j=await rj(r);if(r.status===401){location.href="/";return}
+ if(r.ok){toast(n.trim()?"Saved name for "+k:"Name removed","ok");load()}else toast(friendly(j,r.status),"bad")};
 $("gpsbtn").onclick=async()=>{const b=$("gpsbtn");if(b.dataset.busy)return;const m=b.dataset.mode||"get";
  if(m==="cancel"){if(!confirm("Cancel the location request? No text is sent."))return}
  else if(!confirm((m==="retry"?"Try again? ":"")+"Text the T-SIM to wake and read its GPS position? It searches for up to "+(GPS.settings?GPS.settings.timeout_s:180)+" s (first fix can take up to 5 min), then the location appears here."))return;

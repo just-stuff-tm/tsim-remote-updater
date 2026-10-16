@@ -607,6 +607,8 @@ console.log("tag/asset version ok");
     assert.equal(gd.attempt.diag.ready_ms, 4200); assert.equal(gd.attempt.diag.pwr, "+CGNSSPWR: 1"); assert.equal(m.parseGps({ fix: false }).attempt.diag, undefined); }
   assert.equal(m.validateGps({}, { timeout_s: 600 }).timeout_s, 600); assert.throws(() => m.validateGps({}, { timeout_s: 601 }), /600/);
   assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null);
+  { let o = m.setNick({}, "90e93ce2", " Hilltop <b> "); assert.deepEqual(o, { "90E93CE2": "Hilltop b" }); o = m.setNick(o, "90E93CE2", ""); assert.deepEqual(o, {});
+    assert.throws(() => m.setNick({}, "zz", "x"), /hex/); }
   { const u = m.updateStatus("tsim-updater 1.6.7", { tag: "v1.6.8", asset_name: "firmware.bin", notes: m.relNotes("## New\r\n- GPS"), html_url: m.safeRelUrl("https://github.com/o/r/releases/tag/v1.6.8") });
     assert.equal(u.state, "available"); assert.equal(u.notes, "## New\n- GPS"); assert.equal(u.release_url, "https://github.com/o/r/releases/tag/v1.6.8");
     assert.equal(m.safeRelUrl("javascript:alert(1)", "o/r", "v1"), "https://github.com/o/r/releases/tag/v1"); assert.equal(m.updateStatus("1.6.8", { tag: "v1.6.8", notes: "x" }).notes, undefined); } assert.equal(m.parseGps({ fix: true, lat: 95, lon: 1 }).fix, null);
