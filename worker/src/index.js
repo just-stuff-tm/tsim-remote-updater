@@ -188,7 +188,8 @@ async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
   const names = [...page.matchAll(/\/releases\/download\/[^"]+?\/([^"/]+)"/g)].map((m) => decodeURIComponent(m[1]));
   const name = pattern ? pickAsset(names, pattern) : names.find((n) => ASSET_RE.test(n));
   if (!name) return { skipped: `no upgrade asset in ${tag}` };
-  return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html" };
+  return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html",
+    notes: "", html_url: safeRelUrl(null, REPO, tag) };
 }
 
 export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
@@ -212,7 +213,15 @@ export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
   const an = pickAsset((rel.assets || []).map((a) => a.name), src.asset_pattern);
   const asset = (rel.assets || []).find((a) => a.name === an);
   if (!asset) return { skipped: `no upgrade asset in ${rel.tag_name}` };
-  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null };
+  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null,
+    notes: relNotes(rel.body), html_url: safeRelUrl(rel.html_url, REPO, rel.tag_name) };
+}
+// Release notes cached with the release check: plain text, control chars stripped, capped (rendered escaped in the dashboard).
+export function relNotes(body) { const t = String(body || "").replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trim(); return t ? t.slice(0, 4000) : ""; }
+export function safeRelUrl(u, repo, tag) {
+  const s = String(u || "");
+  if (/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/releases\/tag\/[^\s"'<>]+$/.test(s)) return s;
+  return repo && tag ? `https://github.com/${repo}/releases/tag/${encodeURIComponent(tag)}` : null;
 }
 export const buildUpdateBody = (url) => `UPDATE ${url.replace(/_/g, "%5F")} `;
 
@@ -1177,7 +1186,8 @@ export function updateStatus(installed, rel, flashed = null) {
   const iv = verOf(installed) || (flashed && (verOf(flashed.tag) || verOf(flashed.asset_name)));
   if (lv && iv) {
     const c = vcmp(lv, iv);
-    return c > 0 ? { state: "available", text: `New update available: ${latest} (installed ${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at }
+    return c > 0 ? { state: "available", text: `New update available: ${latest} (installed ${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at,
+        notes: rel.notes || "", release_url: rel.html_url || null, tag: rel.tag || null }
       : { state: "current", text: `Up to date (${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at };
   }
   if (flashed && flashed.asset_name && flashed.asset_name === rel.asset_name && (!flashed.tag || flashed.tag === rel.tag))
@@ -1219,12 +1229,12 @@ export async function refreshReleases(env, now = Date.now()) {
   for (const id of await listDeviceIds(env)) {
     try {
       const src = await getSource(env, id), cur = await kvJson(env, `release:${id}`);
-      if (src.enabled && !(cur && cur.checked_at && now - Date.parse(cur.checked_at) < REFRESH_MS)) {
+      if (src.enabled && !(cur && cur.checked_at && cur.notes !== undefined && now - Date.parse(cur.checked_at) < REFRESH_MS)) {
         const rel = await get(src);
         if (!rel.skipped) { await putJson(env, `release:${id}`, { ...rel, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":radio"); }
       }
       const ts = await getTsimSource(env, id), tcur = await kvJson(env, `tsimrel:${id}`);
-      if (ts.mode !== "url" && !(tcur && tcur.checked_at && now - Date.parse(tcur.checked_at) < REFRESH_MS)) {
+      if (ts.mode !== "url" && !(tcur && tcur.checked_at && tcur.notes !== undefined && now - Date.parse(tcur.checked_at) < REFRESH_MS)) {
         const r = await get({ repo: ts.repo, asset_pattern: ts.asset });
         if (!r.skipped) {
           let checksum = ts.checksum || ""; if (!checksum && r.digest) { try { checksum = normChecksum(r.digest); } catch {} }
@@ -1320,6 +1330,10 @@ const STALE_MS=26*3600e3;
 const sig=c=>c==null||c<0||c==99?null:(c>=20?"Excellent":c>=15?"Good":c>=10?"OK":"Weak")+" ("+c+")";
 const PSTATE={running:["Updating…","run"],done:["Updated","ok"],failed:["Update failed","failed"],timeout:["Stalled","failed"],cancelled:["Cancelled","mut"]};
 function ubadge(u,label){if(!u)return"";const c=u.state==="available"||u.state==="flashed"?"run":u.state==="current"?"":u.state==="mismatch"?"failed":"mut";const w=u.state==="available"?"update available":u.state==="current"?"up to date":u.state==="flashed"?"awaiting confirmation":u.state==="mismatch"?"version mismatch":u.state==="unknown"?"version unknown":"not checked";return '<span class="badge '+c+'" title="'+e(u.text)+'">'+e(label+": "+w)+'</span>'}
+function mdl(x){return e(x).split("\\n").map(l=>{let h=l.replace(/\\*\\*([^*]+)\\*\\*/g,"<b>$1</b>").replace(/\\x60([^\\x60]+)\\x60/g,"<code>$1</code>").replace(/\\[([^\\]]+)\\]\\([^)]*\\)/g,"$1");
+ if(/^#{1,6}\\s/.test(l))return"<b>"+h.replace(/^#{1,6}\\s+/,"")+"</b>";if(/^\\s*[-*]\\s/.test(l))return"&nbsp;• "+h.replace(/^\\s*[-*]\\s+/,"");return h}).join("<br>")}
+function relnotes(u){if(!u||u.state!=="available")return"";const ok=u.release_url&&/^https:\\/\\/github\\.com\\//.test(u.release_url);
+ return '<details class="small" style="margin-top:8px"><summary>What’s new in '+e(u.latest||u.tag||"this release")+'</summary><div style="margin-top:6px;line-height:1.45">'+(u.notes?mdl(u.notes):'<span class="mut">No release notes were published for this release.</span>')+'</div>'+(ok?'<p style="margin:6px 0 0"><a href="'+e(u.release_url)+'" target="_blank" rel="noopener noreferrer">View the release on GitHub</a></p>':'')+'</details>'}
 function utext(u){if(!u)return null;return u.state==="available"?"⬆ "+u.text:u.state==="current"?"✓ "+u.text:u.state==="mismatch"?"⚠ "+u.text:u.state==="flashed"?"⏳ "+u.text:u.text}
 function finfo(f){if(!f)return"";const r=[["Chip",f.chip],["Image",f.image],["Flash address",f.addr],["Bytes written",f.written==null?null:f.written.toLocaleString()+(f.size?" / "+f.size.toLocaleString():"")],["Verify (MD5)",f.verify?(f.verify==="OK"?"✓ OK":"✗ "+f.verify)+(f.md5?" · "+f.md5.slice(0,12)+"…":""):null]].filter(x=>x[1]!=null);return r.length?'<div class="small" style="margin-top:6px">'+r.map(x=>'<div><span class="mut">'+e(x[0])+':</span> '+e(String(x[1]))+'</div>').join("")+'</div>':""}
 function pbadge(p,label){if(!p||p.state==="idle")return"";if(p.state==="done"&&p.finished_at&&Date.now()-new Date(p.finished_at)>36e5)return"";const s=PSTATE[p.state]||[p.state,"mut"];return '<span class="badge '+(s[1]==="ok"?"":s[1])+'">'+e(label+": "+s[0]+(p.state==="running"?" "+p.pct+"%":""))+'</span>'}
@@ -1531,8 +1545,8 @@ async function load(){
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
  const US=d.update_status||{};
- $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)],["Last flashed",US.radio&&US.radio.flashed?US.radio.flashed.file+" · "+t(US.radio.flashed.at):null]])+(US.radio&&US.radio.flashed?finfo(US.radio.flashed.flash):"");
- $("c-tsimfw").innerHTML=kv([["Status",utext(US.tsim)],["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]]);
+ $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)],["Last flashed",US.radio&&US.radio.flashed?US.radio.flashed.file+" · "+t(US.radio.flashed.at):null]])+(US.radio&&US.radio.flashed?finfo(US.radio.flashed.flash):"")+relnotes(US.radio);
+ $("c-tsimfw").innerHTML=kv([["Status",utext(US.tsim)],["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]])+relnotes(US.tsim);
  for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
  $("p-heltec").innerHTML=prog(PG.heltec,"Heltec",pending.heltec);$("p-tsim").innerHTML=prog(PG.tsim,"T-SIM",pending.tsim);
  const busy=["heltec","tsim"].some(k=>pending[k]||(PG[k]||{}).state==="running");

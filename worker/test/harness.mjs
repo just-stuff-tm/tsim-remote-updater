@@ -606,7 +606,10 @@ console.log("tag/asset version ok");
   { const gd = m.parseGps({ fix: false, sats: 0, msg: "x", diag: { ready_ms: 4200, warm: false, pwr: "+CGNSSPWR: 1", ant: "CGDRT=4,1 OK; CGSETV=4,1 OK", mode: "+CGNSSMODE: 3", first: ",,,,,,,,", last: ",,,,", sats: 0, timeout: 180 } });
     assert.equal(gd.attempt.diag.ready_ms, 4200); assert.equal(gd.attempt.diag.pwr, "+CGNSSPWR: 1"); assert.equal(m.parseGps({ fix: false }).attempt.diag, undefined); }
   assert.equal(m.validateGps({}, { timeout_s: 600 }).timeout_s, 600); assert.throws(() => m.validateGps({}, { timeout_s: 601 }), /600/);
-  assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null); assert.equal(m.parseGps({ fix: true, lat: 95, lon: 1 }).fix, null);
+  assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null);
+  { const u = m.updateStatus("tsim-updater 1.6.7", { tag: "v1.6.8", asset_name: "firmware.bin", notes: m.relNotes("## New\r\n- GPS"), html_url: m.safeRelUrl("https://github.com/o/r/releases/tag/v1.6.8") });
+    assert.equal(u.state, "available"); assert.equal(u.notes, "## New\n- GPS"); assert.equal(u.release_url, "https://github.com/o/r/releases/tag/v1.6.8");
+    assert.equal(m.safeRelUrl("javascript:alert(1)", "o/r", "v1"), "https://github.com/o/r/releases/tag/v1"); assert.equal(m.updateStatus("1.6.8", { tag: "v1.6.8", notes: "x" }).notes, undefined); } assert.equal(m.parseGps({ fix: true, lat: 95, lon: 1 }).fix, null);
   assert.equal(m.gpsCfgCmd(m.DEFAULT_GPS), "GPSCFG auto=0 to=180");
   assert.throws(() => m.validateGps({}, { timeout_s: 10 }), /30 and 600/);
   assert(m.isSysCmd("GPSFIX") && m.isSysCmd("GPSCFG auto=1 to=90") && !m.isSysCmd("set lat 1"));
