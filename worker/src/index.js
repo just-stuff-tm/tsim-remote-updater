@@ -681,6 +681,13 @@ export function gpsPendResolved(pend, p, a, now = Date.now()) {
   if (a && a.at && Date.parse(a.at) >= t) return true;
   return now - Date.parse(pend) > 15 * 60e3;
 }
+// Units (dashboard toggle, default metric). Distances in metres in, display string out.
+export function fmtDist(m, imperial) {
+  if (m == null || !isFinite(m)) return null;
+  if (imperial) { const ft = m * 3.28084; return Math.abs(ft) >= 5280 ? (ft / 5280).toFixed(1) + " mi" : Math.round(ft) + " ft"; }
+  return Math.abs(m) >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m) + " m";
+}
+export function fmtTemp(c, imperial) { return c == null || !isFinite(c) ? null : imperial ? Math.round(c * 9 / 5 + 32) + " °F" : Math.round(c) + " °C"; }
 export const GPS_STEPS = ["Waiting for T-SIM to wake", "Searching for satellites", "Done"];
 // req: {id, at, timeout_s}; cmds: command list; gps: stored record.
 export function gpsProgress(req, cmds = [], gps = {}, now = Date.now()) {
@@ -1344,7 +1351,12 @@ const e=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt
 const t=s=>s?new Date(s).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"—";
 const ago=s=>{if(!s)return "never";const d=(Date.now()-new Date(s))/1000;return d<90?Math.round(d)+"s ago":d<5400?Math.round(d/60)+" min ago":d<172800?Math.round(d/3600)+" h ago":Math.round(d/86400)+" d ago"};
 const kv=rows=>rows.map(([k,v])=>'<div class="kv"><span>'+e(k)+'</span><span>'+(v&&v.h!=null?v.h:e(v??"—"))+'</span></div>').join("");
-const SENS_K="tsim_show_sensitive";
+const SENS_K="tsim_show_sensitive",UNIT_K="tsim_units";
+const fmtDist=${fmtDist.toString().replace(/^function \w+/, "function")},fmtTemp=${fmtTemp.toString().replace(/^function \w+/, "function")};
+const imp=()=>{try{return localStorage.getItem(UNIT_K)==="imperial"}catch{return false}};
+const dist=m=>fmtDist(m,imp());
+function unitsToggle(){try{localStorage.setItem(UNIT_K,imp()?"metric":"imperial")}catch{}unitsBtn();if(typeof load==="function")load()}
+function unitsBtn(){const b=document.getElementById("unitsbtn");if(b){b.textContent=imp()?"ft · °F":"m · °C";b.title="Units: "+(imp()?"imperial":"metric")+" (click to switch)"}}
 const sensOn=()=>{try{return localStorage.getItem(SENS_K)==="1"}catch{return false}};
 function sensApply(){document.documentElement.classList.toggle("showsens",sensOn());document.querySelectorAll(".eye").forEach(b=>{b.textContent=sensOn()?"🙈":"👁";b.title=sensOn()?"Hide":"Show";b.setAttribute("aria-pressed",String(sensOn()))})}
 function sensToggle(){try{localStorage.setItem(SENS_K,sensOn()?"0":"1")}catch{}sensApply()}
@@ -1412,7 +1424,7 @@ const PS_HTML = `Repeater stats can still be retrieved over the mesh using MeshC
 
 export function dashboardPage(dev, acc = { kind: "d" }) {
   return `${HEAD(dev.name)}
-<body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span></div>
+<body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span><button type="button" id="unitsbtn" class="g sm" onclick="unitsToggle()" style="margin-left:6px">m · °C</button></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
 <nav class="tabs" id="tabs"><button type="button" data-t="ov">Overview</button><button type="button" data-t="radio">LoRa radio</button><button type="button" data-t="tsim">T-SIM</button><button type="button" data-t="act">Activity</button></nav>
 <main>
@@ -1559,7 +1571,7 @@ function prog(p,label,pend){
   '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+(p.resolved?'<div class="small mut">Confirmed: '+e(p.resolved)+'</div>':'')+finfo(p.flash)+
   (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
 var DS={};
-async function load(){
+async function load(){unitsBtn();
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
  const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
@@ -1699,7 +1711,7 @@ let GPS={},gpsLoaded=false,LMAP=null,LMK=null,gpsPend=null;
 const gpsPendResolved=${gpsPendResolved.toString().replace(/^function \w+/, "function")};
 const GSTEP=["Waiting for T-SIM to wake","Searching for satellites","Done"];
 function llTxt(f){return f.lat.toFixed(6)+", "+f.lon.toFixed(6)}
-function acc(h){if(h==null||h<0)return null;const q=h<=1?"excellent":h<=2?"good":h<=5?"fair":"poor";return "HDOP "+h.toFixed(1)+" ("+q+", about ±"+Math.max(3,Math.round(h*5))+" m)"}
+function acc(h){if(h==null||h<0)return null;const q=h<=1?"excellent":h<=2?"good":h<=5?"fair":"poor";return "HDOP "+h.toFixed(1)+" ("+q+", about ±"+dist(Math.max(3,Math.round(h*5)))+")"}
 function copyLL(){const f=GPS.fix;if(!f)return;const s=llTxt(f);(navigator.clipboard?navigator.clipboard.writeText(s):Promise.reject()).then(()=>toast("Coordinates copied","ok"),()=>toast(s,"ok"))}
 function loadLeaflet(){if(window.L)return Promise.resolve();if(loadLeaflet.p)return loadLeaflet.p;
  const c=document.createElement("link");c.rel="stylesheet";c.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";c.integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";c.crossOrigin="";document.head.appendChild(c);
@@ -1725,7 +1737,7 @@ function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progre
  $("gpsnote").hidden=G.supported!==false;
  $("gpsat").textContent=F?"fix "+t(F.utc||F.received_at):"";
  const cp=F?{h:'<span class="sens">'+e(llTxt(F))+'</span> <button type="button" class="eye" onclick="sensToggle()" title="Show">👁</button> <button type="button" class="g sm" onclick="copyLL()">Copy</button>'}:null;
- $("c-gps").innerHTML=F?kv([["Coordinates",cp],["Fix time",t(F.utc||F.received_at)+(F.trigger==="auto"?" (on check-in)":"")],["Satellites",F.sats],["Accuracy",acc(F.hdop)],["Altitude",F.alt==null?null:Math.round(F.alt)+" m"],
+ $("c-gps").innerHTML=F?kv([["Coordinates",cp],["Fix time",t(F.utc||F.received_at)+(F.trigger==="auto"?" (on check-in)":"")],["Satellites",F.sats],["Accuracy",acc(F.hdop)],["Altitude",dist(F.alt)],
   ...(A&&!A.fix&&new Date(A.at)>new Date(F.received_at)?[["Last attempt","No fix "+t(A.at)+(A.sats!=null?" · "+A.sats+" satellites seen":"")]]:[])])
   :'<p class="small mut">'+(A?"No fix yet. Last attempt "+e(t(A.at))+(A.sats!=null?" saw "+A.sats+" satellites":"")+". Check the GNSS antenna and that it can see the sky.":"No location yet. Press Get location.")+'</p>';
  if(F)showMap(F);else $("gpsmapw").hidden=true;

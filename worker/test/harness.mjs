@@ -607,6 +607,9 @@ console.log("tag/asset version ok");
     assert.equal(gd.attempt.diag.ready_ms, 4200); assert.equal(gd.attempt.diag.pwr, "+CGNSSPWR: 1"); assert.equal(m.parseGps({ fix: false }).attempt.diag, undefined); }
   assert.equal(m.validateGps({}, { timeout_s: 600 }).timeout_s, 600); assert.throws(() => m.validateGps({}, { timeout_s: 601 }), /600/);
   assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null);
+  assert.equal(m.fmtDist(301.4, false), "301 m"); assert.equal(m.fmtDist(301.4, true), "989 ft"); assert.equal(m.fmtDist(7, true), "23 ft");
+  assert.equal(m.fmtDist(2500, false), "2.5 km"); assert.equal(m.fmtDist(2000, true), "1.2 mi"); assert.equal(m.fmtDist(null, true), null);
+  assert.equal(m.fmtTemp(25, true), "77 °F"); assert.equal(m.fmtTemp(25, false), "25 °C");
   { const q = "2026-10-16T17:56:56.350Z", N = Date.parse(q) + 60e3;
     assert.equal(m.gpsPendResolved(q, { state: "done", started_at: q }, null, N), true, "server shows this request");
     assert.equal(m.gpsPendResolved("2026-10-16T17:56:57.900Z", { state: "done", started_at: q }, null, N), true, "client clock a bit later");
