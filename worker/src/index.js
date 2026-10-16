@@ -293,7 +293,11 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
   const sent = kind === "tsim" ? st.tsim_update_sent : st.last_update_sent;
   const isK = (h) => h.type === "update" && h.msg && (kind === "tsim" ? /^TSIM OTA/.test(h.msg) : !/^TSIM OTA/.test(h.msg) && !/^TESTDL/.test(h.msg)) ||
     (kind === "tsim" && /booted new firmware after OTA/.test(h.msg || ""));
-  const evs = history.filter(isK).slice().reverse();  // oldest first
+  // Activity history is capped, so the outcome can scroll out of it; the last result is also kept in state.
+  const last = kind === "tsim" ? st.tsim_last_ota : st.last_update_result;
+  const hist2 = last && last.msg && !history.some((h) => h.msg === last.msg && h.received_at === last.at)
+    ? [{ type: "update", msg: last.msg, received_at: last.at }, ...history] : history;
+  const evs = hist2.filter(isK).slice().sort((a, b) => Date.parse(a.received_at) - Date.parse(b.received_at));  // oldest first
   let startAt = sent ? Date.parse(sent.at) : null;
   if (startAt == null) { const s = evs.filter((h) => /start/i.test(h.msg)).pop(); if (s) startAt = Date.parse(s.received_at); }
   if (startAt == null || now - startAt > 7 * 864e5) return { state: "idle" };
@@ -322,6 +326,17 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
   if (state === "running" && cancel && Date.parse(cancel.at) >= startAt)
     return { state: "cancelled", step, steps: STEPS, times, target, started_at: times[0], finished_at: cancel.at, pct: 0,
       reason: cancel.note || "Cancel requested." };
+  // Version check: if the device already runs the target (or newer), the update is done, whatever the log says.
+  if (state !== "done" && sent) {
+    const tv = verOf(sent.tag) || verOf(sent.asset_name);
+    const inst = kind === "tsim" ? st.tsim_fw : (st.radio_ver_at && Date.parse(st.radio_ver_at) >= startAt ? st.radio_ver : null);
+    const iv = verOf(inst);
+    if (tv && iv && vcmp(iv, tv) >= 0) {
+      const at = (kind === "tsim" ? st.tsim_fw_at : st.radio_ver_at) || null;
+      return { state: "done", step: 5, steps: STEPS, times: { ...times, 5: at }, target, started_at: times[0], finished_at: at, reason: null, pct: 100,
+        resolved: `${kind === "tsim" ? "T-SIM" : "Repeater"} reports ${vstr(iv)}`, ...(flash ? { flash } : {}) };
+    }
+  }
   const lastAt = Math.max(startAt, ...mine.map((h) => Date.parse(h.received_at) || 0), st.last_checkin_ts || 0);
   if (state === "running" && now - lastAt > STALL_MS) { state = "timeout";
     reason = step === 0 ? "The T-SIM never woke up to start the update. It may be out of power or have lost its cell connection. Press Retry to text it again." :
@@ -439,6 +454,7 @@ async function handleIngest(request, env, id) {
     }
     if (mesh.heltec_fw) await setPowersaving(env, id, false, "mesh poll: CLI answered");  // any successful reply re-enables
     await putJson(env, `mesh:${id}`, mesh);
+    if (mesh.heltec_fw) { const s3 = (await kvJson(env, `state:${id}`)) || {}; s3.radio_ver = mesh.heltec_fw; s3.radio_ver_at = entry.received_at; await putJson(env, `state:${id}`, s3); }
     const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
     await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at });
     const n = mesh.neighbors ? mesh.neighbors.length : "?";
@@ -474,6 +490,19 @@ async function handleIngest(request, env, id) {
   await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type });
   if (entry.type === "update") { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_checkin_ts = Date.now(); await putJson(env, `state:${id}`, s2); }
   await logActivity(env, id, entry);
+  if (entry.fw || (entry.type === "mesh" && t.ver)) {
+    const st = (await kvJson(env, `state:${id}`)) || {}; let ch = false;
+    if (entry.fw && st.tsim_fw !== entry.fw) { st.tsim_fw = entry.fw; st.tsim_fw_at = entry.received_at; ch = true; }
+    if (entry.fw && st.tsim_update_sent) {
+      const tv = verOf(st.tsim_update_sent.tag) || verOf(st.tsim_update_sent.asset_name), iv = verOf(entry.fw);
+      if (tv && iv && vcmp(iv, tv) >= 0) {  // target reached: never reinstall
+        const list = (await kvJson(env, `cmds:${id}`)) || []; let n = 0;
+        for (const c of list) if (c.status === "queued" && isTsimUpd(c)) { c.status = "cancelled"; c.error = "already running " + entry.fw; n++; }
+        if (n) await putJson(env, `cmds:${id}`, list);
+      }
+    }
+    if (ch) await putJson(env, `state:${id}`, st);
+  }
   if (entry.type === "power" && entry.msg) {
     const st = (await kvJson(env, `state:${id}`)) || {};
     st.power_event = { at: entry.received_at, msg: entry.msg }; await putJson(env, `state:${id}`, st);
@@ -1305,7 +1334,7 @@ function prog(p,label,pend){
   if(i===5&&fail)return '<li class="bad"><span>Failed</span><span>'+e(t(p.finished_at)||"")+'</span></li>';
   return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
  return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"Failed":p.pct+"%")+'</span></div>'+
-  '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+finfo(p.flash)+
+  '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+(p.resolved?'<div class="small mut">Confirmed: '+e(p.resolved)+'</div>':'')+finfo(p.flash)+
   (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
 var DS={};
 async function load(){

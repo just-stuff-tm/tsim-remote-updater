@@ -548,3 +548,35 @@ console.log("tag/asset version ok");
   assert.equal(scheduleInfo(0, {}, now).next_run, null);
   console.log("save & send / schedule tests OK");
 }
+
+// Auto-resolve: never Stalled when the device runs the target version
+{
+  const now = Date.parse("2026-10-16T10:30:00Z");
+  const sent = { at: "2026-10-15T23:28:29.192Z", asset_name: "firmware.bin", tag: "v1.6.5" };
+  // outcome scrolled out of history, but state keeps tsim_last_ota
+  let p = computeProgress("tsim", [], { tsim_update_sent: sent, tsim_last_ota: { at: "2026-10-15T23:31:34.685Z", msg: "TSIM OTA OK: tsim-updater 1.6.5 running (ingest accepted)" } }, now);
+  assert.equal(p.state, "done");
+  // no log at all, but device reports the version
+  p = computeProgress("tsim", [], { tsim_update_sent: sent, tsim_fw: "tsim-updater 1.6.5", tsim_fw_at: "2026-10-15T23:31:40Z" }, now);
+  assert.equal(p.state, "done"); assert(/reports v1.6.5/.test(p.resolved));
+  p = computeProgress("tsim", [], { tsim_update_sent: sent, tsim_fw: "tsim-updater 1.6.4" }, now);
+  assert.equal(p.state, "timeout");
+  // radio: repeater confirms target after the start
+  const rs = { last_update_sent: { at: "2026-10-15T10:43:00Z", asset_name: "Heltec_v3_repeater-v1.18.0-81dbae5.bin", tag: "repeater-v1.18.0" } };
+  p = computeProgress("heltec", [], { ...rs, radio_ver: "v1.18.0-81dbae5 (Build: 15-Oct-2026)", radio_ver_at: "2026-10-15T10:49:35Z" }, now);
+  assert.equal(p.state, "done");
+  p = computeProgress("heltec", [], { ...rs, radio_ver: "v1.18.0", radio_ver_at: "2026-10-15T10:00:00Z" }, now);  // older report: not proof
+  assert.equal(p.state, "timeout");
+  p = computeProgress("heltec", [], { ...rs, last_update_result: { at: "2026-10-15T10:48:14Z", msg: "SUCCESS: https://g/x/Heltec_v3_repeater-v1.18.0-81dbae5.bin" } }, now);
+  assert.equal(p.state, "done");
+  // ingest: fw report cancels queued TSIMUPDATE
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const s0 = JSON.parse(kv.get("state:tsim-1")); s0.tsim_update_sent = sent; kv.set("state:tsim-1", JSON.stringify(s0));
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "q1", cmd: "TSIMUPDATE https://x/firmware.bin", sys: true, status: "queued" }]));
+  await call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify({ type: "status", fw: "tsim-updater 1.6.5", msg: "STATUS" }) });
+  assert.equal(JSON.parse(kv.get("cmds:tsim-1"))[0].status, "cancelled");
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).tsim_fw, "tsim-updater 1.6.5");
+  await call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify({ type: "mesh", ver: "v1.18.0-81dbae5" }) });
+  assert(JSON.parse(kv.get("state:tsim-1")).radio_ver.startsWith("v1.18.0"));
+  console.log("auto-resolve tests OK");
+}
