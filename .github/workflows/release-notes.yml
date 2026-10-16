@@ -1,0 +1,29 @@
+name: Release notes
+# Sets a release's description from release-notes/<tag>.md. Only edits the text; never rebuilds or replaces assets.
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space-separated release tags (e.g. v1.6.8 v1.6.7)"
+        required: true
+permissions:
+  contents: write
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        env:
+          TAGS: ${{ inputs.tags }}
+        with:
+          script: |
+            const fs = require("fs");
+            for (const tag of process.env.TAGS.split(/\s+/).filter(Boolean)) {
+              if (!/^v[0-9.]+$/.test(tag)) { core.warning(`skip ${tag}`); continue; }
+              const f = `release-notes/${tag}.md`;
+              if (!fs.existsSync(f)) { core.warning(`no ${f}`); continue; }
+              const { data: rel } = await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+              await github.rest.repos.updateRelease({ ...context.repo, release_id: rel.id, body: fs.readFileSync(f, "utf8") });
+              core.info(`updated ${tag}`);
+            }
