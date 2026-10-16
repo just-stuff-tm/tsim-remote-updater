@@ -75,7 +75,7 @@ const HISTORY_MAX = 50;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const COOKIE = "tsim_session";
 const SCHEDULE_CHOICES = [0, 6, 12, 24, 168];
-const CMD_MAX_PENDING = 10, CMD_HISTORY = 30, CMD_MAX_LEN = 120, CMD_OUT_MAX = 2000;
+const CMD_MAX_PENDING = 10, CMD_HISTORY = 80, CFG_MAX_QUEUE = 40, CMD_MAX_LEN = 120, CMD_OUT_MAX = 2000;
 // Console commands that can wipe or detach a repeater: need an explicit confirm (force).
 export const RISKY_CMD_RE = /^(erase|start ota|password|set (freq|radio|bw|sf|cr|tx|af)|set prv\.key|neighbor\.remove|clear)/i;
 const PS_NOTE = "Console unavailable while the repeater is in power saving (its serial CLI is not answering)";
@@ -535,6 +535,15 @@ async function handleIngest(request, env, id) {
       a.error = adc.error || null; a.at = entry.received_at;
       await putJson(env, `adc:${id}`, a);
     }
+    const rs = c && c.cfg ? parseSettingReply(c.cmd, t.error && !out ? "" : out) : null;
+    if (rs) {
+      const cv = (await kvJson(env, `rptcfg:${id}`)) || {}, prevV = cv[rs.key] || {};
+      if (rs.op === "get") cv[rs.key] = rs.value != null ? { value: rs.value, at: entry.received_at } : { ...prevV, unsupported: !!rs.unsupported, error: rs.error || null, at: entry.received_at, value: rs.unsupported ? null : prevV.value };
+      else if (rs.ok) cv[rs.key] = { value: c.val ?? prevV.value ?? null, at: entry.received_at, set: true, msg: rs.key.includes("password") ? "" : rs.msg };
+      else cv[rs.key] = { ...prevV, unsupported: !!rs.unsupported, error: rs.unsupported ? null : rs.error, at: entry.received_at };
+      if (rs.key === "password") { delete cv.password.value; c.cmd = "password ••••••"; c.output = rs.ok ? "OK (password hidden)" : c.output; await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
+      await putJson(env, `rptcfg:${id}`, cv);
+    }
     if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
     else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
     else if (!t.error && ran === "powersaving on" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving on");
@@ -600,6 +609,112 @@ async function setPowersaving(env, id, on, source) {
   await putJson(env, `state:${id}`, st);
   await logActivity(env, id, { type: "event", msg: `Heltec power saving ${on === null ? "unknown (no CLI reply since the firmware change)" : on ? "ON: console and mesh polling paused" : "off: console and mesh polling available"} (${source})` });
 }
+
+// ---------- repeater settings (MeshCore CLI get/set, https://docs.meshcore.io/cli_commands/) ----------
+// Radio presets: official MeshCore list from the app config API https://api.meshcore.nz/api/v1/config (fetched 2026-10-16).
+export const RADIO_PRESETS = [
+  ["Americas", [["USA", 910.525, 62.5, 7, 5], ["USA - Southern California", 927.875, 62.5, 7, 5, 3], ["Canada", 910.525, 62.5, 7, 5, 3], ["Costa Rica", 910.525, 125, 11, 5], ["Brazil", 923.125, 62.5, 8, 8]]],
+  ["Europe 868 MHz", [["EU/UK (Narrow)", 869.618, 62.5, 8, 8], ["EU/UK (Deprecated)", 869.525, 250, 11, 5], ["Czech Republic (Narrow)", 869.432, 62.5, 7, 5, 2], ["Hungary", 869.618, 62.5, 7, 5, 2], ["Netherlands", 869.618, 62.5, 7, 5], ["Netherlands (Limburg)", 869.618, 62.5, 8, 8, 2], ["Portugal 868", 869.618, 62.5, 7, 6], ["Slovakia", 869.618, 62.5, 7, 5, 2], ["Switzerland", 869.618, 62.5, 8, 8]]],
+  ["Europe 433 MHz", [["EU 433MHz (Long Range)", 433.65, 250, 11, 5], ["EU 433MHz (Narrow)", 433.65, 62.5, 8, 8], ["Portugal 433", 433.375, 62.5, 9, 6]]],
+  ["Australia & New Zealand", [["Australia", 915.8, 250, 10, 5], ["Australia (Narrow)", 916.575, 62.5, 7, 7], ["Australia (Mid)", 915.075, 125, 9, 5], ["Australia: SA, WA", 923.125, 62.5, 8, 8], ["Australia: QLD", 923.125, 62.5, 8, 5], ["New Zealand (Narrow)", 917.375, 62.5, 7, 5, 2], ["New Zealand (Gisborne)", 917.375, 250, 11, 5, 1]]],
+  ["Asia", [["Vietnam (Narrow)", 920.25, 62.5, 8, 5], ["Vietnam (Deprecated)", 920.25, 250, 11, 5]]],
+];
+const ONOFF = [["on", "On"], ["off", "Off"]];
+// type: text | num | sel | radio | secret ; ro = read-only ; risk = strong warning ; typed = typed confirmation word
+export const RPT_SETTINGS = [
+  { cat: "Identity", items: [
+    { k: "name", label: "Node name", type: "text", max: 31, help: "Shown in adverts. Up to 23 bytes when location is shared, 31 otherwise." },
+    { k: "owner.info", label: "Owner info", type: "text", max: 90, help: "Free text; | becomes a new line. Firmware 1.12+." },
+    { k: "role", label: "Role", ro: true }, { k: "public.key", label: "Public key", ro: true, mono: true } ] },
+  { cat: "Location", note: "Coordinates in adverts are public. The Repeater location card can copy the T-SIM's GPS position here.", items: [
+    { k: "lat", label: "Latitude", type: "num", min: -90, max: 90, step: 0.000001, unit: "°" },
+    { k: "lon", label: "Longitude", type: "num", min: -180, max: 180, step: 0.000001, unit: "°" } ] },
+  { cat: "Radio", risk: true, note: "Wrong radio settings take the repeater off your mesh, and you may then only be able to fix it here or over USB. Radio changes apply after the radio restarts (Reboot radio at the top of this tab).", items: [
+    { k: "radio", label: "Frequency / bandwidth / SF / CR", type: "radio", risk: true },
+    { k: "tx", label: "Transmit power", type: "num", min: 1, max: 22, step: 1, unit: "dBm", risk: true, help: "LoRa chip power only; boards with an amplifier transmit more. Stay within your local legal limit." },
+    { k: "radio.rxgain", label: "RX boosted gain", type: "sel", opts: ONOFF, help: "SX12xx/LR1110, firmware 1.14.1+." },
+    { k: "radio.fem.rxgain", label: "Front-end RX gain (LNA)", type: "sel", opts: ONOFF, help: "Only on boards with an external front end." },
+    { k: "radio.fem.txgain", label: "Front-end TX gain", type: "sel", opts: ONOFF, risk: true, help: "Only on boards with an external front end (e.g. Station G3)." } ] },
+  { cat: "Repeating & routing", items: [
+    { k: "repeat", label: "Repeat packets", type: "sel", opts: ONOFF, risk: true, help: "Off = the node stops relaying for the mesh." },
+    { k: "path.hash.mode", label: "Advert path hash size", type: "sel", opts: [["0", "1 byte (max 64 hops)"], ["1", "2 bytes (max 32 hops)"], ["2", "3 bytes (max 21 hops)"]], risk: true, help: "Firmware 1.14+. Nodes on 1.13 or older drop 2-3 byte paths." },
+    { k: "loop.detect", label: "Loop detection", type: "sel", opts: [["off", "Off"], ["minimal", "Minimal"], ["moderate", "Moderate"], ["strict", "Strict"]] },
+    { k: "flood.max", label: "Max flood hops", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
+    { k: "flood.max.unscoped", label: "Max hops, unscoped floods", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
+    { k: "flood.max.advert", label: "Max hops, advert floods", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
+    { k: "multi.acks", label: "Multi-acks", type: "sel", opts: [["1", "On"], ["0", "Off"]] } ] },
+  { cat: "Timing & airtime", items: [
+    { k: "txdelay", label: "Flood retransmit delay factor", type: "num", min: 0, max: 2, step: 0.1, unit: "×" },
+    { k: "direct.txdelay", label: "Direct retransmit delay factor", type: "num", min: 0, max: 2, step: 0.1, unit: "×" },
+    { k: "rxdelay", label: "Receive delay base (experimental)", type: "num", min: 0, max: 20, step: 0.1 },
+    { k: "dutycycle", label: "Duty cycle limit", type: "num", min: 1, max: 100, step: 1, unit: "%", help: "Firmware 1.15+. EU 868: usually 10% or less." },
+    { k: "int.thresh", label: "Interference threshold", type: "num", min: 0, max: 100, step: 1 },
+    { k: "cad", label: "Channel activity detection", type: "sel", opts: ONOFF },
+    { k: "agc.reset.interval", label: "AGC reset interval", type: "num", min: 0, max: 1020, step: 4, unit: "s", help: "0 = off; rounded down to a multiple of 4." } ] },
+  { cat: "Adverts", items: [
+    { k: "flood.advert.interval", label: "Flood advert every", type: "num", min: 3, max: 168, step: 1, unit: "h" },
+    { k: "advert.interval", label: "Zero-hop advert every", type: "num", min: 0, max: 240, step: 2, unit: "min", help: "60–240, or 0 for off." } ] },
+  { cat: "Power & battery", items: [
+    { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, help: "On = the repeater sleeps between transmissions and stops answering this dashboard's console." },
+    { k: "adc.multiplier", label: "Battery multiplier", ro: true, help: "Calibrate it from a multimeter reading in Repeater battery calibration." } ] },
+  { cat: "Passwords", risk: true, note: "Anyone who knows these can log in to the repeater over the mesh. Passwords are sent over SMS/LTE to the T-SIM and stored in this dashboard's command history.", items: [
+    { k: "guest.password", label: "Guest password", type: "secret", max: 60, risk: true },
+    { k: "password", label: "Admin password (change only)", type: "secret", max: 60, wo: true, risk: true, typed: "CHANGE", help: "Can't be read back. Default on new nodes: password." } ] },
+];
+export const RPT_INDEX = Object.fromEntries(RPT_SETTINGS.flatMap((c) => c.items.map((i) => [i.k, { ...i, cat: c.cat }])));
+export const rptGetCmd = (k) => (k === "powersaving" ? "powersaving" : "get " + k);
+export const RPT_READ_KEYS = Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => i.k);
+// Parse a reply to a settings get/set command: { key, op, value?, unsupported?, error? } or null.
+export function parseSettingReply(cmd, out) {
+  const c = String(cmd || "").trim(); let m, key, op;
+  if (/^powersaving$/i.test(c)) { key = "powersaving"; op = "get"; }
+  else if ((m = c.match(/^powersaving (on|off)$/i))) { key = "powersaving"; op = "set"; }
+  else if ((m = c.match(/^password\s/i))) { key = "password"; op = "set"; }
+  else if ((m = c.match(/^(get|set) (\S+)/i)) && RPT_INDEX[m[2].toLowerCase()]) { key = m[2].toLowerCase(); op = m[1].toLowerCase(); }
+  else return null;
+  const r = cleanCli(out);
+  if (!r) return { key, op, error: "No reply from the repeater" };
+  if (/unsupported|unknown (config|command)|^\?\?|not supported/i.test(r)) return { key, op, unsupported: true };
+  if (/^(error|err\b|err -)/i.test(r) || /\berror\b/i.test(r) && !/^ok/i.test(r)) return { key, op, error: r.slice(0, 120) };
+  if (op === "set") return { key, op, ok: true, msg: key === "password" ? "Admin password changed" : r.slice(0, 120) };
+  let v = r.replace(/^>\s*/, "").trim();
+  if (key === "powersaving") { const p = v.match(/\b(on|off)\b/i); v = p ? p[1].toLowerCase() : v; }
+  return { key, op, value: v.slice(0, 200) };
+}
+const fmtNum = (n) => String(+(+n).toFixed(6));
+// Validate one change and build its CLI command. Throws Error(plain text).
+export function buildSettingCmd(k, v) {
+  const s = RPT_INDEX[k]; if (!s || s.ro) throw new Error(`"${k}" can't be changed here`);
+  const label = s.label;
+  if (s.type === "radio") {
+    const p = String(v).split(",").map((x) => +x);
+    if (p.length !== 4 || p.some((x) => !Number.isFinite(x))) throw new Error("Radio needs frequency, bandwidth, SF and CR");
+    const [f, bw, sf, cr] = p;
+    if (!(f >= 300 && f <= 2500)) throw new Error("Frequency must be 300–2500 MHz");
+    if (!(bw >= 7.8 && bw <= 500)) throw new Error("Bandwidth must be 7.8–500 kHz");
+    if (!(Number.isInteger(sf) && sf >= 5 && sf <= 12)) throw new Error("Spreading factor must be 5–12");
+    if (!(Number.isInteger(cr) && cr >= 5 && cr <= 8)) throw new Error("Coding rate must be 5–8");
+    return `set radio ${fmtNum(f)},${fmtNum(bw)},${sf},${cr}`;
+  }
+  if (s.type === "num") {
+    const n = Number(v); if (v === "" || v == null || !Number.isFinite(n) || n < s.min || n > s.max) throw new Error(`${label} must be ${s.min}–${s.max}${s.unit ? " " + s.unit : ""}`);
+    if (k === "advert.interval" && n > 0 && n < 60) throw new Error("Zero-hop advert interval must be 60–240 min, or 0 for off");
+    return `set ${k} ${fmtNum(n)}`;
+  }
+  if (s.type === "sel") {
+    const x = String(v); if (!s.opts.some((o) => o[0] === x)) throw new Error(`Pick a value for ${label}`);
+    return k === "powersaving" ? `powersaving ${x}` : `set ${k} ${x}`;
+  }
+  const t = String(v ?? "");
+  if (!/^[\x20-\x7e]*$/.test(t)) throw new Error(`${label}: use plain letters, numbers and symbols (no emoji or accents)`);
+  if (t.length > s.max) throw new Error(`${label} is too long (max ${s.max})`);
+  if (k === "password") { if (t.length < 4 || /\s/.test(t)) throw new Error("Admin password: at least 4 characters, no spaces"); return `password ${t}`; }
+  if (k === "name" && !t.trim()) throw new Error("Node name can't be empty");
+  return `set ${k} ${t}`.trimEnd();
+}
+export const RPT_ACTIONS = { advert: "Send a flood advert", "advert.zerohop": "Send a zero-hop advert" };
+// Firmware runs at most this many queued commands per wake (CMD_MAX_RUN in firmware/src/main.cpp).
+export const CMDS_PER_WAKE = 10;
 
 // ---------- Heltec (repeater) battery calibration via MeshCore "adc.multiplier" ----------
 export const ADC_UNSUPPORTED = "This repeater's firmware/board doesn't support battery calibration (it answered \"Error: unsupported\"). Stock MeshCore for the Heltec V3 doesn't implement it yet; the reading can only be corrected in firmware.";
@@ -754,7 +869,7 @@ export function locProgress(req, cmds = []) {
   return { ...res, state: cs.some((c) => c.status === "sent") ? "sending" : "queued" };
 }
 // Console history shows only what the user typed (system commands still drive state, they're just hidden).
-export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.unsolicited && !isSysCmd(c.cmd));
+export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.cfg && !c.unsolicited && !isSysCmd(c.cmd));
 // T-SIM pulls queued console commands (text/plain, one "<id>\t<command>" per line). Marks them sent.
 async function handleDeviceCommands(request, env, id) {
   const dev = await getDevice(env, id);
@@ -968,11 +1083,13 @@ async function deviceApi(request, env, dev, action) {
     const schedule = scheduleInfo(settings.schedule_hours, s);
     const pq = (cmds || []).find((c) => /^pwrcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const [gps, gcfg, greq, lreq, nicks, adcSt] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`), kvJson(env, `adc:${id}`)]);
+    const rptq = {}; for (const c of cmds || []) if (c.cfg && (c.status === "queued" || c.status === "sent")) { const ps = parseSettingReply(c.cmd, "x"); if (ps && !rptq[ps.key]) rptq[ps.key] = c.status; }
+    const rptVals = (await kvJson(env, `rptcfg:${id}`)) || {};
     const adcq = (cmds || []).filter((c) => /^(get|set) adc\.multiplier\b/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ rpt: { vals: rptVals, queued: rptq }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1077,6 +1194,45 @@ async function deviceApi(request, env, dev, action) {
     let wake = null;
     if (b.wake === true) { const [o, c] = await manualSend(env, dev, "CMD", "CMD (console)"); wake = { ...o, status: c }; }
     return json({ queued: entry, wake });
+  }
+  if (action === "rpt-read" || action === "rpt-save" || action === "rpt-action") {
+    const settings = await getSettings(env, id);
+    if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; repeater settings use it." }, 403);
+    if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE + ". Turn power saving off first.", powersaving: true }, 409);
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    const queuedCmds = new Set(list.filter((c) => c.status === "queued").map((c) => c.cmd));
+    let add = [];
+    if (action === "rpt-read") {
+      const keys = Array.isArray(b.keys) && b.keys.length ? b.keys.map(String) : RPT_READ_KEYS;
+      for (const k of keys) { if (!RPT_READ_KEYS.includes(k)) return json({ error: `Unknown setting "${k}"` }, 400); const cmd = rptGetCmd(k); if (!queuedCmds.has(cmd)) add.push({ cmd }); }
+      if (!add.length) return json({ queued: 0, note: "already queued" });
+    } else if (action === "rpt-save") {
+      const ch = b.changes && typeof b.changes === "object" ? Object.entries(b.changes) : [];
+      if (!ch.length) return json({ error: "Nothing to change" }, 400);
+      if (ch.length > CFG_MAX_QUEUE) return json({ error: "Too many changes at once" }, 400);
+      const errs = [];
+      for (const [k, v] of ch) {
+        let cmd; try { cmd = buildSettingCmd(k, v); } catch (e) { errs.push(e.message); continue; }
+        if (cmd.length > CMD_MAX_LEN) { errs.push(`${RPT_INDEX[k].label} is too long`); continue; }
+        const s = RPT_INDEX[k];
+        if (s.risk && b.risk_ok !== true) return json({ error: `${s.label} is a risky change and needs confirmation`, risky: true }, 409);
+        if (s.typed && String(b.typed || "").trim().toUpperCase() !== s.typed) return json({ error: `Type ${s.typed} to confirm the ${s.label.toLowerCase()}`, typed: s.typed }, 409);
+        add.push({ cmd, val: s.wo ? undefined : (s.type === "sel" ? String(v) : s.type === "num" ? String(+v) : String(v)) });
+      }
+      if (errs.length) return json({ error: errs.join(". ") }, 400);
+      add.sort((x, y) => (/^powersaving on/.test(x.cmd) ? 1 : 0) - (/^powersaving on/.test(y.cmd) ? 1 : 0));  // power saving last, so the rest still runs
+    } else {
+      if (!RPT_ACTIONS[b.act]) return json({ error: "Unknown action" }, 400);
+      add = [{ cmd: b.act }];
+    }
+    if (list.filter((c) => c.status === "queued").length + add.length > CFG_MAX_QUEUE) return json({ error: `Too many queued commands (max ${CFG_MAX_QUEUE}). Wait for the current ones or cancel them in Repeater console.` }, 429);
+    const now = new Date().toISOString();
+    for (const a of add) list.unshift({ id: randomHex(4), cmd: a.cmd, status: "queued", queued_at: now, cfg: action !== "rpt-action", ...(a.val !== undefined ? { val: a.val } : {}) });
+    await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await logActivity(env, id, { type: "action", msg: action === "rpt-read" ? `Repeater settings: reading ${add.length} value(s)` : action === "rpt-save" ? `Repeater settings: ${add.map((a) => a.cmd.startsWith("password") || a.cmd.includes("guest.password") ? a.cmd.split(" ").slice(0, 2).join(" ") + " ••••" : a.cmd).join("; ").slice(0, 200)}` : `Repeater: ${RPT_ACTIONS[b.act]}` });
+    const [o, c] = await manualSend(env, dev, "CMD", "CMD (repeater settings)");
+    return json({ queued: add.length, wakes_needed: Math.ceil((list.filter((x) => x.status === "queued").length) / CMDS_PER_WAKE), wake: { ...o, status: c } });
   }
   if (action === "adc-cal") {
     const settings = await getSettings(env, id);
@@ -1389,6 +1545,9 @@ a{color:var(--acc)}a.dev{color:inherit;text-decoration:none;display:block}a.dev:
 details.card{margin:10px 0;padding:0}details.card>summary{cursor:pointer;padding:14px;list-style:none;display:flex;justify-content:space-between;gap:8px}
 details.card>summary::after{content:"▸";color:var(--mut)}details[open].card>summary::after{content:"▾"}details.card>.in{padding:0 14px 14px}
 .sens{filter:blur(5px);user-select:none;transition:filter .15s}.showsens .sens{filter:none;user-select:auto}.eye{border:0;background:none;padding:0 2px;cursor:pointer;font-size:13px;width:auto;min-width:0}
+.term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:10px 12px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}.term .pr{color:#3fb950}.term .ts{color:#8b949e;font-size:11px}.term .to{color:#e6edf3;margin:0 0 6px 14px}.term .te{color:#ff7b72;margin:0 0 6px 14px}
+.term-in{background:#0d1117;border-radius:8px;padding:4px 8px;align-items:center}.term-in .pr{color:#3fb950;font-family:ui-monospace,monospace}.term-in input{background:transparent;color:#e6edf3;border:0;flex:1}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.rscat{margin-top:10px}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
 .psnote{background:#d1242f1a;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px;font-size:13px}.dim{opacity:.45}
 .tog{display:flex;gap:8px;align-items:center;margin:8px 0;color:var(--fg);font-size:15px}.tog input{width:auto;margin:0}
 pre.o{margin:0;max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px}code{font-size:12px}
@@ -1516,6 +1675,16 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Packets</h3><div id="m-pkt"></div></div>
 </div>
 <div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><p class="small mut" style="margin:0 0 6px">The repeater only reports short node IDs. Press ✎ to give a node a name (saved on this dashboard).</p><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
+<section><h2>Repeater settings</h2><div class="card">
+<p class="small mut" style="margin-top:0">View and change the repeater's MeshCore settings. Values are read and changed through the repeater console (one text wakes the T-SIM; it runs up to 10 commands per wake). Changed fields are highlighted; only changed values are sent. Prefer typing commands? Use Repeater console below.</p>
+<p class="psnote" id="rsps" hidden>Not available while the repeater is in power saving: its command line isn't answering. ${PS_HTML}</p>
+<p class="psnote" id="rscon" hidden>Turn on "Allow console commands" under Repeater console below to use repeater settings.</p>
+<div class="acts" style="margin-top:0"><button type="button" id="rsreadall">Read all</button><button type="button" id="rssave" class="w" disabled>Save changes</button>
+<button type="button" class="g" data-rsact="advert">Send flood advert</button><button type="button" class="g" data-rsact="advert.zerohop">Send zero-hop advert</button></div>
+<div id="rsq" class="small"></div><span id="rsmsg" class="msg"></span>
+<div id="rsgrid"></div>
+<p class="small mut">Battery multiplier: use <a href="#" onclick="document.getElementById('adcbox').open=true;document.getElementById('adcbox').scrollIntoView();return false">Repeater battery calibration</a>. Not shown here on purpose: factory reset (erase), private key, OTA, regions and ACL (use the console).</p>
+</div></section>
 <section><h2>Settings</h2>
 <details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
 <label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
@@ -1556,10 +1725,10 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" id="conon"> Allow console commands for this repeater</label>
 <p class="small mut">Commands run on the repeater's MeshCore command line the next time the T-SIM wakes. "Queue &amp; wake" texts the T-SIM so they run within a few minutes. Examples: <code>ver</code> <code>neighbors</code> <code>stats-packets</code> <code>get name</code> <code>clock</code></p>
 <p class="psnote" id="conps" hidden>The console is unavailable while the repeater is in power saving. It comes back after <code>powersaving off</code> or any successful reply, e.g. after Request status. ${PS_HTML}</p>
-<div id="conui"><form id="conf" class="row"><input id="cmd" maxlength="120" placeholder="MeshCore CLI command" autocapitalize="none" autocomplete="off">
+<div id="conui"><div class="row" style="margin-bottom:6px"><select id="clipick" class="mono"><option value="">Insert a command…</option><option value="ver">ver</option><option value="board">board</option><option value="clock">clock</option><option value="clock sync">clock sync</option><option value="neighbors">neighbors</option><option value="discover.neighbors">discover.neighbors</option><option value="stats-core">stats-core</option><option value="stats-radio">stats-radio</option><option value="stats-packets">stats-packets</option><option value="clear stats">clear stats</option><option value="advert">advert</option><option value="advert.zerohop">advert.zerohop</option><option value="powersaving">powersaving</option><option value="powersaving on">powersaving on</option><option value="powersaving off">powersaving off</option><option value="get name">get name</option><option value="get owner.info">get owner.info</option><option value="get role">get role</option><option value="get public.key">get public.key</option><option value="get lat">get lat</option><option value="get lon">get lon</option><option value="get radio">get radio</option><option value="get tx">get tx</option><option value="get radio.rxgain">get radio.rxgain</option><option value="get radio.fem.rxgain">get radio.fem.rxgain</option><option value="get radio.fem.txgain">get radio.fem.txgain</option><option value="get repeat">get repeat</option><option value="get path.hash.mode">get path.hash.mode</option><option value="get loop.detect">get loop.detect</option><option value="get txdelay">get txdelay</option><option value="get direct.txdelay">get direct.txdelay</option><option value="get rxdelay">get rxdelay</option><option value="get dutycycle">get dutycycle</option><option value="get int.thresh">get int.thresh</option><option value="get cad">get cad</option><option value="get agc.reset.interval">get agc.reset.interval</option><option value="get multi.acks">get multi.acks</option><option value="get flood.max">get flood.max</option><option value="get flood.max.unscoped">get flood.max.unscoped</option><option value="get flood.max.advert">get flood.max.advert</option><option value="get flood.advert.interval">get flood.advert.interval</option><option value="get advert.interval">get advert.interval</option><option value="get guest.password">get guest.password</option><option value="get adc.multiplier">get adc.multiplier</option><option value="get acl">get acl</option><option value="get bridge.type">get bridge.type</option><option value="get pwrmgt.support">get pwrmgt.support</option><option value="get pwrmgt.source">get pwrmgt.source</option><option value="get pwrmgt.bootreason">get pwrmgt.bootreason</option><option value="get pwrmgt.bootmv">get pwrmgt.bootmv</option><option value="get bootloader.ver">get bootloader.ver</option><option value="set name ">set name</option><option value="set owner.info ">set owner.info</option><option value="set lat ">set lat</option><option value="set lon ">set lon</option><option value="set tx ">set tx</option><option value="set repeat on">set repeat on</option><option value="set repeat off">set repeat off</option><option value="set txdelay ">set txdelay</option><option value="set dutycycle ">set dutycycle</option><option value="set flood.max ">set flood.max</option><option value="set flood.advert.interval ">set flood.advert.interval</option><option value="set advert.interval ">set advert.interval</option><option value="set radio ">set radio</option><option value="tempradio ">tempradio</option><option value="setperm ">setperm</option><option value="region">region</option><option value="region list allowed">region list allowed</option><option value="region list denied">region list denied</option><option value="region get *">region get *</option><option value="region home">region home</option><option value="region default">region default</option><option value="region save">region save</option><option value="log start">log start</option><option value="log stop">log stop</option><option value="log erase">log erase</option><option value="gps">gps</option><option value="gps advert">gps advert</option><option value="sensor list">sensor list</option><option value="eth.status">eth.status</option><option value="time ">time</option></select><small class="mut">↑/↓ recalls your previous commands</small></div><form id="conf" class="row term-in"><span class="pr">$</span><input id="cmd" class="mono" maxlength="120" placeholder="MeshCore CLI command" autocapitalize="none" autocomplete="off" spellcheck="false">
 <button type="submit" class="g">Queue</button><button type="button" id="qwake">Queue &amp; wake</button></form>
 <div class="row small" style="margin:8px 0"><span id="conmsg" class="msg"></span><span><button type="button" id="wake" class="g sm">Wake to run queued</button> <button type="button" id="cancel" class="g sm">Cancel queued</button></span></div>
-<div class="tw"><table><thead><tr><th>Command</th><th>Status</th><th>Reply</th></tr></thead><tbody id="cmds"></tbody></table></div></div></div></details>
+<div class="term" id="cmds"></div></div></div></details>
 </section>
 </div>
 
@@ -1677,8 +1846,8 @@ async function load(){unitsBtn();
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
  if(PS)$("consum").textContent="paused (power saving)";
- showAdc(d);
- const CM=(d.commands||[]).filter(c=>!c.sys&&!c.unsolicited);$("cmds").innerHTML=CM.length?CM.map(c=>'<tr><td><code>'+e(c.sys?"T-SIM update":c.cmd)+'</code><br><small class="mut">'+e(t(c.done_at||c.sent_at||c.queued_at))+'</small></td><td>'+e(c.status)+'</td><td><pre class="o">'+e(c.output||c.error||"")+'</pre></td></tr>').join(""):'<tr><td colspan=3 class="mut">No commands yet</td></tr>';
+ showAdc(d);showRpt(d);
+ const CM=(d.commands||[]).filter(c=>!c.sys&&!c.unsolicited);const tm=$("cmds"),atB=tm.scrollHeight-tm.scrollTop-tm.clientHeight<30;tm.innerHTML=CM.length?CM.slice().reverse().map(c=>'<div class="tl"><span class="pr">$</span> '+e(c.cmd)+' <span class="ts">'+e(c.status==="done"?t(c.done_at):c.status==="queued"?"queued":c.status==="sent"?"sent, waiting…":c.status)+'</span></div>'+(c.output||c.error?'<div class="'+(c.error?"te":"to")+'">'+e(c.output||c.error)+'</div>':'')).join(""):'<div class="ts">No commands yet. Type one below, or pick from "Insert a command…".</div>';if(atB)tm.scrollTop=tm.scrollHeight;
  $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"Status report":""))+'</td></tr>').join("")||'<tr><td colspan=3 class="mut">No activity yet</td></tr>';
  clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
 }
@@ -1736,7 +1905,7 @@ $("schsave").onclick=async()=>{const h=$("schon").checked?+$("sch").value:0;
 $("conon").onchange=async ev=>{const on=ev.target.checked;
  if(on&&!confirm("Allow console commands for this repeater? Anyone with this login can then run MeshCore CLI commands on it."))return void(ev.target.checked=false);
  const r=await post("settings",{console_enabled:on});if(!r.ok){ev.target.checked=!on;toast(friendly(await rj(r),r.status),"bad")}else toast("Console "+(on?"on":"off"),"ok");load();};
-async function queue(wake,force){const c=$("cmd").value.trim();if(!c)return;
+async function queue(wake,force){const c=$("cmd").value.trim();if(!c)return;cliRemember(c);
  if(wake&&!confirm("Queue '"+c+"' and text the T-SIM to run it now?"))return;
  const r=await post("commands",{cmd:c,wake,force:!!force});const j=await rj(r);
  if(r.status===409&&j.risky){if(confirm("'"+c+"' can change or wipe the repeater's settings. Queue it anyway?"))return queue(wake,true);return}
@@ -1765,6 +1934,66 @@ $("adcf").onsubmit=async ev=>{ev.preventDefault();const mv=+ev.target.mv.value;c
  if(!r.ok)return say("adcmsg",false,j.error||friendly(j,r.status));const p=j.preview;
  adcPost({op:"set",meter_v:mv},"Set the repeater's battery multiplier from "+p.current.toFixed(3)+" to "+p.new_mult.toFixed(3)+" (repeater "+p.reported_v.toFixed(2)+" V, meter "+p.meter_v.toFixed(2)+" V)? One text is sent now.")};
 $("adcreset").onclick=()=>adcPost({op:"reset"},"Reset the repeater's battery multiplier to the board default? One text is sent now.");
+const RS=${JSON.stringify(RPT_SETTINGS)},RP=${JSON.stringify(RADIO_PRESETS)},PERWAKE=${CMDS_PER_WAKE};
+let RV={},RQ={},RLOAD=false;
+const rsId=k=>"rs-"+k;
+function rsInput(i){const id=rsId(i.k);
+ if(i.ro)return '<div class="rsro'+(i.mono?' mono':'')+'" id="'+id+'">—</div>';
+ if(i.type==="sel")return '<select id="'+id+'" data-k="'+i.k+'"><option value="">—</option>'+i.opts.map(o=>'<option value="'+e(o[0])+'">'+e(o[1])+'</option>').join("")+'</select>';
+ if(i.type==="num")return '<span class="rsnum"><input id="'+id+'" data-k="'+i.k+'" type="number" min="'+i.min+'" max="'+i.max+'" step="'+i.step+'">'+(i.unit?'<small class="mut">'+e(i.unit)+'</small>':'')+'</span>';
+ if(i.type==="radio")return '<select id="rs-preset" data-k="radio"><option value="">Preset… (or enter values below)</option>'+RP.map(g=>'<optgroup label="'+e(g[0])+'">'+g[1].map(p=>'<option value="'+p.slice(1,5).join(",")+'" data-ph="'+(p[5]||"")+'">'+e(p[0])+' · '+p[1]+' MHz / '+p[2]+' kHz / SF'+p[3]+' / CR'+p[4]+'</option>').join("")+'</optgroup>').join("")+'</select>'+
+  '<div class="rsradio"><label>Freq (MHz)<input id="rs-radio-f" data-k="radio" type="number" min="300" max="2500" step="0.001"></label><label>BW (kHz)<select id="rs-radio-bw" data-k="radio"><option value=""></option>'+["7.8","10.4","15.6","20.8","31.25","41.7","62.5","125","250","500"].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>SF<select id="rs-radio-sf" data-k="radio"><option value=""></option>'+[5,6,7,8,9,10,11,12].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>CR<select id="rs-radio-cr" data-k="radio"><option value=""></option>'+[5,6,7,8].map(x=>'<option>'+x+'</option>').join("")+'</select></label></div><div id="rs-phnote" class="small mut"></div>';
+ return '<input id="'+id+'" data-k="'+i.k+'" type="'+(i.type==="secret"?"password":"text")+'" maxlength="'+i.max+'" autocomplete="off" autocapitalize="none"'+(i.wo?' placeholder="new password"':'')+'>'}
+function rsBuild(){$("rsgrid").innerHTML=RS.map((c,ci)=>'<details class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
+ c.items.map(i=>'<div class="rsrow"><div class="rsl">'+e(i.label)+(i.risk?' <span class="warn" title="Risky change">⚠</span>':'')+'</div><div class="rsi">'+rsInput(i)+'</div><div class="small" id="rsst-'+i.k+'"></div>'+(i.help?'<div class="small mut">'+e(i.help)+'</div>':'')+'</div>').join("")+
+ '<button type="button" class="g sm" data-rsread="'+ci+'">Read this group</button></div></details>').join("");
+ $("rsgrid").addEventListener("input",ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(!k)return;
+  if(ev.target.id==="rs-preset"){const v=ev.target.value;if(v){const p=v.split(",");["f","bw","sf","cr"].forEach((x,j)=>$("rs-radio-"+x).value=x==="bw"?String(+p[j]):p[j]);const ph=ev.target.selectedOptions[0].dataset.ph;
+   $("rs-phnote").textContent=ph?"This mesh also uses a "+ph+"-byte path hash (Repeating & routing › Advert path hash size = "+(ph-1)+"). Change it separately if you want to match.":""}}
+  else if(k==="radio")$("rs-preset").value="";rsDirty()});
+ $("rsgrid").addEventListener("click",ev=>{const b=ev.target.closest("[data-rsread]");if(b)rsRead(RS[+b.dataset.rsread].items.filter(i=>!i.wo).map(i=>i.k),RS[+b.dataset.rsread].cat)})}
+function rsCur(i){if(i.type==="radio"){const p=["f","bw","sf","cr"].map(x=>$("rs-radio-"+x).value.trim());return p.every(x=>x!=="")?p.join(","):""}const el=$(rsId(i.k));return el?el.value.trim():""}
+function rsNorm(i,v){v=String(v??"").trim();if(v==="")return"";if(i.type==="num")return String(+v);if(i.type==="radio")return v.split(",").map(x=>String(+x)).join(",");if(i.type==="sel")return v.toLowerCase();return v}
+function rsChanges(){const ch=[];for(const c of RS)for(const i of c.items){if(i.ro)continue;const cur=rsCur(i),rv=RV[i.k]&&RV[i.k].value;
+ if(cur==="")continue;if(i.wo||rsNorm(i,cur)!==rsNorm(i,rv))ch.push(i)}return ch}
+function rsDirty(){const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
+ document.querySelectorAll(".rsrow").forEach(r=>r.classList.remove("dirty"));rsChanges().forEach(i=>{const el=$(i.type==="radio"?"rs-preset":rsId(i.k));el&&el.closest(".rsrow").classList.add("dirty")})}
+function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);RV=R.vals||{};RQ=R.queued||{};
+ if(!RLOAD){rsBuild();RLOAD=true}
+ $("rsps").hidden=!PS;$("rscon").hidden=!!S.console_enabled||PS;const off=PS||!S.console_enabled;
+ ["rsreadall","rssave"].forEach(x=>$(x).disabled=off||(x==="rssave"&&!rsChanges().length));
+ for(const c of RS)for(const i of c.items){const v=RV[i.k]||{},st=$("rsst-"+i.k),q=RQ[i.k];
+  if(v.value!=null&&!(document.activeElement&&document.activeElement.dataset&&document.activeElement.dataset.k===i.k)){
+   if(i.ro){const el=$(rsId(i.k));el.textContent=v.value}
+   else if(i.type==="radio"){if(!document.querySelector(".rsrow.dirty #rs-preset")){const p=String(v.value).split(",");if(p.length===4){$("rs-radio-f").value=String(+p[0]);$("rs-radio-bw").value=String(+p[1]);$("rs-radio-sf").value=String(+p[2]);$("rs-radio-cr").value=String(+p[3]);
+     const m=[].find.call($("rs-preset").options,o=>o.value&&o.value.split(",").map(Number).join()===p.map(Number).join());$("rs-preset").value=m?m.value:""}}}
+   else if(!i.wo){const el=$(rsId(i.k));if(el&&!el.closest(".rsrow").classList.contains("dirty"))el.value=i.type==="sel"?String(v.value).toLowerCase():i.type==="num"?String(+v.value):v.value}}
+  st.innerHTML=q?'<span class="mut">⏳ '+(q==="sent"?"sent to the T-SIM, waiting for the reply":"queued for the next wake")+'</span>':v.unsupported?'<span class="mut">Not supported by this repeater'+(v.at?" · "+e(t(v.at)):"")+'</span>':v.error?'<span class="err">'+e(v.error)+(v.at?" · "+e(t(v.at)):"")+'</span>':v.at?'<span class="mut">'+(v.set?"Changed "+e(t(v.at))+(v.msg?" · "+e(v.msg):""):"Read "+e(t(v.at)))+'</span>':i.wo?"":'<span class="mut">Not read yet</span>'}
+ RS.forEach((c,ci)=>{const ks=c.items.filter(i=>!i.wo).map(i=>i.k),ats=ks.map(k=>RV[k]&&RV[k].at).filter(Boolean).sort();$("rssum"+ci).textContent=ats.length?"read "+ago(ats[ats.length-1]):"not read"});
+ const nq=Object.values(RQ).filter(x=>x==="queued").length,ns=Object.values(RQ).filter(x=>x==="sent").length;
+ $("rsq").innerHTML=nq||ns?(ns?"⏳ "+ns+" sent, waiting for replies. ":"")+(nq?nq+" queued"+(ns?"":' <button type="button" class="g sm" id="rscont">Send next batch (1 text)</button>'):""):"";
+ const cb=$("rscont");if(cb)cb.onclick=async()=>{if(!confirm("Text the T-SIM to run the next "+Math.min(nq,PERWAKE)+" queued settings commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("rsmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load()};
+ rsDirty()}
+async function rsRead(keys,what){const w=Math.ceil(keys.length/PERWAKE);
+ if(!confirm("Read "+(what||"all repeater settings")+"? This queues "+keys.length+" commands and sends one text now."+(w>1?"\\n\\nThe T-SIM runs "+PERWAKE+" commands per wake, so this needs "+w+" wakes: after the first batch, press \\"Send next batch\\" for the rest.":"")))return;
+ const r=await post("rpt-read",{keys});const j=await rj(r);say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(j.queued?"Queued "+j.queued+" reads. "+(j.wake&&j.wake.sent?"Text sent; values appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Already queued."):(j.error||friendly(j,r.status)));load()}
+$("rsreadall").onclick=()=>rsRead(RS.flatMap(c=>c.items.filter(i=>!i.wo).map(i=>i.k)));
+$("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const changes={};ch.forEach(i=>changes[i.k]=rsCur(i));
+ const risky=ch.filter(i=>i.risk),lines=ch.map(i=>"• "+i.label+": "+(i.type==="secret"?"(hidden)":i.type==="radio"?changes[i.k].replace(/,/g," / ")+"  (MHz / kHz / SF / CR)":changes[i.k])+(i.risk?"  ⚠":""));
+ let msg="Send these changes to the repeater now (one text)?\\n\\n"+lines.join("\\n");
+ if(risky.length)msg+="\\n\\n⚠ WARNING: "+risky.map(i=>i.k==="radio"||i.k==="tx"||i.k==="radio.fem.txgain"?"radio changes can drop the repeater off your mesh (applied after a radio restart)":i.k==="powersaving"?"power saving ON stops this dashboard reaching the repeater's console":i.k==="repeat"?"repeat off stops relaying":i.k==="path.hash.mode"?"older nodes drop multi-byte paths":"passwords control who can administer the repeater").filter((x,ix,a)=>a.indexOf(x)===ix).join("; ")+".";
+ if(!confirm(msg))return;
+ let typed="";if(ch.some(i=>i.typed)){typed=prompt("Changing the admin password. Anyone with the old password loses admin access, and the new password is stored in this dashboard's history until it runs.\\n\\nType CHANGE to confirm.")||"";if(typed.trim().toUpperCase()!=="CHANGE")return say("rsmsg",false,"Not sent: admin password change not confirmed.")}
+ const r=await post("rpt-save",{changes,risk_ok:risky.length>0,typed});const j=await rj(r);
+ if(r.ok){ch.forEach(i=>{if(i.type==="secret"){$(rsId(i.k)).value=""}document.querySelectorAll(".rsrow.dirty").forEach(x=>x.classList.remove("dirty"))})}
+ say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?"Queued "+j.queued+" change"+(j.queued>1?"s":"")+". "+(j.wake&&j.wake.sent?"Text sent; results appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status))+(changes.radio?" Radio changes apply after Reboot radio.":""):(j.error||friendly(j,r.status)));load()};
+document.querySelectorAll("[data-rsact]").forEach(b=>b.onclick=async()=>{const a=b.dataset.rsact;if(!confirm(b.textContent+" now? This sends one text."))return;const r=await post("rpt-action",{act:a});const j=await rj(r);say("rsmsg",r.ok,r.ok?(j.wake&&j.wake.sent?"Text sent.":"Queued; wake text not sent."):(j.error||friendly(j,r.status)));load()});
+// terminal console: history + up/down recall
+const CH=()=>{try{return JSON.parse(localStorage.getItem("clihist")||"[]")}catch(x){return[]}};let chi=-1;
+$("cmd").addEventListener("keydown",ev=>{const h=CH();if(ev.key==="ArrowUp"&&h.length){chi=Math.min(chi+1,h.length-1);$("cmd").value=h[chi];ev.preventDefault()}else if(ev.key==="ArrowDown"){chi=Math.max(chi-1,-1);$("cmd").value=chi<0?"":h[chi];ev.preventDefault()}});
+function cliRemember(c){const h=CH().filter(x=>x!==c);h.unshift(c);localStorage.setItem("clihist",JSON.stringify(h.slice(0,50)));chi=-1}
+$("clipick").onchange=ev=>{const v=ev.target.value;if(!v)return;$("cmd").value=v;$("cmd").focus();ev.target.value=""};
+
 $("conf").onsubmit=ev=>{ev.preventDefault();queue(false)};$("qwake").onclick=()=>queue(true);
 $("wake").onclick=async()=>{if(!confirm("Text the T-SIM to run the queued commands?"))return;const r=await post("wake-cmd");const j=await rj(r);say("conmsg",!!j.sent,j.sent?"Text sent. Replies appear within a few minutes.":friendly(j,r.status));load();};
 $("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const j=await rj(r);say("conmsg",r.ok,r.ok?"Cancelled "+j.cancelled+" queued command"+(j.cancelled==1?"":"s"):friendly(j,r.status));load();};

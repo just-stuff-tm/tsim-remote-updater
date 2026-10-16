@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -738,6 +738,55 @@ console.log("tag/asset version ok");
   const ph = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
   assert(ph.includes('id="adcbox"') && ph.includes('id="adcread"'));
   for (const m of ph.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);  // dashboard script parses
-  await P("settings", { console_enabled: false });
   console.log("repeater battery calibration tests OK");
+  // ---------- repeater settings ----------
+  assert.deepEqual(parseSettingReply("get name", "  -> > Hilltop"), { key: "name", op: "get", value: "Hilltop" });
+  assert.deepEqual(parseSettingReply("get radio", "  -> > 910.525,62.5,7,5"), { key: "radio", op: "get", value: "910.525,62.5,7,5" });
+  assert.equal(parseSettingReply("powersaving", "  -> on").value, "on");
+  assert.equal(parseSettingReply("get radio.fem.rxgain", "  -> Error: unsupported").unsupported, true);
+  assert.equal(parseSettingReply("get cad", "  -> ??: get cad").unsupported, true);
+  assert.equal(parseSettingReply("set tx 30", "  -> Error, range is -9 to 30").error.startsWith("Error"), true);
+  assert.equal(parseSettingReply("set tx 20", "  -> OK").ok, true);
+  assert.equal(parseSettingReply("neighbors", "x"), null); assert.equal(parseSettingReply("get prv.key", "x"), null, "private key never parsed");
+  assert.equal(buildSettingCmd("radio", "910.525,62.5,7,5"), "set radio 910.525,62.5,7,5");
+  assert.throws(() => buildSettingCmd("radio", "910,62.5,13,5")); assert.throws(() => buildSettingCmd("tx", 23)); assert.throws(() => buildSettingCmd("advert.interval", 30));
+  assert.equal(buildSettingCmd("advert.interval", 0), "set advert.interval 0"); assert.equal(buildSettingCmd("powersaving", "off"), "powersaving off");
+  assert.equal(buildSettingCmd("multi.acks", "1"), "set multi.acks 1"); assert.throws(() => buildSettingCmd("role", "x")); assert.throws(() => buildSettingCmd("prv.key", "x"));
+  assert.throws(() => buildSettingCmd("name", "café")); assert.equal(buildSettingCmd("password", "s3cret!"), "password s3cret!");
+  const allP = RADIO_PRESETS.flatMap((g) => g[1]); assert.equal(allP.length, 26); assert(allP.some((x) => x[0] === "USA" && x[1] === 910.525 && x[2] === 62.5 && x[3] === 7 && x[4] === 5));
+  await P("settings", { console_enabled: false });
+  assert.equal((await P("rpt-read", {})).status, 403);
+  await P("settings", { console_enabled: true });
+  unthrottle(); h0 = holo;
+  j = await (await P("rpt-read", {})).json(); assert.equal(j.queued, RPT_READ_KEYS.length); assert(j.queued > CMDS_PER_WAKE); assert.equal(holo, h0 + 1, "one text");
+  assert.equal(j.wakes_needed, Math.ceil(RPT_READ_KEYS.length / CMDS_PER_WAKE));
+  assert.equal((await (await P("rpt-read", {})).json()).queued, 0, "no duplicates");
+  let batch = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.equal(batch.length, CMDS_PER_WAKE); assert.equal(batch[0][1], "get name");
+  const reply = { "get name": "  -> > Hilltop", "get owner.info": "  -> > Just Stuff", "get role": "  -> > repeater", "get public.key": "  -> > ABCD", "get lat": "  -> > 40.89", "get lon": "  -> > -77.47", "get radio": "  -> > 910.525,62.5,7,5", "get tx": "  -> > 22", "get radio.rxgain": "  -> > on", "get radio.fem.rxgain": "  -> Error: unsupported" };
+  for (const [bid, bc] of batch) await ingest({ type: "cmd", cmd_id: bid, cmd: bc, output: reply[bc] || "  -> > 1" });
+  tl = await TEL();
+  assert.equal(tl.rpt.vals.name.value, "Hilltop"); assert.equal(tl.rpt.vals.radio.value, "910.525,62.5,7,5"); assert.equal(tl.rpt.vals["radio.fem.rxgain"].unsupported, true);
+  assert(tl.rpt.queued.repeat === "queued"); assert(!tl.commands.some((x) => x.cmd === "get name"), "settings commands hidden from console history");
+  // save: risky needs confirm, typed password, validation
+  assert.equal((await P("rpt-save", { changes: { radio: "910.525,250,10,5" } })).status, 409);
+  assert.equal((await P("rpt-save", { changes: { tx: 40 } })).status, 400);
+  assert.equal((await P("rpt-save", { changes: { password: "newpass1" }, risk_ok: true })).status, 409, "typed confirmation");
+  assert.equal((await P("rpt-save", { changes: { "prv.key": "00" }, risk_ok: true })).status, 400, "private key excluded");
+  await P("commands", { cancel: true });
+  unthrottle(); h0 = holo;
+  r = await P("rpt-save", { changes: { powersaving: "on", name: "Hilltop 2", radio: "910.525,250,10,5", password: "newpass1" }, risk_ok: true, typed: "change" });
+  j = await r.json(); assert.equal(r.status, 200); assert.equal(j.queued, 4); assert.equal(holo, h0 + 1);
+  batch = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.equal(batch[batch.length - 1][1], "powersaving on", "power saving runs last");
+  for (const [bid, bc] of batch) if (bc !== "powersaving on") await ingest({ type: "cmd", cmd_id: bid, cmd: bc, output: bc.startsWith("password") ? "  -> password now: newpass1" : "  -> OK" });
+  tl = await TEL(); assert.equal(tl.rpt.vals.name.value, "Hilltop 2"); assert.equal(tl.rpt.vals.name.set, true); assert.equal(tl.rpt.vals.radio.value, "910.525,250,10,5");
+  const raw = kv.get("cmds:tsim-1") + kv.get("rptcfg:tsim-1"); assert(!raw.includes("newpass1"), "admin password redacted after it runs");
+  assert.equal((await P("rpt-action", { act: "erase" })).status, 400); unthrottle(); assert.equal((await P("rpt-action", { act: "advert" })).status, 200);
+  const ph2 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(ph2.includes('id="rsreadall"') && ph2.includes('id="clipick"') && ph2.includes("Southern California") && !ph2.includes('value="erase"'));
+  for (const m of ph2.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  await P("commands", { cancel: true });
+  console.log("repeater settings tests OK");
+  await P("settings", { console_enabled: false });
 }
