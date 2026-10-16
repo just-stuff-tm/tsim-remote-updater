@@ -603,9 +603,12 @@ console.log("tag/asset version ok");
   assert.equal(g1.fix.lat, 35.123457); assert.equal(g1.fix.sats, 9); assert.equal(g1.fix.utc, "2026-10-16T17:00:00Z");
   const g2 = m.parseGps({ type: "gps", fix: false, sats: 3, msg: "GPS no fix after 90s (sats seen 3)" }, g1, "2026-10-16T18:00:00Z");
   assert.equal(g2.fix.lat, 35.123457, "no-fix keeps last good fix"); assert.equal(g2.attempt.fix, false); assert.equal(g2.attempt.sats, 3);
+  { const gd = m.parseGps({ fix: false, sats: 0, msg: "x", diag: { ready_ms: 4200, warm: false, pwr: "+CGNSSPWR: 1", ant: "CGDRT=4,1 OK; CGSETV=4,1 OK", mode: "+CGNSSMODE: 3", first: ",,,,,,,,", last: ",,,,", sats: 0, timeout: 180 } });
+    assert.equal(gd.attempt.diag.ready_ms, 4200); assert.equal(gd.attempt.diag.pwr, "+CGNSSPWR: 1"); assert.equal(m.parseGps({ fix: false }).attempt.diag, undefined); }
+  assert.equal(m.validateGps({}, { timeout_s: 600 }).timeout_s, 600); assert.throws(() => m.validateGps({}, { timeout_s: 601 }), /600/);
   assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null); assert.equal(m.parseGps({ fix: true, lat: 95, lon: 1 }).fix, null);
-  assert.equal(m.gpsCfgCmd(m.DEFAULT_GPS), "GPSCFG auto=0 to=90");
-  assert.throws(() => m.validateGps({}, { timeout_s: 10 }), /30 and 300/);
+  assert.equal(m.gpsCfgCmd(m.DEFAULT_GPS), "GPSCFG auto=0 to=180");
+  assert.throws(() => m.validateGps({}, { timeout_s: 10 }), /30 and 600/);
   assert(m.isSysCmd("GPSFIX") && m.isSysCmd("GPSCFG auto=1 to=90") && !m.isSysCmd("set lat 1"));
   const req = { id: "g1", at: "2026-10-16T17:00:00Z", timeout_s: 90 }, T = Date.parse("2026-10-16T17:01:00Z");
   assert.equal(m.gpsProgress(null).state, "idle");

@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <esp_sleep.h>
+#include <sys/time.h>
 #include <driver/gpio.h>
 #include <ctype.h>
 #include <string.h>
@@ -1766,14 +1767,14 @@ static size_t pwrJson(char *dst, size_t cap) {  // extra status fields
 // On demand (GPSFIX system command) and optionally on each STATUS check-in (GPSCFG auto=1, default off).
 // Powers GNSS on, polls for a fix up to the timeout, reads lat/lon/alt/sats/HDOP, powers GNSS off.
 static bool s_gps_auto = false;
-static uint32_t s_gps_to = 90;          // seconds
+static uint32_t s_gps_to = 180;         // seconds (v1.6.8: default 180, max 600)
 static bool s_gps_done = false;         // a fix attempt already ran this wake
 struct GpsFix { bool fix; double lat, lon; float alt, hdop; int sats; char utc[24]; char src[12]; uint32_t secs; };
 static void gpsLoad() {
   Preferences p; p.begin("tsimgps", true);
-  s_gps_auto = p.getBool("auto", false); s_gps_to = p.getUInt("to", 90);
+  s_gps_auto = p.getBool("auto", false); s_gps_to = p.getUInt("to", 180);
   p.end();
-  if (s_gps_to < 30 || s_gps_to > 300) s_gps_to = 90;
+  if (s_gps_to < 30 || s_gps_to > 600) s_gps_to = 180;
 }
 static void gpsApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimgps", false);
@@ -1782,7 +1783,7 @@ static void gpsApplyCfg(const char *args, char *out, size_t cap) {
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
     if (!strcmp(k, "auto")) { s_gps_auto = atoi(v) != 0; p.putBool("auto", s_gps_auto); n++; }
-    else if (!strcmp(k, "to")) { uint32_t s = (uint32_t)atoi(v); if (s >= 30 && s <= 300) { s_gps_to = s; p.putUInt("to", s); n++; } }
+    else if (!strcmp(k, "to")) { uint32_t s = (uint32_t)atoi(v); if (s >= 30 && s <= 600) { s_gps_to = s; p.putUInt("to", s); n++; } }
   }
   p.end();
   snprintf(out, cap, "GPSCFG applied %d: auto=%d to=%u", n, (int)s_gps_auto, (unsigned)s_gps_to);
@@ -1826,24 +1827,95 @@ static bool gpsParse(const char *line, bool cgnss, GpsFix &g) {
   return true;
 }
 static const char *gpsLine(const char *tag) { const char *p = strstr(s_at_resp, tag); return p ? p + strlen(tag) : nullptr; }
+// v1.6.8: follows LilyGO-T-A76XX GPS_BuiltIn for T-SIM7670G/7672G (TinyGSM enableGPS with MODEM_GPS_ENABLE_GPIO 4, level 1):
+// AT+CGDRT=4,1 + AT+CGSETV=4,1 (modem GPIO4 = GNSS antenna/LNA power), then AT+CGNSSPWR=1. We also wait for
+// "+CGNSSPWR: READY!" and confirm with AT+CGNSSPWR? before the fix timer starts. GNSS is left on ~5 min after an
+// attempt (warm retries) unless low-battery protection is active; the deadline survives deep sleep (RTC clock).
+#define GPS_WARM_S 300
+RTC_DATA_ATTR static bool s_gnss_on = false;
+RTC_DATA_ATTR static int64_t s_gnss_off_at = 0;   // epoch seconds (RTC time keeps running in deep sleep)
+struct GpsDiag { int ready_ms; bool warm; char pwrq[48]; char ant[64]; char mode[40]; char first[160]; char last[160]; };
+static GpsDiag s_gd;
+static int64_t rtcNow() { struct timeval tv; gettimeofday(&tv, nullptr); return (int64_t)tv.tv_sec; }
+// copy the first "+TAG..." line of s_at_resp (or a short reply) into dst, JSON-safe
+static void gpsGrab(char *dst, size_t cap, const char *tag) {
+  const char *p = tag ? strstr(s_at_resp, tag) : s_at_resp; if (!p) p = s_at_resp;
+  while (*p == '\r' || *p == '\n' || *p == ' ') p++;
+  size_t o = 0;
+  for (; *p && o + 1 < cap; p++) {
+    char c = *p;
+    if (c == '\r' || c == '\n') { if (tag) break; c = ' '; }
+    if (c == '"' || c == '\\' || (unsigned char)c < 0x20) c = '\'';
+    if (c == ' ' && o && dst[o - 1] == ' ') continue;
+    dst[o++] = c;
+  }
+  while (o && dst[o - 1] == ' ') o--;
+  dst[o] = 0;
+}
+static bool gpsWaitReady(uint32_t ms) {
+  if (strstr(s_at_resp, "READY!")) return true;
+  size_t n = 0; uint32_t t = millis(); char buf[96] = "";
+  while (millis() - t < ms) {
+    while (ModemSerial.available()) {
+      char c = (char)ModemSerial.read();
+      if (n + 1 >= sizeof(buf)) { memmove(buf, buf + 48, n - 48); n -= 48; }
+      buf[n++] = c; buf[n] = 0;
+      if (strstr(buf, "READY!")) return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+static void gpsPowerOff(const char *why) {
+  modemAT("AT+CGNSSPWR=0", 5000);
+  modemAT("AT+CGSETV=4,0", 2000); modemAT("AT+CGDRT=4,0", 2000);   // antenna power off (LilyGO disableGPS)
+  s_gnss_on = false; s_gnss_off_at = 0;
+  logf("GPS: GNSS powered off (%s)", why);
+}
+// Called once the modem is up each wake, and before sleeping: turns GNSS off when the warm window ran out
+// or battery protection switched the repeater off.
+static void gpsHousekeep() {
+  if (!s_gnss_on) return;
+  if (s_lb_state == 1) gpsPowerOff("battery protection");
+  else if (rtcNow() >= s_gnss_off_at) gpsPowerOff("warm window over");
+}
 static bool gpsAcquire(GpsFix &g) {
-  memset(&g, 0, sizeof(g)); g.hdop = -1;
-  uint32_t t0 = millis();
-  bool cgnss = modemAT("AT+CGNSSPWR=1", 10000);
-  if (cgnss) strcpy(g.src, "CGNSSINFO");
-  else if (modemAT("AT+CGPS=1", 5000)) strcpy(g.src, "CGPSINFO");   // older SIMCom command set
-  else { strcpy(g.src, "none"); return false; }
-  delay(2000);
+  memset(&g, 0, sizeof(g)); g.hdop = -1; memset(&s_gd, 0, sizeof(s_gd)); s_gd.ready_ms = -1;
+  uint32_t p0 = millis();
+  // antenna power (modem GPIO4), exactly as LilyGO enableGPS for this board
+  bool a1 = modemAT("AT+CGDRT=4,1", 2000), a2 = modemAT("AT+CGSETV=4,1", 2000);
+  snprintf(s_gd.ant, sizeof(s_gd.ant), "CGDRT=4,1 %s; CGSETV=4,1 %s", a1 ? "OK" : "ERROR", a2 ? "OK" : "ERROR");
+  bool already = modemAT("AT+CGNSSPWR?", 3000) && strstr(s_at_resp, "+CGNSSPWR: 1");
+  s_gd.warm = already;
+  bool cgnss;
+  if (already) { cgnss = true; s_gd.ready_ms = 0; }
+  else {
+    cgnss = modemAT("AT+CGNSSPWR=1", 10000);
+    if (cgnss) s_gd.ready_ms = gpsWaitReady(30000) ? (int)(millis() - p0) : -1;
+  }
+  if (cgnss) {
+    strcpy(g.src, "CGNSSINFO");
+    if (modemAT("AT+CGNSSPWR?", 3000)) gpsGrab(s_gd.pwrq, sizeof(s_gd.pwrq), "+CGNSSPWR:"); else gpsGrab(s_gd.pwrq, sizeof(s_gd.pwrq), nullptr);
+    if (modemAT("AT+CGNSSMODE?", 3000)) gpsGrab(s_gd.mode, sizeof(s_gd.mode), "+CGNSSMODE:");
+  } else if (modemAT("AT+CGPS=1", 5000)) strcpy(g.src, "CGPSINFO");   // older SIMCom command set
+  else { strcpy(g.src, "none"); gpsGrab(s_gd.pwrq, sizeof(s_gd.pwrq), nullptr); return false; }
+  s_gnss_on = cgnss;
+  uint32_t t0 = millis();   // fix timer starts only once GNSS reports ready
   while (millis() - t0 < s_gps_to * 1000UL) {
     if (modemAT(cgnss ? "AT+CGNSSINFO" : "AT+CGPSINFO", 3000)) {
-      const char *l = gpsLine(cgnss ? "+CGNSSINFO:" : "+CGPSINFO:");
+      const char *tag = cgnss ? "+CGNSSINFO:" : "+CGPSINFO:";
+      if (!s_gd.first[0]) gpsGrab(s_gd.first, sizeof(s_gd.first), tag);
+      gpsGrab(s_gd.last, sizeof(s_gd.last), tag);
+      const char *l = gpsLine(tag);
       if (l && gpsParse(l, cgnss, g)) break;
     }
     delay(5000);
   }
   g.secs = (millis() - t0) / 1000UL;
-  modemAT(cgnss ? "AT+CGNSSPWR=0" : "AT+CGPS=0", 5000);
-  logf("GPS: %s src=%s sats=%d secs=%u", g.fix ? "fix" : "no fix", g.src, g.sats, (unsigned)g.secs);
+  if (!cgnss) modemAT("AT+CGPS=0", 5000);
+  else if (s_lb_state == 1) gpsPowerOff("battery protection");
+  else { s_gnss_off_at = rtcNow() + GPS_WARM_S; logf("GPS: GNSS kept on %ds for warm retries", GPS_WARM_S); }
+  logf("GPS: %s src=%s sats=%d secs=%u ready=%dms", g.fix ? "fix" : "no fix", g.src, g.sats, (unsigned)g.secs, s_gd.ready_ms);
   return g.fix;
 }
 // Runs a fix attempt and posts {"type":"gps",...}. Summary text -> out.
@@ -1853,14 +1925,17 @@ static void gpsReport(const char *trigger, char *out, size_t cap) {
   if (g.fix) snprintf(out, cap, "GPS fix %.6f,%.6f alt=%.0fm sats=%d hdop=%.1f in %us", g.lat, g.lon, g.alt, g.sats, g.hdop, (unsigned)g.secs);
   else if (!strcmp(g.src, "none")) snprintf(out, cap, "GPS unavailable: modem did not accept the GNSS power command");
   else snprintf(out, cap, "GPS no fix after %us (sats seen %d). Check the GNSS antenna and sky view.", (unsigned)g.secs, g.sats);
-  static char body[600];
+  static char diag[700];
+  snprintf(diag, sizeof(diag), ",\"diag\":{\"ready_ms\":%d,\"warm\":%s,\"pwr\":\"%s\",\"ant\":\"%s\",\"mode\":\"%s\",\"first\":\"%s\",\"last\":\"%s\",\"sats\":%d,\"timeout\":%u}",
+           s_gd.ready_ms, s_gd.warm ? "true" : "false", s_gd.pwrq, s_gd.ant, s_gd.mode, s_gd.first, s_gd.last, g.sats, (unsigned)s_gps_to);
+  static char body[1400];
   if (g.fix)
     snprintf(body, sizeof(body), "{\"type\":\"gps\",\"fw\":\"%s\",\"fix\":true,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sats\":%d,\"hdop\":%.1f,"
-             "\"utc\":\"%s\",\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"}",
-             FW_VERSION, g.lat, g.lon, g.alt, g.sats, g.hdop, g.utc, (unsigned)g.secs, g.src, trigger, out);
+             "\"utc\":\"%s\",\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"%s}",
+             FW_VERSION, g.lat, g.lon, g.alt, g.sats, g.hdop, g.utc, (unsigned)g.secs, g.src, trigger, out, diag);
   else
-    snprintf(body, sizeof(body), "{\"type\":\"gps\",\"fw\":\"%s\",\"fix\":false,\"sats\":%d,\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"}",
-             FW_VERSION, g.sats, (unsigned)g.secs, g.src, trigger, out);
+    snprintf(body, sizeof(body), "{\"type\":\"gps\",\"fw\":\"%s\",\"fix\":false,\"sats\":%d,\"secs\":%u,\"src\":\"%s\",\"trigger\":\"%s\",\"msg\":\"%s\"%s}",
+             FW_VERSION, g.sats, (unsigned)g.secs, g.src, trigger, out, diag);
   ingestSendBig(body);
 }
 
@@ -2214,6 +2289,7 @@ static void sleepQuick() {
 
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  gpsHousekeep();
   rollbackIfPending("no successful ingest before sleep");
   logf("Deep sleep; RI GPIO%d LOW", MODEM_RI_PIN);
   heltecPinsRelease();
@@ -2225,6 +2301,10 @@ static void goToSleep() {
   if (s_ext0_failed) esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
   else if (s_lb_en) { esp_sleep_enable_timer_wakeup((uint64_t)s_lb_int_min * 60ULL * 1000000ULL);  // battery check
     logf("battery check timer: %u min", (unsigned)s_lb_int_min); }
+  if (!s_ext0_failed && s_gnss_on) {   // v1.6.8: wake when the GNSS warm window ends to power it off
+    int64_t left = s_gnss_off_at - rtcNow(); if (left < 5) left = 5;
+    if (!s_lb_en || (uint64_t)left < (uint64_t)s_lb_int_min * 60ULL) esp_sleep_enable_timer_wakeup((uint64_t)left * 1000000ULL);
+    logf("GNSS warm: off timer %llds", (long long)left); }
   Serial.flush(); delay(100);
   esp_deep_sleep_start();
 }
@@ -2319,7 +2399,7 @@ void setup() {
   gpsLoad();
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
-  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_ext0_failed && !otaPendingVerify()) {
+  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
     gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
     heltecPinsRelease();
     bool changed = pwrCheck("timer");
@@ -2340,6 +2420,7 @@ void setup() {
     goToSleep(); return;
   }
   modemAT("ATE0"); modemAT("AT+CMEE=2");
+  gpsHousekeep();   // v1.6.8: GNSS warm window / battery protection
   bool sim = modemWaitCpinReady(20000);
   modemLogDiagnostics();
   if (sim) {

@@ -622,7 +622,7 @@ export function validatePower(cur, b, rawIdle) {
 export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
 // ---------- GPS / location (T-SIM firmware 1.6.7+) ----------
 export const GPS_FW = "1.6.7";
-export const DEFAULT_GPS = { auto: false, timeout_s: 90 };
+export const DEFAULT_GPS = { auto: false, timeout_s: 180 };
 const isGpsCmd = (cmd) => /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}`;
 export function validateGps(cur, b) {
@@ -630,7 +630,7 @@ export function validateGps(cur, b) {
   if (b.auto !== undefined) o.auto = b.auto === true;
   if (b.timeout_s !== undefined) {
     const s = Math.round(Number(b.timeout_s));
-    if (!(s >= 30 && s <= 300)) throw new Error("Fix timeout must be between 30 and 300 seconds.");
+    if (!(s >= 30 && s <= 600)) throw new Error("Fix timeout must be between 30 and 600 seconds.");
     o.timeout_s = s;
   }
   return { auto: o.auto, timeout_s: o.timeout_s };
@@ -642,6 +642,12 @@ export function parseGps(t, prev = {}, receivedAt = new Date().toISOString()) {
   const fix = t.fix === true && lat != null && lon != null && !(lat === 0 && lon === 0);
   const attempt = { at: receivedAt, fix, sats: num(t.sats, 0, 200), secs: num(t.secs, 0, 3600), trigger: t.trigger === "auto" ? "auto" : "cmd",
     src: String(t.src || "").slice(0, 12), msg: String(t.msg || "").slice(0, 200) };
+  const d = t.diag && typeof t.diag === "object" ? t.diag : null;   // v1.6.8 modem diagnostics
+  if (d) {
+    const st = (v, n) => String(v == null ? "" : v).replace(/[\u0000-\u001f]/g, " ").slice(0, n);
+    attempt.diag = { ready_ms: num(d.ready_ms, -1, 600000), warm: d.warm === true, pwr: st(d.pwr, 60), ant: st(d.ant, 80), mode: st(d.mode, 60),
+      first: st(d.first, 180), last: st(d.last, 180), sats: num(d.sats, 0, 200), timeout: num(d.timeout, 0, 3600) };
+  }
   const out = { attempt, fix: prev.fix || null };
   if (fix) out.fix = { lat: Math.round(lat * 1e6) / 1e6, lon: Math.round(lon * 1e6) / 1e6, alt: num(t.alt, -1000, 20000), sats: attempt.sats,
     hdop: num(t.hdop, 0, 99), utc: /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(String(t.utc || "")) ? t.utc : null, received_at: receivedAt, trigger: attempt.trigger };
@@ -662,7 +668,7 @@ export function gpsProgress(req, cmds = [], gps = {}, now = Date.now()) {
   if (c && c.status === "error") return { ...base, state: "failed", step: 1, pct: 50, finished_at: c.done_at, reason: c.error || c.output || "Failed" };
   if (c && c.status === "done") return { ...base, state: "failed", step: 1, pct: 50, finished_at: c.done_at, reason: c.output || "The T-SIM finished without reporting a location." };
   if (c && c.status === "sent") {
-    const lim = ((req.timeout_s || 90) + 240) * 1000;
+    const lim = ((req.timeout_s || 180) + 270) * 1000;   // + wake, GNSS READY wait and upload
     const p = { ...base, step: 1, pct: 50, times: { ...base.times, 1: c.sent_at } };
     return now - Date.parse(c.sent_at) > lim ? { ...p, state: "timeout", reason: "The T-SIM took the request but no location came back." } : { ...p, state: "running" };
   }
@@ -1454,10 +1460,10 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div id="c-gps"></div><div id="gpsmapw" hidden><div id="gpsmap" class="map sens"></div><p class="small mut" style="margin:4px 0 0">Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors</p></div><div id="p-gps"></div>
 <details class="small" style="margin-top:10px"><summary>Location settings</summary>
 <form id="gpsf" style="margin-top:8px"><label class="tog"><input type="checkbox" name="auto"> Auto-update location on every check-in (uses extra battery: GPS runs up to the timeout each check-in)</label>
-<label>Fix timeout (seconds, 30–300)<input name="to" type="number" min="30" max="300" step="5"></label>
+<label>Fix timeout (seconds, 30–600)<input name="to" type="number" min="30" max="600" step="5"></label>
 <button type="submit" class="g">Save</button> <span id="gpsmsg" class="msg"></span>
 <p class="small mut">Settings are applied at the T-SIM's next wake (no text is sent).</p></form></details>
-<p class="small mut">Uses the modem's built-in GPS. Needs a GNSS antenna on the T-SIM's GPS/GNSS u.FL connector (not the LTE one) with a view of the sky. The first fix after a long time off can take 1–2 minutes. Coordinates are hidden until you press the eye.</p>
+<p class="small mut">Uses the modem's built-in GPS. Needs a GNSS antenna on the T-SIM's GPS/GNSS u.FL connector (not the LTE one) with a view of the sky. The first fix can take up to 5 min (180 s or more timeout recommended). GPS stays on about 5 min after a try, so a retry soon after is faster. Coordinates are hidden until you press the eye.</p>
 </div></section>
 <section><h2>Settings</h2>
 <details class="card" id="calbox"><summary><b>Battery calibration</b><small id="calsum" class="mut"></small></summary><div class="in">
@@ -1670,6 +1676,9 @@ function gprog(p){if(gpsPend&&(!p||p.state==="idle"||p.state==="done"||p.state==
  return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(p.state==="done"?"":fail?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"No fix":p.pct+"%")+'</span></div>'+
   '<div class="bar '+(p.state==="done"?"done":fail?"failed":"")+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+
   (p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small"><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
+function gdiag(A){const D=A&&A.diag;if(!D)return"";
+ const rd=D.warm?"already on (warm)":D.ready_ms==null||D.ready_ms<0?"no READY! seen within 30 s":(D.ready_ms/1000).toFixed(1)+" s";
+ return '<details class="small" style="margin-top:8px"><summary>GPS diagnostics (last attempt '+e(t(A.at))+')</summary>'+kv([["GNSS ready",rd],["Power check",D.pwr?{h:"<code>"+e(D.pwr)+"</code>"}:"(no reply)"],["Antenna power",D.ant||null],["GNSS mode",D.mode?{h:"<code>"+e(D.mode)+"</code>"}:null],["Satellites parsed",D.sats],["Searched",A.secs!=null?A.secs+" s of "+(D.timeout||"?")+" s":null],["First reply",D.first?{h:'<code class="sens">'+e(D.first)+"</code>"}:"(none)"],["Last reply",D.last?{h:'<code class="sens">'+e(D.last)+"</code>"}:"(none)"]])+'<p class="small mut">Replies with only commas mean the GPS is on but has no satellites yet.</p></details>'}
 function gpsMode(p){const s=gpsPend&&!(p&&p.started_at&&new Date(p.started_at)>=gpsPend)?"running":(p&&p.state)||"idle";return s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"get"}
 function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progress;
  if(gpsPend&&P&&P.started_at&&new Date(P.started_at)>=gpsPend)gpsPend=null;
@@ -1680,7 +1689,7 @@ function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progre
   ...(A&&!A.fix&&new Date(A.at)>new Date(F.received_at)?[["Last attempt","No fix "+t(A.at)+(A.sats!=null?" · "+A.sats+" satellites seen":"")]]:[])])
   :'<p class="small mut">'+(A?"No fix yet. Last attempt "+e(t(A.at))+(A.sats!=null?" saw "+A.sats+" satellites":"")+". Check the GNSS antenna and that it can see the sky.":"No location yet. Press Get location.")+'</p>';
  if(F)showMap(F);else $("gpsmapw").hidden=true;
- $("p-gps").innerHTML=gprog(P);
+ $("p-gps").innerHTML=gprog(P)+gdiag(A);
  const b=$("gpsbtn");if(!b.dataset.busy){const m=gpsMode(P);b.dataset.mode=m;b.textContent=m==="cancel"?"Cancel location request":m==="retry"?"Retry location":"Get location";b.className=m==="cancel"?"g":"";b.disabled=G.supported===false&&m!=="cancel"}
  if(!gpsLoaded&&G.settings){const f=$("gpsf");f.auto.checked=!!G.settings.auto;f.to.value=G.settings.timeout_s;gpsLoaded=true}
  $("gpsmsg").textContent=G.settings_pending?"Waiting for the T-SIM's next wake to apply.":$("gpsmsg").textContent;
@@ -1693,7 +1702,7 @@ function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progre
  sensApply()}
 $("gpsbtn").onclick=async()=>{const b=$("gpsbtn");if(b.dataset.busy)return;const m=b.dataset.mode||"get";
  if(m==="cancel"){if(!confirm("Cancel the location request? No text is sent."))return}
- else if(!confirm((m==="retry"?"Try again? ":"")+"Text the T-SIM to wake and read its GPS position? It takes up to "+(GPS.settings?GPS.settings.timeout_s:90)+" s to find satellites, then the location appears here."))return;
+ else if(!confirm((m==="retry"?"Try again? ":"")+"Text the T-SIM to wake and read its GPS position? It searches for up to "+(GPS.settings?GPS.settings.timeout_s:180)+" s (first fix can take up to 5 min), then the location appears here."))return;
  b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
  try{const r=await post(m==="cancel"?"gps-cancel":"gps-fix",m==="retry"?{retry:true}:undefined);const j=await rj(r);if(r.status===401){location.href="/";return}
   if(m==="cancel"){if(r.ok){gpsPend=null;toast(j.note,"ok")}else toast(friendly(j,r.status),"bad")}
@@ -1702,7 +1711,7 @@ $("gpsbtn").onclick=async()=>{const b=$("gpsbtn");if(b.dataset.busy)return;const
  catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  delete b.dataset.busy;b.textContent=old;b.disabled=false;load()};
 $("gpsf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target,to=+f.to.value;
- if(!(to>=30&&to<=300))return say("gpsmsg",false,"Fix timeout must be between 30 and 300 seconds.");
+ if(!(to>=30&&to<=600))return say("gpsmsg",false,"Fix timeout must be between 30 and 600 seconds.");
  if(f.auto.checked&&!GPS.settings?.auto&&!confirm("Read GPS on every check-in? Each check-in then runs GPS for up to "+to+" s, which uses more battery."))return;
  const r=await post("gps-settings",{auto:f.auto.checked,timeout_s:to});const j=await rj(r);say("gpsmsg",r.ok,r.ok?"Saved. Applied at the T-SIM's next wake.":friendly(j,r.status));if(r.ok){gpsLoaded=false;load()}};
 $("locbtn").onclick=async()=>{const b=$("locbtn"),F=GPS.fix;if(!F||b.dataset.busy)return;
