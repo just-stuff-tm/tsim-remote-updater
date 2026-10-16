@@ -715,6 +715,9 @@ export function buildSettingCmd(k, v) {
 export const RPT_ACTIONS = { advert: "Send a flood advert", "advert.zerohop": "Send a zero-hop advert" };
 // Firmware runs at most this many queued commands per wake (CMD_MAX_RUN in firmware/src/main.cpp).
 export const CMDS_PER_WAKE = 10;
+// 1.6.9 runs up to 40 per wake with a 6 KB fetch buffer.
+export const BATCH_FW = "1.6.9", CMDS_PER_WAKE_169 = 40, CMD_FETCH_BYTES = 6000;
+export const cmdsPerWake = (fw) => (fwAtLeast(fw, BATCH_FW) ? CMDS_PER_WAKE_169 : CMDS_PER_WAKE);
 
 // ---------- Heltec (repeater) battery calibration via MeshCore "adc.multiplier" ----------
 export const ADC_UNSUPPORTED = "This repeater's firmware/board doesn't support battery calibration (it answered \"Error: unsupported\"). Stock MeshCore for the Heltec V3 doesn't implement it yet; the reading can only be corrected in firmware.";
@@ -882,7 +885,10 @@ async function handleDeviceCommands(request, env, id) {
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd))).reverse().slice(0, CMD_MAX_PENDING);
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd))).reverse().slice(0, cmdsPerWake(lat.fw));
+  // never let the reply overflow the T-SIM's fetch buffer (a cut line would run a truncated command)
+  let bytes = 0; const fits = []; for (const c of pending) { bytes += `${c.id}\t${c.cmd}\n`.length; if (bytes > (fwAtLeast(lat.fw, BATCH_FW) ? CMD_FETCH_BYTES : 1700)) break; fits.push(c); }
+  pending.length = 0; pending.push(...fits);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
   if (pending.length) await putJson(env, `cmds:${id}`, list);
   return new Response(pending.map((c) => `${c.id}\t${c.cmd}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
@@ -1089,7 +1095,7 @@ async function deviceApi(request, env, dev, action) {
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ rpt: { vals: rptVals, queued: rptq }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ rpt: { vals: rptVals, queued: rptq, per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1232,7 +1238,7 @@ async function deviceApi(request, env, dev, action) {
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     await logActivity(env, id, { type: "action", msg: action === "rpt-read" ? `Repeater settings: reading ${add.length} value(s)` : action === "rpt-save" ? `Repeater settings: ${add.map((a) => a.cmd.startsWith("password") || a.cmd.includes("guest.password") ? a.cmd.split(" ").slice(0, 2).join(" ") + " ••••" : a.cmd).join("; ").slice(0, 200)}` : `Repeater: ${RPT_ACTIONS[b.act]}` });
     const [o, c] = await manualSend(env, dev, "CMD", "CMD (repeater settings)");
-    return json({ queued: add.length, wakes_needed: Math.ceil((list.filter((x) => x.status === "queued").length) / CMDS_PER_WAKE), wake: { ...o, status: c } });
+    return json({ queued: add.length, wakes_needed: Math.ceil((list.filter((x) => x.status === "queued").length) / cmdsPerWake(((await kvJson(env, `telem:${id}:latest`)) || {}).fw)), wake: { ...o, status: c } });
   }
   if (action === "adc-cal") {
     const settings = await getSettings(env, id);
@@ -1676,7 +1682,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 </div>
 <div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><p class="small mut" style="margin:0 0 6px">The repeater only reports short node IDs. Press ✎ to give a node a name (saved on this dashboard).</p><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
 <section><h2>Repeater settings</h2><div class="card">
-<p class="small mut" style="margin-top:0">View and change the repeater's MeshCore settings. Values are read and changed through the repeater console (one text wakes the T-SIM; it runs up to 10 commands per wake). Changed fields are highlighted; only changed values are sent. Prefer typing commands? Use Repeater console below.</p>
+<p class="small mut" style="margin-top:0">View and change the repeater's MeshCore settings. Values are read and changed through the repeater console (one text wakes the T-SIM; it runs up to 10 commands per wake, or 40 with T-SIM firmware 1.6.9+). Changed fields are highlighted; only changed values are sent. Prefer typing commands? Use Repeater console below.</p>
 <p class="psnote" id="rsps" hidden>Not available while the repeater is in power saving: its command line isn't answering. ${PS_HTML}</p>
 <p class="psnote" id="rscon" hidden>Turn on "Allow console commands" under Repeater console below to use repeater settings.</p>
 <div class="acts" style="margin-top:0"><button type="button" id="rsreadall">Read all</button><button type="button" id="rssave" class="w" disabled>Save changes</button>
@@ -1934,7 +1940,7 @@ $("adcf").onsubmit=async ev=>{ev.preventDefault();const mv=+ev.target.mv.value;c
  if(!r.ok)return say("adcmsg",false,j.error||friendly(j,r.status));const p=j.preview;
  adcPost({op:"set",meter_v:mv},"Set the repeater's battery multiplier from "+p.current.toFixed(3)+" to "+p.new_mult.toFixed(3)+" (repeater "+p.reported_v.toFixed(2)+" V, meter "+p.meter_v.toFixed(2)+" V)? One text is sent now.")};
 $("adcreset").onclick=()=>adcPost({op:"reset"},"Reset the repeater's battery multiplier to the board default? One text is sent now.");
-const RS=${JSON.stringify(RPT_SETTINGS)},RP=${JSON.stringify(RADIO_PRESETS)},PERWAKE=${CMDS_PER_WAKE};
+const RS=${JSON.stringify(RPT_SETTINGS)},RP=${JSON.stringify(RADIO_PRESETS)},PERWAKE0=${CMDS_PER_WAKE};let PERWAKE=PERWAKE0;
 let RV={},RQ={},RLOAD=false;
 const rsId=k=>"rs-"+k;
 function rsInput(i){const id=rsId(i.k);
@@ -1958,7 +1964,7 @@ function rsChanges(){const ch=[];for(const c of RS)for(const i of c.items){if(i.
  if(cur==="")continue;if(i.wo||rsNorm(i,cur)!==rsNorm(i,rv))ch.push(i)}return ch}
 function rsDirty(){const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
  document.querySelectorAll(".rsrow").forEach(r=>r.classList.remove("dirty"));rsChanges().forEach(i=>{const el=$(i.type==="radio"?"rs-preset":rsId(i.k));el&&el.closest(".rsrow").classList.add("dirty")})}
-function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);RV=R.vals||{};RQ=R.queued||{};
+function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);RV=R.vals||{};RQ=R.queued||{};PERWAKE=R.per_wake||PERWAKE0;
  if(!RLOAD){rsBuild();RLOAD=true}
  $("rsps").hidden=!PS;$("rscon").hidden=!!S.console_enabled||PS;const off=PS||!S.console_enabled;
  ["rsreadall","rssave"].forEach(x=>$(x).disabled=off||(x==="rssave"&&!rsChanges().length));

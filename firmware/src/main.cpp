@@ -686,8 +686,10 @@ static bool ingestSend(const char *json) {
 #define CLI_OUT_MAX        1024
 #define CLI_TIMEOUT_MS     4000
 #define CLI_QUIET_MS       350
-#define CMD_FETCH_MAX      1800
-#define CMD_MAX_RUN        10
+#define CMD_FETCH_MAX      6144   // 1.6.9: up to 40 lines of "<id>\t<cmd>\n" (Worker caps the reply at 6000 bytes)
+#define CMD_MAX_RUN        40     // 1.6.9: was 10
+#define CMD_BUDGET_MS      300000 // stop starting new commands after 5 min of a batch
+#define CMD_NOREPLY_STOP   3      // consecutive Heltec no-replies before skipping the rest (asleep / power saving)
 static char s_cli_out[CLI_OUT_MAX];
 static char s_mesh_body[4096];
 static char s_cmd_list[CMD_FETCH_MAX];
@@ -841,7 +843,7 @@ static void doConsoleCommands(bool sys_only = false) {
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
   if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return; }
-  int ran = 0;
+  int ran = 0, noreply = 0; uint32_t b0 = millis();
   char *save = nullptr;
   for (char *line = strtok_r(s_cmd_list, "\n", &save); line && ran < CMD_MAX_RUN; line = strtok_r(nullptr, "\n", &save)) {
     char *tab = strchr(line, '\t');
@@ -854,6 +856,13 @@ static void doConsoleCommands(bool sys_only = false) {
     for (char *q = cmd; *q; q++) if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e) clean = false;
     bool ok = false;
     static char ec[960], ei[40];
+    // Over budget, or the Heltec stopped answering: report the rest as skipped so the Worker doesn't wait on them.
+    const char *skip = (millis() - b0 > CMD_BUDGET_MS) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
+    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0) {
+      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"%s\"}", FW_VERSION, ei, ec, skip);
+      ingestSendBig(s_mesh_body); ran++; continue;
+    }
     if (clean && strncasecmp(cmd, "TSIMUPDATE ", 11) == 0) {  // T-SIM self-update (Worker system command, not a Heltec CLI command)
       jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"T-SIM OTA starting\"}", FW_VERSION, ei, ec);
@@ -881,7 +890,7 @@ static void doConsoleCommands(bool sys_only = false) {
       ran++;
       continue;
     }
-    if (clean) ok = heltecCli(cmd, s_cli_out, sizeof(s_cli_out), 8000);
+    if (clean) { ok = heltecCli(cmd, s_cli_out, sizeof(s_cli_out), 8000); noreply = ok ? 0 : noreply + 1; }
     else strcpy(s_cli_out, "");
     static char eo[CLI_OUT_MAX * 2];
     jsonEsc(eo, sizeof(eo), s_cli_out); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
@@ -1891,7 +1900,13 @@ static bool gpsAcquire(GpsFix &g) {
   if (already) { cgnss = true; s_gd.ready_ms = 0; }
   else {
     cgnss = modemAT("AT+CGNSSPWR=1", 10000);
-    if (cgnss) s_gd.ready_ms = gpsWaitReady(30000) ? (int)(millis() - p0) : -1;
+    // 1.6.9: some modem firmware never prints "+CGNSSPWR: READY!" (or prints it inside the OK response), which cost
+    // a 30 s wait every attempt. Wait at most 5 s for the URC, then accept AT+CGNSSPWR? reporting 1 as ready.
+    if (cgnss) {
+      if (gpsWaitReady(5000)) s_gd.ready_ms = (int)(millis() - p0);
+      else if (modemAT("AT+CGNSSPWR?", 3000) && strstr(s_at_resp, "+CGNSSPWR: 1")) s_gd.ready_ms = (int)(millis() - p0);
+      else s_gd.ready_ms = -1;
+    }
   }
   if (cgnss) {
     strcpy(g.src, "CGNSSINFO");

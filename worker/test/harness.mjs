@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -788,5 +788,20 @@ console.log("tag/asset version ok");
   for (const m of ph2.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
   await P("commands", { cancel: true });
   console.log("repeater settings tests OK");
+  // 1.6.9: whole Read all batch in one wake
+  assert.equal(cmdsPerWake("tsim-updater 1.6.8"), 10); assert.equal(cmdsPerWake("tsim-updater 1.6.9"), 40); assert.equal(cmdsPerWake(null), 10);
+  await ingest({ type: "status", fw: "tsim-updater 1.6.9" });
+  tl = await TEL(); assert.equal(tl.rpt.per_wake, 40);
+  unthrottle(); j = await (await P("rpt-read", {})).json(); assert.equal(j.wakes_needed, 1);
+  const big = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n");
+  assert.equal(big.length, RPT_READ_KEYS.length, "all reads in one fetch"); assert(big.join("\n").length < 6000);
+  // byte cap: long commands never overflow the T-SIM buffer
+  const lst = JSON.parse(kv.get("cmds:tsim-1")); for (let i = 0; i < 40; i++) lst.unshift({ id: "x" + i, cmd: "set owner.info " + "y".repeat(150), status: "queued", queued_at: new Date().toISOString(), cfg: true });
+  kv.set("cmds:tsim-1", JSON.stringify(lst));
+  const capd = await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+  assert(capd.length <= 6000 && capd.endsWith("\n") && capd.trim().split("\n").length < 40);
+  await P("commands", { cancel: true });
+  await ingest({ type: "status", fw: "tsim-updater 1.6.8" });
+  console.log("1.6.9 batch tests OK");
   await P("settings", { console_enabled: false });
 }
