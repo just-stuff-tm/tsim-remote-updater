@@ -814,6 +814,16 @@ console.log("tag/asset version ok");
   tl = await TEL(); assert(tl.rpt.lists.acl.error);
   const ph3 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
   assert(ph3.includes('id="rgadd"') && ph3.includes('id="acladd"') && ph3.includes('id="tmpr"')); for (const m of ph3.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  // per-setting read: one get, only that field changes
+  unthrottle(); j = await (await P("rpt-read", { keys: ["tx"] })).json(); assert.equal(j.queued, 1);
+  tl = await TEL(); assert.equal(tl.rpt.queued.tx, "queued"); assert.equal(Object.values(tl.rpt.queued).filter((x) => x === "queued").length, 1);
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.deepEqual(fl.map((x) => x[1]), ["get tx"]); const nameAt = tl.rpt.vals.name.at;
+  await ingest({ type: "cmd", cmd_id: fl[0][0], cmd: "get tx", output: "  -> > 20" });
+  tl = await TEL(); assert.equal(tl.rpt.vals.tx.value, "20"); assert.equal(tl.rpt.vals.name.at, nameAt, "other fields untouched");
+  assert.equal((await P("rpt-read", { keys: ["password"] })).status, 400, "write-only can't be read");
+  assert.equal(buildRptOp({ op: "sensor.get", key: "temp" })[0].cmd, "sensor get temp");
+  assert(ph3.includes("data-rs1"));
   console.log("regions / ACL / tools tests OK");
   // 1.6.9: whole Read all batch in one wake
   assert.equal(cmdsPerWake("tsim-updater 1.6.8"), 10); assert.equal(cmdsPerWake("tsim-updater 1.6.9"), 40); assert.equal(cmdsPerWake(null), 10);
