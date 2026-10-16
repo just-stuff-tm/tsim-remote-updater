@@ -1973,17 +1973,25 @@ static void decodeSmsField(char *s, size_t cap) {
 }
 
 // -------------------- SMS inbox --------------------
+static char s_sms_stat[24];
+static char s_sms_ts[32];
 static int parseOneCmgl(const char **p_inout) {
   const char *p = strstr(*p_inout, "+CMGL:");
   if (!p) return -1;
   int index = -1;
   if (sscanf(p, "+CMGL: %d", &index) != 1) { *p_inout = p + 6; return -1; }
   const char *q = p; int quotes = 0;
-  const char *fs = nullptr, *fe = nullptr;
-  while (*q && *q != '\n' && quotes < 4) {
-    if (*q == '"') { quotes++; if (quotes == 3) fs = q + 1; else if (quotes == 4) { fe = q; break; } }
+  const char *fs = nullptr, *fe = nullptr, *ss = nullptr, *se = nullptr, *ts = nullptr, *te = nullptr;
+  while (*q && *q != '\n' && quotes < 8) {
+    if (*q == '"') { quotes++;
+      if (quotes == 1) ss = q + 1; else if (quotes == 2) se = q;
+      else if (quotes == 3) fs = q + 1; else if (quotes == 4) fe = q;
+      else if (quotes == 7) ts = q + 1; else if (quotes == 8) te = q; }
     q++;
   }
+  s_sms_stat[0] = 0; s_sms_ts[0] = 0;
+  if (ss && se && se > ss) { size_t l = se - ss; if (l >= sizeof(s_sms_stat)) l = sizeof(s_sms_stat) - 1; memcpy(s_sms_stat, ss, l); s_sms_stat[l] = 0; }
+  if (ts && te && te > ts) { size_t l = te - ts; if (l >= sizeof(s_sms_ts)) l = sizeof(s_sms_ts) - 1; memcpy(s_sms_ts, ts, l); s_sms_ts[l] = 0; }
   s_sms_from[0] = 0;
   if (fs && fe && fe > fs) {
     size_t fl = (size_t)(fe - fs);
@@ -2008,28 +2016,45 @@ static int parseOneCmgl(const char **p_inout) {
   return index;
 }
 
+// v1.6.6: SMS replay protection.
+//  - each message is deleted from the modem BEFORE its command runs (an update reboot can no longer leave it stored)
+//  - in the read-all fallback, already-read (REC READ) messages are discarded, never executed
+//  (No time-based dedupe: a legitimate Retry of the same command always runs.)
+static bool looksLikeCommand(const char *body) {
+  static char n[1024]; strncpy(n, body, sizeof(n) - 1); n[sizeof(n) - 1] = 0; normalizeSmsBody(n);
+  size_t l = strlen(n); if (l >= 4 && strcasecmp(n + l - 4, " ACK") == 0) { n[l - 4] = 0; normalizeSmsBody(n); }
+  return !strcasecmp(n, "STATUS") || !strcasecmp(n, "CMD") || !strcasecmp(n, "REBOOT") ||
+         !strncasecmp(n, "UPDATE ", 7) || !strncasecmp(n, "TSIMUPDATE ", 11);
+}
+
 static void processSmsInbox() {
   // Read with UCS2 so every char ('_', '@', '$', ...) arrives as unambiguous hex.
   modemAT("AT+CSCS=\"UCS2\"");
-  if (!modemAT("AT+CMGL=\"REC UNREAD\"", 15000) || !strstr(s_at_resp, "+CMGL:"))
-    modemAT("AT+CMGL=\"ALL\"", 15000);
+  bool all_mode = false;
+  if (!modemAT("AT+CMGL=\"REC UNREAD\"", 15000) || !strstr(s_at_resp, "+CMGL:")) {
+    modemAT("AT+CMGL=\"ALL\"", 15000); all_mode = true;
+  }
   static char inbox[8192];
   strncpy(inbox, s_at_resp, sizeof(inbox) - 1); inbox[sizeof(inbox) - 1] = 0;
   modemAT("AT+CSCS=\"GSM\"");  // restore default charset
+  // Pass 1: collect messages (and GSM re-reads) while they still exist on the modem.
+  struct Msg { int idx; bool stale; char ts[32]; char from[160]; char body[1024]; };
+  static Msg msgs[10];
   const char *cursor = inbox;
   int count = 0;
   while (count < 10) {
     int idx = parseOneCmgl(&cursor);
     if (idx < 0) break;
-    count++;
-    logf("SMS[%d] from=%s body='%.200s'", idx, s_sms_from, s_sms_body);
-    static char from_copy[160], body_copy[1024];
-    strncpy(from_copy, s_sms_from, sizeof(from_copy)-1); from_copy[sizeof(from_copy)-1]=0;
-    strncpy(body_copy, s_sms_body, sizeof(body_copy)-1); body_copy[sizeof(body_copy)-1]=0;
-    if (!handleCommand(from_copy, body_copy)) {
+    Msg &m = msgs[count++];
+    m.idx = idx;
+    m.stale = all_mode && strstr(s_sms_stat, "READ") && !strstr(s_sms_stat, "UNREAD");
+    strncpy(m.ts, s_sms_ts, sizeof(m.ts) - 1); m.ts[sizeof(m.ts) - 1] = 0;
+    strncpy(m.from, s_sms_from, sizeof(m.from) - 1); m.from[sizeof(m.from) - 1] = 0;
+    strncpy(m.body, s_sms_body, sizeof(m.body) - 1); m.body[sizeof(m.body) - 1] = 0;
+    logf("SMS[%d] stat=%s ts=%s from=%s body='%.200s'", idx, s_sms_stat, s_sms_ts, m.from, m.body);
+    if (!m.stale && !looksLikeCommand(m.body)) {
       // v1.5.1: some texts come back from UCS2 CMGL as short/odd hex (e.g. "005300" for STATUS).
-      // Re-read this one message in GSM charset and try again.
-      modemAT("AT+CSCS=\"GSM\"");
+      // Re-read this one message in GSM charset (before it is deleted).
       snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGR=%d", idx);
       if (modemAT(s_cmdbuf, 5000)) {
         const char *h = strstr(s_at_resp, "+CMGR:");
@@ -2037,15 +2062,23 @@ static void processSmsInbox() {
         if (nl) {
           const char *bs = nl + 1; if (*bs == '\r') bs++;
           const char *be = strstr(bs, "\r\nOK"); if (!be) be = strstr(bs, "\nOK"); if (!be) be = bs + strlen(bs);
-          size_t bl = (size_t)(be - bs); if (bl >= sizeof(body_copy)) bl = sizeof(body_copy) - 1;
-          memcpy(body_copy, bs, bl); body_copy[bl] = 0; trimInPlace(body_copy);
-          logf("SMS[%d] GSM re-read body='%.200s'", idx, body_copy);
-          handleCommand(from_copy, body_copy);
+          size_t bl = (size_t)(be - bs); if (bl >= sizeof(m.body)) bl = sizeof(m.body) - 1;
+          memcpy(m.body, bs, bl); m.body[bl] = 0; trimInPlace(m.body);
+          logf("SMS[%d] GSM re-read body='%.200s'", idx, m.body);
         }
       }
     }
-    snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGD=%d", idx);
+  }
+  // Pass 2: delete every collected message first, so nothing can be replayed after a reboot.
+  for (int i = 0; i < count; i++) {
+    snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGD=%d", msgs[i].idx);
     modemAT(s_cmdbuf, 5000);
+  }
+  // Pass 3: execute.
+  for (int i = 0; i < count; i++) {
+    Msg &m = msgs[i];
+    if (m.stale) { logf("SMS[%d] ignored: already read (stale)", m.idx); continue; }
+    handleCommand(m.from, m.body);
   }
   logf("SMS processed: %d", count);
 }

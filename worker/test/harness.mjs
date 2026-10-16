@@ -419,7 +419,7 @@ console.log("tag/asset version ok");
   assert.equal(psDecision(st, false, "mesh poll: CLI answered"), false);
   const dev = JSON.parse(kv.get("device:tsim-1"));
   const post = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
-  const s0 = JSON.parse(kv.get("state:tsim-1")); s0.heltec_powersaving = true; kv.set("state:tsim-1", JSON.stringify(s0));
+  const s0 = JSON.parse(kv.get("state:tsim-1")); s0.heltec_powersaving = true; delete s0.cli_ok_at; kv.set("state:tsim-1", JSON.stringify(s0));
   await post({ type: "update", msg: "SUCCESS: https://g/x/Heltec_v3_repeater-v1.17.1-d929643.bin | chip=ESP32-S3" });
   assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, null, "flash resets to unknown");
   await post({ type: "mesh", heltec_cli: "asleep" });
@@ -579,4 +579,18 @@ console.log("tag/asset version ok");
   await call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify({ type: "mesh", ver: "v1.18.0-81dbae5" }) });
   assert(JSON.parse(kv.get("state:tsim-1")).radio_ver.startsWith("v1.18.0"));
   console.log("auto-resolve tests OK");
+}
+
+// ---- sent:<id> overlay (send record survives a stale state: overwrite) ----
+{
+  const m = await import("../src/index.js");
+  const st = { last_update_sent: { at: "2026-10-15T10:43:02Z", tag: "a" }, x: 1 };
+  const sent = { last_update_sent: { at: "2026-10-16T01:26:00Z", tag: "a", retry: true }, log: [{ received_at: "2026-10-16T01:26:00Z", type: "action", msg: "UPDATE retry text sent" }] };
+  const o = m.overlaySent(st, sent);
+  if (!o.last_update_sent.retry || o.x !== 1) throw new Error("overlay newer failed");
+  const o2 = m.overlaySent({ last_update_sent: { at: "2026-10-16T01:26:00Z", cancelled: true } }, sent);
+  if (!o2.last_update_sent.cancelled) throw new Error("overlay must keep same-time state copy");
+  const h = m.mergeSendLog([{ received_at: "2026-10-16T01:27:00Z", msg: "UPDATE start" }], sent);
+  if (h.length !== 2 || h[1].msg !== "UPDATE retry text sent") throw new Error("merge log failed");
+  console.log("sent overlay tests OK");
 }

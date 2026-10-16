@@ -238,9 +238,38 @@ async function logActivity(env, id, entry) {
   await putJson(env, `telem:${id}:history`, hist.slice(0, HISTORY_MAX));
 }
 
+// Send records live in their own key (written only by manualSend) so a concurrent device ingest that
+// read a stale state: copy (KV is eventually consistent) can no longer erase an update/retry send.
+const SENT_FIELDS = ["last_update_sent", "tsim_update_sent", "last_action"];
+export function overlaySent(st, sent) {
+  const o = { ...(st || {}) };
+  if (!sent) return o;
+  for (const f of SENT_FIELDS) if (sent[f] && (!o[f] || String(sent[f].at || "") > String(o[f].at || ""))) o[f] = sent[f];
+  return o;
+}
+export function mergeSendLog(history, sent) {
+  const h = history || [], log = (sent && sent.log) || [];
+  const have = new Set(h.map((e) => (e.received_at || "") + "|" + (e.msg || "")));
+  const add = log.filter((e) => !have.has((e.received_at || "") + "|" + (e.msg || "")));
+  if (!add.length) return h;
+  return [...h, ...add].sort((a, b) => String(b.received_at || "").localeCompare(String(a.received_at || ""))).slice(0, HISTORY_MAX);
+}
+async function loadState(env, id) {
+  const [st, sent] = await Promise.all([kvJson(env, `state:${id}`), kvJson(env, `sent:${id}`)]);
+  return overlaySent(st, sent);
+}
+async function recordSend(env, id, st, label, ok, err) {
+  const sent = (await kvJson(env, `sent:${id}`)) || {};
+  for (const f of SENT_FIELDS) if (st[f]) sent[f] = st[f];
+  sent.last_send_ts = st.last_send_ts;
+  const msg = ok ? `${label} text sent` : `${label} text FAILED: ${err}`;
+  sent.log = [{ received_at: new Date().toISOString(), type: "action", msg }, ...(sent.log || [])].slice(0, 30);
+  await putJson(env, `sent:${id}`, sent);
+}
+
 async function manualSend(env, dev, body, label, onSuccess) {
   const stKey = `state:${dev.id}`;
-  const st = (await kvJson(env, stKey)) || {};
+  const st = await loadState(env, dev.id);
   const now = Date.now();
   if (st.last_send_ts && now - st.last_send_ts < SEND_GAP_MS) {
     const wait = Math.ceil((SEND_GAP_MS - (now - st.last_send_ts)) / 1000);
@@ -254,11 +283,13 @@ async function manualSend(env, dev, body, label, onSuccess) {
     if (onSuccess) await onSuccess(st);
     st.last_action = { at: new Date().toISOString(), label, sent: true };
     await putJson(env, stKey, st);
+    await recordSend(env, dev.id, st, label, true);
     await logActivity(env, dev.id, { type: "action", msg: `${label} text sent` });
     return [{ sent: true, body, hologram_response_summary: { success: true } }, 200];
   } catch (e) {
     st.last_action = { at: new Date().toISOString(), label, sent: false, error: e.message };
     await putJson(env, stKey, st);
+    await recordSend(env, dev.id, st, label, false, e.message);
     await logActivity(env, dev.id, { type: "action", msg: `${label} text FAILED: ${e.message}` });
     return [{ sent: false, body, hologram_response_summary: { success: false, error: e.message } }, 502];
   }
@@ -768,7 +799,7 @@ function sameOrigin(request) {
 async function bodyRetry(request) { try { const b = await request.clone().json(); return b && b.retry === true; } catch { return false; } }
 // Returns a friendly refusal if an update of this kind is already queued/running (so a double press never sends a 2nd text).
 export async function dupeCheck(env, id, kind, retry, now = Date.now()) {
-  const st = (await kvJson(env, `state:${id}`)) || {};
+  const st = await loadState(env, id);
   const p = computeProgress(kind, (await kvJson(env, `telem:${id}:history`)) || [], st, now);
   const who = kind === "tsim" ? "T-SIM" : "radio";
   if (p.state === "running") {
@@ -788,7 +819,8 @@ async function deviceApi(request, env, dev, action) {
     const [latest, history, st, rel, mesh, settings, cmds, tsimSrc, tsimRel] = await Promise.all([
       kvJson(env, `telem:${id}:latest`), kvJson(env, `telem:${id}:history`), kvJson(env, `state:${id}`), kvJson(env, `release:${id}`),
       kvJson(env, `mesh:${id}`), getSettings(env, id), kvJson(env, `cmds:${id}`), getTsimSource(env, id), kvJson(env, `tsimrel:${id}`),
-    ]);
+      kvJson(env, `sent:${id}`),
+    ]).then((r) => { r[2] = overlaySent(r[2], r[9]); r[1] = mergeSendLog(r[1], r[9]); return r; });
     const s = st || {};
     const source = await getSource(env, id);
     const schedule = scheduleInfo(settings.schedule_hours, s);
@@ -917,7 +949,7 @@ async function deviceApi(request, env, dev, action) {
     let b = {}; try { b = await request.json(); } catch {}
     const kind = b.kind === "tsim" ? "tsim" : b.kind === "heltec" ? "heltec" : null;
     if (!kind) return json({ error: "kind must be tsim or heltec" }, 400);
-    const st = (await kvJson(env, `state:${id}`)) || {};
+    const st = await loadState(env, id);
     const hist = (await kvJson(env, `telem:${id}:history`)) || [];
     const p = computeProgress(kind, hist, st);
     if (p.state !== "running" && p.state !== "timeout") return json({ cancelled: false, error: "No update is in progress." }, 409);
@@ -984,7 +1016,7 @@ async function fleetApi(env, acc) {
   for (const id of acc.devices) {
     const dev = await getDevice(env, id);
     if (!dev) continue;
-    const [L, mesh, st, settings, hist, rel, trel] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), kvJson(env, `state:${id}`), getSettings(env, id), kvJson(env, `telem:${id}:history`), kvJson(env, `release:${id}`), kvJson(env, `tsimrel:${id}`)]);
+    const [L, mesh, st, settings, hist, rel, trel] = await Promise.all([kvJson(env, `telem:${id}:latest`), kvJson(env, `mesh:${id}`), loadState(env, id), getSettings(env, id), kvJson(env, `telem:${id}:history`), kvJson(env, `release:${id}`), kvJson(env, `tsimrel:${id}`)]);
     const ph = computeProgress("heltec", hist || [], st || {}), pt = computeProgress("tsim", hist || [], st || {});
     const l = L || {}, m = mesh || {};
     out.push({ id, name: dev.name, last_seen: l.received_at || null, fw: l.fw || null, battery_v: l.battery_v ?? null, battery_pct: l.battery_pct ?? null,
