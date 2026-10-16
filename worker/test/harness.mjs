@@ -607,6 +607,12 @@ console.log("tag/asset version ok");
     assert.equal(gd.attempt.diag.ready_ms, 4200); assert.equal(gd.attempt.diag.pwr, "+CGNSSPWR: 1"); assert.equal(m.parseGps({ fix: false }).attempt.diag, undefined); }
   assert.equal(m.validateGps({}, { timeout_s: 600 }).timeout_s, 600); assert.throws(() => m.validateGps({}, { timeout_s: 601 }), /600/);
   assert.equal(m.parseGps({ fix: true, lat: 0, lon: 0 }).fix, null);
+  { const q = "2026-10-16T17:56:56.350Z", N = Date.parse(q) + 60e3;
+    assert.equal(m.gpsPendResolved(q, { state: "done", started_at: q }, null, N), true, "server shows this request");
+    assert.equal(m.gpsPendResolved("2026-10-16T17:56:57.900Z", { state: "done", started_at: q }, null, N), true, "client clock a bit later");
+    assert.equal(m.gpsPendResolved(q, { state: "idle" }, { at: "2026-10-16T17:58:22Z", fix: true }, N), true, "newer fix arrived");
+    assert.equal(m.gpsPendResolved(q, { state: "done", started_at: "2026-10-16T17:30:00Z" }, { at: "2026-10-16T17:31:00Z" }, N), false, "older result only");
+    assert.equal(m.gpsPendResolved(q, null, null, Date.parse(q) + 16 * 60e3), true, "gives up after 15 min"); }
   { let o = m.setNick({}, "90e93ce2", " Hilltop <b> "); assert.deepEqual(o, { "90E93CE2": "Hilltop b" }); o = m.setNick(o, "90E93CE2", ""); assert.deepEqual(o, {});
     assert.throws(() => m.setNick({}, "zz", "x"), /hex/); }
   { const u = m.updateStatus("tsim-updater 1.6.7", { tag: "v1.6.8", asset_name: "firmware.bin", notes: m.relNotes("## New\r\n- GPS"), html_url: m.safeRelUrl("https://github.com/o/r/releases/tag/v1.6.8") });

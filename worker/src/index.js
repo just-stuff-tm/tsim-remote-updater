@@ -154,7 +154,7 @@ const SEC_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store",
   "X-Frame-Options": "DENY",
-  "Referrer-Policy": "no-referrer",
+  "Referrer-Policy": "strict-origin-when-cross-origin",   // OSM tile policy needs a Referer (origin only is sent cross-site)
   "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' https://unpkg.com; style-src 'unsafe-inline' https://unpkg.com; img-src https://tile.openstreetmap.org https://unpkg.com data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 };
 const html = (body, status = 200, headers = {}) => new Response(body, { status, headers: { ...SEC_HEADERS, ...headers } });
@@ -671,6 +671,15 @@ export function setNick(map, hash, name) {
   if (n) o[h] = n; else delete o[h];
   if (Object.keys(o).length > 200) throw new Error("Too many nicknames (max 200).");
   return o;
+}
+// Dashboard-side: the local "just pressed" placeholder ends once the server shows this request (or a newer result).
+// pend: ISO time the request was queued (server time); p: gps.progress; a: gps.attempt.
+export function gpsPendResolved(pend, p, a, now = Date.now()) {
+  if (!pend) return true;
+  const t = Date.parse(pend) - 5000;   // small clock-skew allowance
+  if (p && p.started_at && Date.parse(p.started_at) >= t) return true;
+  if (a && a.at && Date.parse(a.at) >= t) return true;
+  return now - Date.parse(pend) > 15 * 60e3;
 }
 export const GPS_STEPS = ["Waiting for T-SIM to wake", "Searching for satellites", "Done"];
 // req: {id, at, timeout_s}; cmds: command list; gps: stored record.
@@ -1687,6 +1696,7 @@ document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
 });
 /* ---- location (GPS) ---- */
 let GPS={},gpsLoaded=false,LMAP=null,LMK=null,gpsPend=null;
+const gpsPendResolved=${gpsPendResolved.toString().replace(/^function \w+/, "function")};
 const GSTEP=["Waiting for T-SIM to wake","Searching for satellites","Done"];
 function llTxt(f){return f.lat.toFixed(6)+", "+f.lon.toFixed(6)}
 function acc(h){if(h==null||h<0)return null;const q=h<=1?"excellent":h<=2?"good":h<=5?"fair":"poor";return "HDOP "+h.toFixed(1)+" ("+q+", about ±"+Math.max(3,Math.round(h*5))+" m)"}
@@ -1695,9 +1705,9 @@ function loadLeaflet(){if(window.L)return Promise.resolve();if(loadLeaflet.p)ret
  const c=document.createElement("link");c.rel="stylesheet";c.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";c.integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";c.crossOrigin="";document.head.appendChild(c);
  return loadLeaflet.p=new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";s.integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";s.crossOrigin="";s.onload=ok;s.onerror=bad;document.head.appendChild(s)})}
 function showMap(f){$("gpsmapw").hidden=false;loadLeaflet().then(()=>{const ll=[f.lat,f.lon];
- if(!LMAP){LMAP=L.map("gpsmap",{scrollWheelZoom:false,attributionControl:false}).setView(ll,15);L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19}).addTo(LMAP);LMK=L.marker(ll).addTo(LMAP)}
+ if(!LMAP){LMAP=L.map("gpsmap",{scrollWheelZoom:false,attributionControl:false}).setView(ll,15);L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,referrerPolicy:"strict-origin-when-cross-origin"}).addTo(LMAP);LMK=L.marker(ll).addTo(LMAP)}
  else if(showMap.k!==ll.join()){LMK.setLatLng(ll);LMAP.setView(ll,LMAP.getZoom())}showMap.k=ll.join();setTimeout(()=>LMAP.invalidateSize(),50)}).catch(()=>{$("gpsmap").innerHTML='<p class="small mut" style="padding:10px">Map couldn’t load (no internet?). Coordinates above still work.</p>'})}
-function gprog(p){if(gpsPend&&(!p||p.state==="idle"||p.state==="done"||p.state==="failed"||p.state==="cancelled")&&!(p&&p.started_at&&new Date(p.started_at)>=gpsPend))p={state:"running",step:0,pct:10,times:{0:gpsPend.toISOString()}};
+function gprog(p){if(gpsPend&&!gpsPendResolved(gpsPend.toISOString(),p,GPS.attempt))p={state:"running",step:0,pct:10,times:{0:gpsPend.toISOString()}};
  if(!p||p.state==="idle")return "";
  if(p.state==="cancelled")return '<p class="small mut">Location request cancelled '+e(t(p.finished_at))+'.</p>';
  const fail=p.state==="failed"||p.state==="timeout";
@@ -1709,9 +1719,9 @@ function gprog(p){if(gpsPend&&(!p||p.state==="idle"||p.state==="done"||p.state==
 function gdiag(A){const D=A&&A.diag;if(!D)return"";
  const rd=D.warm?"already on (warm)":D.ready_ms==null||D.ready_ms<0?"no READY! seen within 30 s":(D.ready_ms/1000).toFixed(1)+" s";
  return '<details class="small" style="margin-top:8px"><summary>GPS diagnostics (last attempt '+e(t(A.at))+')</summary>'+kv([["GNSS ready",rd],["Power check",D.pwr?{h:"<code>"+e(D.pwr)+"</code>"}:"(no reply)"],["Antenna power",D.ant||null],["GNSS mode",D.mode?{h:"<code>"+e(D.mode)+"</code>"}:null],["Satellites parsed",D.sats],["Searched",A.secs!=null?A.secs+" s of "+(D.timeout||"?")+" s":null],["First reply",D.first?{h:'<code class="sens">'+e(D.first)+"</code>"}:"(none)"],["Last reply",D.last?{h:'<code class="sens">'+e(D.last)+"</code>"}:"(none)"]])+'<p class="small mut">Replies with only commas mean the GPS is on but has no satellites yet.</p></details>'}
-function gpsMode(p){const s=gpsPend&&!(p&&p.started_at&&new Date(p.started_at)>=gpsPend)?"running":(p&&p.state)||"idle";return s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"get"}
+function gpsMode(p){const s=gpsPend&&!gpsPendResolved(gpsPend.toISOString(),p,GPS.attempt)?"running":(p&&p.state)||"idle";return s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"get"}
 function showGps(d){const G=d.gps||{};GPS=G;const F=G.fix,A=G.attempt,P=G.progress;
- if(gpsPend&&P&&P.started_at&&new Date(P.started_at)>=gpsPend)gpsPend=null;
+ if(gpsPend&&gpsPendResolved(gpsPend.toISOString(),P,A))gpsPend=null;
  $("gpsnote").hidden=G.supported!==false;
  $("gpsat").textContent=F?"fix "+t(F.utc||F.received_at):"";
  const cp=F?{h:'<span class="sens">'+e(llTxt(F))+'</span> <button type="button" class="eye" onclick="sensToggle()" title="Show">👁</button> <button type="button" class="g sm" onclick="copyLL()">Copy</button>'}:null;
@@ -1741,7 +1751,7 @@ $("gpsbtn").onclick=async()=>{const b=$("gpsbtn");if(b.dataset.busy)return;const
  b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
  try{const r=await post(m==="cancel"?"gps-cancel":"gps-fix",m==="retry"?{retry:true}:undefined);const j=await rj(r);if(r.status===401){location.href="/";return}
   if(m==="cancel"){if(r.ok){gpsPend=null;toast(j.note,"ok")}else toast(friendly(j,r.status),"bad")}
-  else if(j.sent){gpsPend=new Date();toast("Text sent. The T-SIM will wake and look for satellites; the location appears here in a few minutes.","ok")}
+  else if(j.sent){gpsPend=j.queued&&j.queued.queued_at?new Date(j.queued.queued_at):new Date(Date.now()-10000);toast("Text sent. The T-SIM will wake and look for satellites; the location appears here in a few minutes.","ok")}
   else toast(friendly(j,r.status),"bad")}
  catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  delete b.dataset.busy;b.textContent=old;b.disabled=false;load()};
