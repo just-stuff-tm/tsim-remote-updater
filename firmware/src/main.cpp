@@ -669,7 +669,16 @@ static bool ingestPostTls(const char *json) {
 }
 
 static void markOtaValidIfPending(const char *why);
+// v1.7.0: every post carries a compact telemetry snapshot ("tl") so the dashboard's T-SIM card stays current.
+static size_t telemJson(char *out, size_t cap);
+static char s_post_buf[4096 + 512];
 static bool ingestSendRaw(const char *json) {
+  size_t L = strlen(json);
+  if (L > 1 && L + 400 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
+    memcpy(s_post_buf, json, L - 1); size_t o = L - 1;
+    o += telemJson(s_post_buf + o, sizeof(s_post_buf) - o - 2);
+    s_post_buf[o++] = '}'; s_post_buf[o] = 0; json = s_post_buf;
+  }
   if (modemHttpPost(g_ingest_url, "application/json", g_key_hdr, json)) return true;
   logf("ingest: modem HTTPS failed, trying ESP32 TLS");
   return ingestPostTls(json);
@@ -730,6 +739,8 @@ static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_m
     }
     if (!reply && strstr(out, "-> ")) reply = true;
     if (reply && millis() - last > CLI_QUIET_MS) break;
+    // v1.7.0: output beyond the echoed command line with no "-> " marker = a raw printout; stop after 700 ms quiet
+    if (!reply && millis() - last > 700) { const char *nl = strchr(out, '\n'); if (nl && strlen(nl + 1) > 2) break; }
     delay(5);
   }
   // Drop the echoed command line (everything up to the reply marker), keep "  -> ..." onwards.
@@ -741,6 +752,7 @@ static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_m
     if (nl && strncmp(out, cmd, strlen(cmd)) == 0) memmove(out, nl + 1, strlen(nl + 1) + 1);
   }
   trimInPlace(out);
+  if (!reply && out[0] && strncmp(out, cmd, strlen(cmd)) != 0) reply = true;  // raw printout (get acl, log, ...)
   logf("cli '%.40s' -> %s %.80s", cmd, reply ? "ok" : "NO REPLY", out);
   return reply;
 }
@@ -838,6 +850,7 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
 static bool doTsimUpdate(const char *args);
 static void pwrApplyCfg(const char *args, char *out, size_t cap);
 static void gpsApplyCfg(const char *args, char *out, size_t cap);
+static void csApplyCfg(const char *args, char *out, size_t cap);
 static void gpsReport(const char *trigger, char *out, size_t cap);
 static void doConsoleCommands(bool sys_only = false) {
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
@@ -858,7 +871,7 @@ static void doConsoleCommands(bool sys_only = false) {
     static char ec[960], ei[40];
     // Over budget, or the Heltec stopped answering: report the rest as skipped so the Worker doesn't wait on them.
     const char *skip = (millis() - b0 > CMD_BUDGET_MS) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
-    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0) {
+    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0) {
       jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"%s\"}", FW_VERSION, ei, ec, skip);
       ingestSendBig(s_mesh_body); ran++; continue;
@@ -880,6 +893,12 @@ static void doConsoleCommands(bool sys_only = false) {
       ingestSendBig(s_mesh_body);
       ran++;
       continue;
+    }
+    if (clean && strncasecmp(cmd, "CFGSNAP ", 8) == 0) {  // v1.7.0 settings cache config (Worker system command)
+      static char co[200]; csApplyCfg(cmd + 8, co, sizeof(co));
+      static char ce[300]; jsonEsc(ce, sizeof(ce), co); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, ce);
+      ingestSendBig(s_mesh_body); ran++; continue;
     }
     if (clean && (strcasecmp(cmd, "GPSFIX") == 0 || strncasecmp(cmd, "GPSCFG ", 7) == 0)) {  // v1.6.7 GNSS (Worker system commands)
       static char go[300];
@@ -1842,6 +1861,7 @@ static const char *gpsLine(const char *tag) { const char *p = strstr(s_at_resp, 
 // attempt (warm retries) unless low-battery protection is active; the deadline survives deep sleep (RTC clock).
 #define GPS_WARM_S 300
 RTC_DATA_ATTR static bool s_gnss_on = false;
+RTC_DATA_ATTR static double s_gc_lat = 0, s_gc_lon = 0; RTC_DATA_ATTR static int s_gc_sats = 0; RTC_DATA_ATTR static int64_t s_gc_at = 0;
 RTC_DATA_ATTR static int64_t s_gnss_off_at = 0;   // epoch seconds (RTC time keeps running in deep sleep)
 struct GpsDiag { int ready_ms; bool warm; char pwrq[48]; char ant[64]; char mode[40]; char first[160]; char last[160]; };
 static GpsDiag s_gd;
@@ -1937,6 +1957,7 @@ static bool gpsAcquire(GpsFix &g) {
 static void gpsReport(const char *trigger, char *out, size_t cap) {
   s_gps_done = true;
   GpsFix g; gpsAcquire(g);
+  if (g.fix) { s_gc_lat = g.lat; s_gc_lon = g.lon; s_gc_sats = g.sats; s_gc_at = rtcNow() > 1700000000LL ? rtcNow() : 1; }
   if (g.fix) snprintf(out, cap, "GPS fix %.6f,%.6f alt=%.0fm sats=%d hdop=%.1f in %us", g.lat, g.lon, g.alt, g.sats, g.hdop, (unsigned)g.secs);
   else if (!strcmp(g.src, "none")) snprintf(out, cap, "GPS unavailable: modem did not accept the GNSS power command");
   else snprintf(out, cap, "GPS no fix after %us (sats seen %d). Check the GNSS antenna and sky view.", (unsigned)g.secs, g.sats);
@@ -1967,6 +1988,22 @@ static int batPercent(float v) {
 }
 
 static float s_bat_idle_fwd(void) { return s_bat_idle; }
+RTC_DATA_ATTR static int s_sig_csq = -1, s_sig_rsrp = 0;
+static void telemRefreshSignal() {
+  if (s_tcp_busy) return;
+  if (modemAT("AT+CSQ", 3000)) { const char *p = strstr(s_at_resp, "+CSQ:"); int v; if (p && sscanf(p, "+CSQ: %d", &v) == 1) s_sig_csq = v; }
+}
+static size_t telemJson(char *out, size_t cap) {
+  float bl = batCal(readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f)), sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
+  int64_t now = rtcNow();
+  size_t o = snprintf(out, cap, ",\"tl\":{\"fw\":\"%s\",\"bv\":%.2f,\"bp\":%d,\"bl\":%.2f,\"sv\":%.2f,\"csq\":%d,\"rsrp\":%d,\"up\":%lu,\"wake\":%d,\"heap\":%u,\"tc\":%.1f,\"lb\":%d",
+    FW_VERSION, s_bat_idle, batPercent(s_bat_idle), bl, sol, s_sig_csq, s_sig_rsrp, (unsigned long)(millis() / 1000UL), (int)s_wake_cause,
+    (unsigned)ESP.getFreeHeap(), temperatureRead(), (int)s_lb_state);
+  if (o < cap && now > 1700000000LL) o += snprintf(out + o, cap - o, ",\"ts\":%lld", (long long)now);
+  if (o < cap && s_gc_at > 0) o += snprintf(out + o, cap - o, ",\"glat\":%.6f,\"glon\":%.6f,\"gsats\":%d,\"gat\":%lld", s_gc_lat, s_gc_lon, s_gc_sats, (long long)s_gc_at);
+  if (o < cap) o += snprintf(out + o, cap - o, "}");
+  return o < cap ? o : 0;
+}
 static void doStatusReport(void) {
   float bat_load = batCal(readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f));  // modem on: loaded
   float bat = s_bat_idle;                                          // idle (start of wake): reported value
@@ -2003,9 +2040,11 @@ static void doStatusReport(void) {
   {
     int csqv = -1, rsrq = 0, rsrp = 0, reg = -1;
     char *p = strstr(csq, "+CSQ:"); if (p) sscanf(p, "+CSQ: %d", &csqv);
+    s_sig_csq = csqv;
     // +CPSI: LTE,Online,MCC-MNC,TAC,CellID,PCI,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,RSSI,RSNR
     { int f = 0; const char *q = cpsi;
       while (*q) { if (*q == ',') { f++; if (f == 10) rsrq = atoi(q + 1); if (f == 11) rsrp = atoi(q + 1); } q++; } }
+    s_sig_rsrp = rsrp;
     p = strstr(cereg, "+CEREG:"); if (p) { int a, b2; if (sscanf(p, "+CEREG: %d,%d", &a, &b2) == 2) reg = b2; }
     char op[64] = "", ipv[48] = "", mfw[100] = "", lr[170];
     p = strchr(cops, '"'); if (p) { strncpy(op, p + 1, sizeof(op) - 1); char *e = strchr(op, '"'); if (e) *e = 0; }
@@ -2087,6 +2126,69 @@ static bool doUpdate(const char *url, bool flash_too) {
   return flashed;
 }
 
+// -------------------- v1.7.0 repeater settings cache (CFGSNAP) --------------------
+// When enabled, on a wake that already talks to the repeater, and at most every int hours, the T-SIM fetches the
+// list of read-only "get" commands from the Worker (/api/dev/<id>/cfglist), runs them over serial, and posts the
+// replies as {"type":"cfgsnap"}. Unsent parts are kept in LittleFS and retried on the next wake.
+#define CFGSNAP_Q "/cfgsnap.q"
+static bool s_cs_en = false, s_cs_now = false; static uint32_t s_cs_int_h = 24; static int64_t s_cs_last = 0;
+static void csLoad() { Preferences p; p.begin("tsimcs", true); s_cs_en = p.getBool("en", false); s_cs_int_h = p.getUInt("int", 24); s_cs_last = p.getLong64("last", 0); p.end(); if (s_cs_int_h < 1 || s_cs_int_h > 168) s_cs_int_h = 24; }
+static void csApplyCfg(const char *args, char *out, size_t cap) {
+  Preferences p; p.begin("tsimcs", false);
+  char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0; char *save = nullptr; int n = 0;
+  for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
+    char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
+    if (!strcmp(k, "en")) { s_cs_en = atoi(v) != 0; p.putBool("en", s_cs_en); n++; }
+    else if (!strcmp(k, "int")) { uint32_t h = (uint32_t)atoi(v); if (h >= 1 && h <= 168) { s_cs_int_h = h; p.putUInt("int", h); n++; } }
+    else if (!strcmp(k, "now")) { s_cs_now = atoi(v) != 0; n++; }
+  }
+  p.end();
+  snprintf(out, cap, "CFGSNAP applied %d: en=%d int=%uh%s", n, (int)s_cs_en, (unsigned)s_cs_int_h, s_cs_now ? " (refresh this wake)" : "");
+  logf("%s", out);
+}
+static void csSendOrKeep(const char *body) {
+  if (ingestSendBig(body)) return;
+  File f = LittleFS.open(CFGSNAP_Q, "a"); if (f) { f.println(body); f.close(); logf("cfgsnap: part kept for retry"); }
+}
+static void csFlush() {
+  if (!LittleFS.exists(CFGSNAP_Q)) return;
+  File f = LittleFS.open(CFGSNAP_Q, "r"); if (!f) return;
+  bool all = true;
+  while (f.available()) { size_t n = f.readBytesUntil('\n', s_mesh_body, sizeof(s_mesh_body) - 1); s_mesh_body[n] = 0; trimInPlace(s_mesh_body); if (s_mesh_body[0] && !ingestSendBig(s_mesh_body)) { all = false; break; } }
+  f.close(); if (all) LittleFS.remove(CFGSNAP_Q);
+}
+static void cfgSnapshot() {
+  csFlush();
+  int64_t now = rtcNow();
+  bool due = s_cs_en && (s_cs_last <= 0 || now < s_cs_last || now - s_cs_last >= (int64_t)s_cs_int_h * 3600);
+  if (!s_cs_now && (!due || s_lb_state == 1)) return;   // battery protection: only on explicit request
+  s_cs_now = false;
+  static char url[240]; snprintf(url, sizeof(url), "%s/api/dev/%s/cfglist", g_worker_url, g_device_id);
+  if (httpsGetTls(url, s_cmd_list, sizeof(s_cmd_list)) != 200) { logf("cfgsnap: list fetch failed"); return; }
+  static char esc[CLI_OUT_MAX + 256], ec[200];
+  int part = 0, items = 0, noreply = 0, total = 0; uint32_t t0 = millis();
+  size_t o = 0; char *save = nullptr;
+  auto head = [&]() { o = snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cfgsnap\",\"fw\":\"%s\",\"part\":%d%s,\"items\":[", FW_VERSION, part, now > 1700000000LL ? "" : ""); items = 0; };
+  head();
+  for (char *line = strtok_r(s_cmd_list, "\n", &save); line && total < 48; line = strtok_r(nullptr, "\n", &save)) {
+    trimInPlace(line); if (!line[0]) continue;
+    bool clean = true; for (char *q = line; *q; q++) if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e) clean = false;
+    if (!clean || (strncasecmp(line, "get ", 4) && strcasecmp(line, "powersaving") && strcasecmp(line, "ver") && strcasecmp(line, "board") && strncasecmp(line, "region", 6) && strncasecmp(line, "gps", 3))) continue;  // read-only commands only
+    if (!strncasecmp(line, "gps ", 4) && strcasecmp(line, "gps advert")) continue;
+    if (!strncasecmp(line, "region ", 7) && strcasecmp(line, "region home") && strcasecmp(line, "region default")) continue;
+    if (millis() - t0 > 180000UL || noreply >= 3) break;
+    bool ok = heltecCli(line, s_cli_out, sizeof(s_cli_out), 4000); noreply = ok ? 0 : noreply + 1; total++;
+    jsonEsc(esc, sizeof(esc), ok ? s_cli_out : ""); jsonEsc(ec, sizeof(ec), line);
+    if (o + strlen(esc) + strlen(ec) + 64 > 3400) { snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "]}"); csSendOrKeep(s_mesh_body); part++; head(); }
+    o += snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "%s[\"%s\",\"%s\"]", items ? "," : "", ec, esc); items++;
+  }
+  heltecCliEnd();
+  snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "],\"final\":true,\"count\":%d%s}", total, noreply >= 3 ? ",\"error\":\"no reply from Heltec\"" : "");
+  csSendOrKeep(s_mesh_body);
+  if (total && noreply < 3) { s_cs_last = rtcNow(); Preferences p; p.begin("tsimcs", false); p.putLong64("last", s_cs_last); p.end(); }
+  logf("cfgsnap: %d command(s) in %lus", total, (unsigned long)((millis() - t0) / 1000));
+}
+
 static bool handleCommand(const char *from, const char *body) {
   (void)from;
   strncpy(s_cmdbuf, body, sizeof(s_cmdbuf) - 1);
@@ -2098,16 +2200,19 @@ static bool handleCommand(const char *from, const char *body) {
   if (len >= 4 && strcasecmp(s_cmdbuf + len - 4, " ACK") == 0) {
     s_cmdbuf[len - 4] = 0; normalizeSmsBody(s_cmdbuf);
   }
+  telemRefreshSignal();
   if (strcasecmp(s_cmdbuf, "STATUS") == 0) {
     doStatusReport();
     doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
     if (s_gps_auto && !s_gps_done) { static char go[300]; gpsReport("auto", go, sizeof(go)); }  // v1.6.7 optional location on check-in
     meshSnapshot();
+    cfgSnapshot();   // v1.7.0
     return true;
   }
   if (strcasecmp(s_cmdbuf, "CMD") == 0) {
     doConsoleCommands();
     meshSnapshot();
+    cfgSnapshot();   // v1.7.0
     return true;
   }
   if (strcasecmp(s_cmdbuf, "REBOOT") == 0) {
@@ -2411,7 +2516,7 @@ void setup() {
   analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
   analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
   pwrLoad();
-  gpsLoad();
+  gpsLoad(); csLoad();
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
   if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {

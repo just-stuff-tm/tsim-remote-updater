@@ -481,6 +481,36 @@ async function handleIngest(request, env, id) {
   try { t = JSON.parse(raw); } catch { return json({ error: "bad json" }, 400); }
   const entry = { ...sanitizeTelemetry(t), received_at: new Date().toISOString() };
   if (t.test === true) entry.test = true;
+  const tlf = tlFields(t.tl);
+  if (Object.keys(tlf).length) {  // v1.7.0: every post refreshes the T-SIM card
+    const prev0 = (await kvJson(env, `telem:${id}:latest`)) || {};
+    await putJson(env, `telem:${id}:latest`, { ...prev0, ...tlf, tl_at: entry.received_at, received_at: entry.received_at });
+  }
+  if (t.type === "cfgsnap") {
+    const items = Array.isArray(t.items) ? t.items.slice(0, 60) : [];
+    const cv = (await kvJson(env, `rptcfg:${id}`)) || {}, L = (await kvJson(env, `rptlist:${id}`)) || {};
+    let n = 0;
+    for (const it of items) {
+      if (!Array.isArray(it) || typeof it[0] !== "string") continue;
+      const cmd = it[0].slice(0, 120), out = String(it[1] ?? "").slice(0, CMD_OUT_MAX), li = CACHE_LISTS[cmd.toLowerCase()];
+      if (li) { const txt = cleanCli(out); L[li] = { raw: txt.slice(0, 1500), at: entry.received_at, error: !txt ? "No reply from the repeater" : (/^(error|err\b|\?\?)|unsupported|unknown command/i.test(txt) ? txt.slice(0, 120) : null), src: "cache" }; n++; continue; }
+      const rs = parseSettingReply(cmd, out);
+      if (!rs || rs.op !== "get") continue;
+      if (rs.value != null) cv[rs.key] = { value: rs.value, at: entry.received_at, src: "cache" };
+      else if (rs.unsupported) cv[rs.key] = { unsupported: true, value: null, at: entry.received_at, src: "cache" };
+      else continue;  // a missing reply keeps the last good value
+      n++;
+    }
+    await putJson(env, `rptcfg:${id}`, cv); await putJson(env, `rptlist:${id}`, L);
+    const meta = (await kvJson(env, `rptcache:${id}`)) || {};
+    meta.last_part_at = entry.received_at; meta.parts = (t.part === 0 ? 0 : meta.parts || 0) + 1; meta.items = (t.part === 0 ? 0 : meta.items || 0) + n;
+    if (t.final) { meta.at = entry.received_at; meta.count = typeof t.count === "number" ? t.count : meta.items; meta.error = t.error ? String(t.error).slice(0, 80) : null; }
+    await putJson(env, `rptcache:${id}`, meta);
+    const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
+    await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at });
+    if (t.final) await logActivity(env, id, { type: "event", msg: `Repeater settings cached by the T-SIM: ${meta.items} value(s)${meta.error ? " (" + meta.error + ")" : ""}` });
+    return json({ ok: true });
+  }
   if (entry.type === "mesh") {
     const mesh = { ...parseMesh(t), received_at: entry.received_at, ...(entry.test ? { test: true } : {}) };
     // Generic (any MeshCore-style firmware): a poll where the CLI gave no reply at all = power saving / asleep.
@@ -512,6 +542,9 @@ async function handleIngest(request, env, id) {
   if (entry.type === "cmd") {
     const cmdId = String(t.cmd_id || "").slice(0, 16);
     const out = String(t.output ?? "").slice(0, CMD_OUT_MAX);
+    // MeshCore prints some replies raw (e.g. "get acl", "log") without the "-> " marker; older T-SIM firmware then
+    // flags "no reply" even though the output is there. Real output means the repeater answered.
+    if (t.error && /no reply/i.test(String(t.error)) && cleanCli(out) && !/^\s*$/.test(out)) { const o1 = cleanCli(out), cmd1 = String(t.cmd || "").trim(); if (o1 !== cmd1) delete t.error; }
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const c = list.find((x) => x.id === cmdId);
     // System (non-user) commands: T-SIM self-update, firmware-tagged sys, or anything the user never queued.
@@ -753,7 +786,7 @@ export function buildRptOp(o) {
     case "region.home": return [{ cmd: `region home ${rg(o.name)}` }, { cmd: "region save" }, ...refresh];
     case "region.default": return [{ cmd: `region default ${o.name ? rg(o.name) : "<null>"}` }, { cmd: "region save" }, ...refresh];
     case "acl.set": { const pk = need(HEX, o.pubkey, "public key (hex)"), pm = Number(o.perm); if (![0, 1, 2, 3].includes(pm)) throw new Error("Pick a permission"); return [{ cmd: `setperm ${pk} ${pm}`, risk: pm === 3 }, { cmd: "get acl", list: "acl" }]; }
-    case "acl.remove": return [{ cmd: `setperm ${need(HEX, o.pubkey, "public key (hex)")}`, risk: true }, { cmd: "get acl", list: "acl" }];
+    case "acl.remove": return [{ cmd: `setperm ${need(HEX, o.pubkey, "public key (hex)")} 0`, risk: true }, { cmd: "get acl", list: "acl" }];  // MeshCore 1.18 needs a value; 0 = removed
     case "sensor.get": { const k = need(/^[A-Za-z0-9_.]{1,32}$/, o.key, "sensor setting name"); return [{ cmd: `sensor get ${k}`, list: "sensor:" + k }]; }
     case "sensor.set": { const k = need(/^[A-Za-z0-9_.]{1,32}$/, o.key, "sensor setting name"), v = need(/^[\x21-\x7e][\x20-\x7e]{0,59}$/, o.value, "value"); return [{ cmd: `sensor set ${k} ${v}` }, { cmd: "sensor list", list: "sensors" }]; }
     case "log.start": return [{ cmd: "log start" }]; case "log.stop": return [{ cmd: "log stop" }];
@@ -795,7 +828,7 @@ export function calcAdcMultiplier(cur, meterV, reportedV) {
   if (!(v > 0)) throw new Error("That works out to 0, which would mean \"board default\". Check the readings.");
   return v;
 }
-export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
+export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg|cfgsnap)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
 // ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
 export const LB_RATIO = 1.10;
@@ -835,6 +868,24 @@ export function validatePower(cur, b, rawIdle) {
 export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
 // ---------- GPS / location (T-SIM firmware 1.6.7+) ----------
 export const GPS_FW = "1.6.7";
+// ---------- v1.7.0: T-SIM settings cache + telemetry on every post ----------
+export const CACHE_FW = "1.7.0", DEFAULT_CACHE = { en: false, int_h: 24 };
+export const CACHE_LISTS = { "region": "regions", "region home": "home", "region default": "default", "get acl": "acl" };
+export const cfgListCmds = (vals = {}) => [...rptReadAllKeys(vals).map(rptGetCmd), ...Object.keys(CACHE_LISTS)];
+export const cacheCmd = (c, now) => `CFGSNAP en=${c.en ? 1 : 0} int=${c.int_h}${now ? " now=1" : ""}`;
+// "tl" telemetry block on every post -> fields of the latest T-SIM report
+export function tlFields(tl) {
+  if (!tl || typeof tl !== "object") return {};
+  const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined), o = {};
+  const map = { bv: "battery_v", bp: "battery_pct", bl: "battery_load_v", sv: "solar_v", up: "uptime", wake: "wake", heap: "heap", tc: "chip_temp_c", lb: "lb_state" };
+  for (const [k, f] of Object.entries(map)) if (n(tl[k]) !== undefined) o[f] = tl[k];
+  if (n(tl.csq) !== undefined && tl.csq >= 0 && tl.csq !== 99) o.csq = tl.csq;
+  if (n(tl.rsrp) !== undefined && tl.rsrp !== 0) o.rsrp = tl.rsrp;
+  if (o.battery_v !== undefined && o.battery_v < 0.5) { delete o.battery_v; delete o.battery_pct; }  // USB power: no reading
+  if (typeof tl.fw === "string") o.fw = tl.fw.slice(0, 60);
+  if (n(tl.glat) !== undefined && n(tl.glon) !== undefined) o.gps_cached = { lat: tl.glat, lon: tl.glon, sats: n(tl.gsats) ?? null, at: n(tl.gat) > 1e9 ? new Date(tl.gat * 1000).toISOString() : null };
+  return o;
+}
 export const DEFAULT_GPS = { auto: false, timeout_s: 180 };
 const isGpsCmd = (cmd) => /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}`;
@@ -940,7 +991,7 @@ async function handleDeviceCommands(request, env, id) {
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd))).reverse().slice(0, cmdsPerWake(lat.fw));
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || ""))).reverse().slice(0, cmdsPerWake(lat.fw));
   // never let the reply overflow the T-SIM's fetch buffer (a cut line would run a truncated command)
   let bytes = 0; const fits = []; for (const c of pending) { bytes += `${c.id}\t${c.cmd}\n`.length; if (bytes > (fwAtLeast(lat.fw, BATCH_FW) ? CMD_FETCH_BYTES : 1700)) break; fits.push(c); }
   pending.length = 0; pending.push(...fits);
@@ -950,6 +1001,14 @@ async function handleDeviceCommands(request, env, id) {
   return new Response(pending.map((c) => `${c.id}\t${c.cmd.replace("{{now}}", String(nowS))}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
 }
 
+// v1.7.0: list of read-only commands the T-SIM caches (text/plain, one per line).
+async function handleCfgList(request, env, id) {
+  const dev = await getDevice(env, id);
+  const key = request.headers.get("X-Device-Key") || "";
+  if (!dev || !dev.ingest_key || !safeEq(key, dev.ingest_key)) return json({ error: "unauthorized" }, 401);
+  const vals = (await kvJson(env, `rptcfg:${id}`)) || {};
+  return new Response(cfgListCmds(vals).join("\n") + "\n", { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
+}
 // ---------- admin ----------
 async function handleAdmin(request, env, parts) {
   const auth = request.headers.get("Authorization") || "";
@@ -1152,7 +1211,7 @@ async function deviceApi(request, env, dev, action) {
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => c.cmd), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => c.cmd), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -1416,6 +1475,23 @@ async function deviceApi(request, env, dev, action) {
     let o; try { o = setNick(await kvJson(env, `nicks:${id}`), b.hash, b.name); } catch (e) { return json({ error: e.message }, 400); }
     await putJson(env, `nicks:${id}`, o);
     return json({ saved: true, nicks: o });
+  }
+  if (action === "cache-settings") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const cur = { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) };
+    const c = { en: b.en !== undefined ? b.en === true : cur.en, int_h: b.int_h !== undefined ? Number(b.int_h) : cur.int_h };
+    if (![1, 3, 6, 12, 24, 48, 168].includes(c.int_h)) return json({ error: "Pick an interval" }, 400);
+    const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
+    if (!fwAtLeast(lat.fw, CACHE_FW)) return json({ error: `Needs T-SIM firmware ${CACHE_FW} or newer. Update the T-SIM firmware first.` }, 409);
+    await putJson(env, `cachecfg:${id}`, c);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    for (const x of list) if (x.status === "queued" && /^cfgsnap\s/i.test(x.cmd || "")) x.status = "cancelled";
+    const entry = { id: randomHex(4), cmd: cacheCmd(c, b.now === true), sys: true, status: "queued", queued_at: new Date().toISOString() };
+    list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    let wake = null;
+    if (b.now === true) { const [o, cc] = await manualSend(env, dev, "CMD", "CMD (settings cache refresh)"); wake = { ...o, status: cc }; }
+    await logActivity(env, id, { type: "action", msg: `Settings cache: ${c.en ? "ON every " + c.int_h + " h" : "off"}${b.now ? ", refresh now" : " (applied at next wake)"}` });
+    return json({ saved: true, settings: c, queued: entry, wake });
   }
   if (action === "gps-settings") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -1749,6 +1825,11 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="psnote" id="rscon" hidden>Turn on "Allow console commands" under Repeater console below to use repeater settings.</p>
 <div class="acts" style="margin-top:0"><button type="button" id="rsreadall">Read all</button><button type="button" id="rssave" class="w" disabled>Save changes</button>
 <button type="button" class="g" data-rsact="advert">Send flood advert</button><button type="button" class="g" data-rsact="advert.zerohop">Send zero-hop advert</button></div>
+<details class="small" id="cachebox" style="margin:6px 0"><summary><b>Settings cache on the T-SIM</b> <small id="cachesum" class="mut"></small></summary>
+<p class="small mut">With this on, the T-SIM re-reads these settings (plus regions and the access list) by itself on a wake it already makes, at most every N hours, so values here stay current without extra texts. Reads take about 30 s of serial time; skipped while battery protection has the repeater off or the repeater doesn't answer (power saving). Needs T-SIM firmware 1.7.0+.</p>
+<label class="tog"><input type="checkbox" id="cacheon"> Keep repeater settings cached</label>
+<label>Refresh at most every<select id="cacheint"><option value="6">6 hours</option><option value="12">12 hours</option><option value="24">24 hours</option><option value="48">2 days</option><option value="168">1 week</option></select></label>
+<button type="button" class="g sm" id="cachesave">Save</button> <button type="button" class="g sm" id="cachenow">Refresh cache now (1 text)</button> <span id="cachemsg" class="msg"></span></details>
 <div id="rsq" class="small"></div><span id="rsmsg" class="msg"></span>
 <div id="rsgrid"></div>
 <div id="rtools">
@@ -1909,8 +1990,8 @@ async function load(){unitsBtn();
  const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  $("seen").textContent=seen?(stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale?" stale":"");
- $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
- $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
+ $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
+ $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Battery protection",L.lb_state==null?null:(L.lb_state?"Repeat OFF (low battery)":"normal")],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
  const US=d.update_status||{};
@@ -2070,8 +2151,8 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
    else if(i.type==="radio"){if(!document.querySelector(".rsrow.dirty #rs-preset")){const p=String(v.value).split(",");if(p.length===4){$("rs-radio-f").value=String(+p[0]);$("rs-radio-bw").value=String(+p[1]);$("rs-radio-sf").value=String(+p[2]);$("rs-radio-cr").value=String(+p[3]);
      const m=[].find.call($("rs-preset").options,o=>o.value&&o.value.split(",").map(Number).join()===p.map(Number).join());$("rs-preset").value=m?m.value:""}}}
    else if(!i.wo){const el=$(rsId(i.k));if(el&&!el.closest(".rsrow").classList.contains("dirty"))el.value=i.type==="sel"?String(v.value).toLowerCase():i.type==="num"?String(parseFloat(v.value)):i.type==="secret"?"":v.value}}
-  st.innerHTML=q?'<span class="mut">⏳ '+(q==="sent"?"sent to the T-SIM, waiting for the reply":"queued for the next wake")+'</span>':v.unsupported?'<span class="mut">Not supported by this repeater'+(v.at?" · "+e(t(v.at)):"")+'</span>':v.error?'<span class="err">'+e(v.error)+(v.at?" · "+e(t(v.at)):"")+'</span>':v.at?'<span class="mut">'+(v.set?"Changed "+e(t(v.at))+(v.msg?" · "+e(v.msg):""):"Read "+e(t(v.at)))+'</span>':i.wo?"":'<span class="mut">Not read yet</span>'}
- rsScrub();
+  st.innerHTML=q?'<span class="mut">⏳ '+(q==="sent"?"sent to the T-SIM, waiting for the reply":"queued for the next wake")+'</span>':v.unsupported?'<span class="mut">Not supported by this repeater'+(v.at?" · "+e(t(v.at)):"")+'</span>':v.error?'<span class="err">'+e(v.error)+(v.at?" · "+e(t(v.at)):"")+'</span>':v.at?'<span class="mut">'+(v.set?"Changed "+e(t(v.at))+(v.msg?" · "+e(v.msg):""):(v.src==="cache"?"Cached by T-SIM ":"Read ")+e(t(v.at)))+'</span>':i.wo?"":'<span class="mut">Not read yet</span>'}
+ rsScrub();showCache(d);
  RS.forEach((c,ci)=>{if(c.dep)$("rscat"+ci).hidden=!depOkC(RV[c.dep])});showTools(d);
  RS.forEach((c,ci)=>{const ks=c.items.filter(i=>!i.wo).map(i=>i.k),ats=ks.map(k=>RV[k]&&RV[k].at).filter(Boolean).sort();$("rssum"+ci).textContent=ats.length?"read "+ago(ats[ats.length-1]):"not read"});
  const nq=Object.values(RQ).filter(x=>x==="queued").length,ns=Object.values(RQ).filter(x=>x==="sent").length;
@@ -2081,6 +2162,15 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
 async function rsRead(keys,what){const w=Math.ceil(keys.length/PERWAKE);
  if(!confirm("Read "+(what||"all repeater settings")+"? This queues "+keys.length+" commands and sends one text now."+(w>1?"\\n\\nThe T-SIM runs "+PERWAKE+" commands per wake, so this needs "+w+" wakes: after the first batch, press \\"Send next batch\\" for the rest.":"")))return;
  const r=await post("rpt-read",{keys});const j=await rj(r);say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(j.queued?"Queued "+j.queued+" reads. "+(j.wake&&j.wake.sent?"Text sent; values appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Already queued."):(j.error||friendly(j,r.status)));load()}
+let cacheLoaded=false;
+function showCache(d){const C=d.cache||{},S=C.settings||{},X=C.last;
+ $("cachesum").textContent=!C.supported?"needs T-SIM 1.7.0":(S.en?"on · every "+(S.int_h>=48?S.int_h/24+" days":S.int_h+" h"):"off")+(X&&X.at?" · last "+ago(X.at)+(X.error?" ("+X.error+")":""):"")+(C.pending?" · change waiting for the T-SIM":"");
+ ["cacheon","cacheint","cachesave","cachenow"].forEach(x=>$(x).disabled=!C.supported);
+ if(!cacheLoaded){$("cacheon").checked=!!S.en;$("cacheint").value=String(S.int_h||24);cacheLoaded=true}}
+async function cachePost(now){const b={en:$("cacheon").checked,int_h:+$("cacheint").value,now};
+ if(now&&!confirm("Text the T-SIM so it reads and caches all repeater settings now?"))return;
+ const r=await post("cache-settings",b);const j=await rj(r);say("cachemsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(now?(j.wake&&j.wake.sent?"Text sent; values update within a few minutes.":"Saved; wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Saved. Applied at the T-SIM's next wake."):(j.error||friendly(j,r.status)));cacheLoaded=false;load()}
+$("cachesave").onclick=()=>cachePost(false);$("cachenow").onclick=()=>cachePost(true);
 $("rsreadall").onclick=()=>rsRead(RS.filter(c=>!c.noAll).flatMap(c=>c.items.filter(i=>!i.wo&&(!i.dep||depOkC(RV[i.dep]))).map(i=>i.k)));
 $("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const changes={};ch.forEach(i=>changes[i.k]=rsCur(i));
  const risky=ch.filter(i=>i.risk),lines=ch.map(i=>"• "+i.label+": "+(i.type==="secret"?"(hidden)":i.type==="radio"?changes[i.k].replace(/,/g," / ")+"  (MHz / kHz / SF / CR)":changes[i.k])+(i.risk?"  ⚠":""));
@@ -2098,20 +2188,20 @@ $("cmd").addEventListener("keydown",ev=>{const h=CH();if(ev.key==="ArrowUp"&&h.l
 function cliRemember(c){const h=CH().filter(x=>x!==c);h.unshift(c);localStorage.setItem("clihist",JSON.stringify(h.slice(0,50)));chi=-1}
 $("clipick").onchange=ev=>{const v=ev.target.value;if(!v)return;$("cmd").value=v;$("cmd").focus();ev.target.value=""};
 
-function rgParse(raw){const out=[];const st=[];String(raw||"").split("\\n").forEach(l=>{if(!l.trim()||/^(err|error|\\?\\?)/i.test(l.trim()))return;const ind=(l.match(/^\\s*/)[0].length)>>1,tok=l.trim().split(/\\s+/),name=tok[0].replace(/^->\\s*/,"");if(!name||!/^(\\*|[#A-Za-z0-9_.\\-]+)$/.test(name))return;
- st.length=ind;const parent=ind?st[ind-1]:"";st[ind]=name;out.push({name,flood:/\\bF\\b/.test(tok.slice(1).join(" ")),parent,depth:ind})});return out}
-function aclParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{const m=l.match(/([0-9A-Fa-f]{8,64})\\W+(?:perm(?:issions)?\\W*)?([0-3])\\b/);if(m)r.push({pk:m[1],perm:+m[2]})});return r}
+function rgParse(raw){const out=[];const st=[];String(raw||"").split("\\n").forEach(l=>{if(!l.trim()||/^(err|error|\\?\\?)/i.test(l.trim()))return;const ind=l.replace(/^\\s*->\\s?/,"").match(/^\\s*/)[0].length,tok=l.trim().replace(/^->\\s*/,"").split(/\\s+/),home=/\\^$/.test(tok[0]),name=tok[0].replace(/\\^$/,"");if(!name||!/^(\\*|[#A-Za-z0-9_.\\-]+)$/.test(name))return;
+ st.length=ind;const parent=ind?st[ind-1]:"";st[ind]=name;out.push({name,home,flood:/\\bF\\b/.test(tok.slice(1).join(" ")),parent,depth:ind})});return out}
+function aclParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{l=l.trim();let m=l.match(/^([0-9A-Fa-f]{2})\\s+([0-9A-Fa-f]{16,64})$/);if(m)return r.push({pk:m[2],perm:parseInt(m[1],16)&3,raw:parseInt(m[1],16)});m=l.match(/([0-9A-Fa-f]{16,64})\\W+([0-3])\\b/);if(m)r.push({pk:m[1],perm:+m[2]})});return r}
 function snParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{const m=l.trim().match(/^([A-Za-z0-9_.]+)=(.*)$/);if(m)r.push({k:m[1],v:m[2]})});return r}
 function snVal(L,x){const g=L["sensor:"+x.k],base=L.sensors;if(g&&(!base||g.at>base.at))return g.error?{v:x.v,st:'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(g.error)?"Not supported":g.error)+'</span>'}:{v:g.raw.replace(/^>\\s*/,"").replace(/^[A-Za-z0-9_.]+=/,""),st:'<span class="mut">Read '+e(t(g.at))+'</span>'};return{v:x.v,st:base?'<span class="mut">Read '+e(t(base.at))+'</span>':""}}
 const PERM=["Guest","Read-only","Read-write","Admin"];
-function lstat(L,k){const x=L[k];return x?(x.error?'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(x.error)?"Not supported by this repeater":x.error)+'</span> · '+e(t(x.at)):'<span class="mut">Read '+e(t(x.at))+'</span>'):'<span class="mut">Not read yet</span>'}
+function lstat(L,k){const x=L[k];return x?(x.error&&!(x.raw&&/no reply/i.test(x.error))?'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(x.error)?"Not supported by this repeater":x.error)+'</span> · '+e(t(x.at)):'<span class="mut">'+(x.src==="cache"?"Cached by T-SIM ":"Read ")+e(t(x.at))+'</span>'):'<span class="mut">Not read yet</span>'}
 function showTools(d){const R=d.rpt||{},L=R.lists||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);$("rtools").classList.toggle("dim",PS||!S.console_enabled);
  const rg=rgParse(L.regions&&!L.regions.error?L.regions.raw:"");
- $("rgst").innerHTML=lstat(L,"regions")+(L.home&&!L.home.error?' · home: <b>'+e(L.home.raw.replace(/^>\\s*/,"")||"none")+'</b>':"")+(L.default&&!L.default.error?' · default scope: <b>'+e(L.default.raw.replace(/^>\\s*/,"")||"none")+'</b>':"");
- $("rglist").innerHTML=rg.length?'<table class="small"><thead><tr><th>Region</th><th>Flooding</th><th></th></tr></thead><tbody>'+rg.map(r=>'<tr><td style="padding-left:'+(r.depth*14)+'px">'+e(r.name)+'</td><td>'+(r.flood?'<span class="ok">allowed</span>':'<span class="mut">blocked</span>')+'</td><td class="nowrap"><button type="button" class="g sm" data-rg="flood" data-n="'+e(r.name)+'" data-a="'+(r.flood?0:1)+'">'+(r.flood?"Block":"Allow")+'</button> <button type="button" class="g sm" data-rg="home" data-n="'+e(r.name)+'">Home</button> <button type="button" class="g sm" data-rg="default" data-n="'+e(r.name)+'">Default</button>'+(r.name==="*"?"":' <button type="button" class="g sm" data-rg="remove" data-n="'+e(r.name)+'">✕</button>')+'</td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.regions?"No regions defined.":"Press Read regions.")+'</p>';
+ $("rgst").innerHTML=lstat(L,"regions")+(L.home&&!L.home.error?' · home: <b>'+e(L.home.raw.replace(/^>\\s*/,"").replace(/^home is\\s*/i,"")||"none")+'</b>':"")+(L.default&&!L.default.error?' · default scope: <b>'+e(L.default.raw.replace(/^>\\s*/,"").replace(/^default scope is\\s*/i,"").replace("<null>","none")||"none")+'</b>':"");
+ $("rglist").innerHTML=rg.length?'<table class="small"><thead><tr><th>Region</th><th>Flooding</th><th></th></tr></thead><tbody>'+rg.map(r=>'<tr><td style="padding-left:'+(r.depth*14)+'px">'+e(r.name)+(r.home?' <span class="badge">home</span>':'')+'</td><td>'+(r.flood?'<span class="ok">allowed</span>':'<span class="mut">blocked</span>')+'</td><td class="nowrap"><button type="button" class="g sm" data-rg="flood" data-n="'+e(r.name)+'" data-a="'+(r.flood?0:1)+'">'+(r.flood?"Block":"Allow")+'</button> <button type="button" class="g sm" data-rg="home" data-n="'+e(r.name)+'">Home</button> <button type="button" class="g sm" data-rg="default" data-n="'+e(r.name)+'">Default</button>'+(r.name==="*"?"":' <button type="button" class="g sm" data-rg="remove" data-n="'+e(r.name)+'">✕</button>')+'</td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.regions?"No regions defined.":"Press Read regions.")+'</p>';
  $("rgparent").innerHTML='<option value="">(top level, *)</option>'+rg.map(r=>'<option>'+e(r.name)+'</option>').join("");
  $("rgraw").textContent=L.regions?L.regions.raw:"";
- const acl=aclParse(L.acl&&!L.acl.error?L.acl.raw:"");$("aclst").innerHTML=lstat(L,"acl");
+ const acl=aclParse(L.acl?L.acl.raw:"");$("aclst").innerHTML=lstat(L,"acl");
  $("acllist").innerHTML=acl.length?'<table class="small"><tbody>'+acl.map(a=>'<tr><td class="mono">'+e(a.pk.slice(0,16))+(a.pk.length>16?"…":"")+'</td><td>'+PERM[a.perm]+'</td><td><button type="button" class="g sm" data-acl="'+e(a.pk)+'">Remove</button></td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.acl&&!L.acl.error?"No entries.":"")+'</p>';$("aclraw").textContent=L.acl?L.acl.raw:"";
  const sn=snParse(L.sensors&&!L.sensors.error?L.sensors.raw:"");$("snst").innerHTML=lstat(L,"sensors");
  $("snlist").innerHTML=sn.length?sn.map(x=>{const sv=snVal(L,x),q=(R.ops_q||[]).includes("sensor get "+x.k);return '<div class="row small"><code>'+e(x.k)+'</code><input data-snk="'+e(x.k)+'" value="'+e(sv.v)+'" maxlength="60" style="flex:1"><button type="button" class="g sm" data-sng="'+e(x.k)+'">Read</button><button type="button" class="g sm" data-sns="'+e(x.k)+'">Set</button> '+(q?'<span class="mut">⏳ waiting</span>':sv.st)+'</div>'}).join(""):'<p class="small mut">'+(L.sensors&&!L.sensors.error?"No sensors.":"")+'</p>';
@@ -2261,6 +2351,7 @@ export default {
     try {
       if (parts[0] === "ingest" && parts.length === 2 && m === "POST") return await handleIngest(request, env, parts[1]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "commands" && m === "GET") return await handleDeviceCommands(request, env, parts[2]);
+      if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "cfglist" && m === "GET") return await handleCfgList(request, env, parts[2]);
       if (parts[0] === "admin" && (parts[1] === "devices" || parts[1] === "accounts")) return await handleAdmin(request, env, parts.slice(1));
       if (url.pathname === "/" && m === "GET") {
         const acc = await getAccess(request, env);

@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -845,5 +845,39 @@ console.log("tag/asset version ok");
   await P("commands", { cancel: true });
   await ingest({ type: "status", fw: "tsim-updater 1.6.8" });
   console.log("1.6.9 batch tests OK");
+  // ---------- v1.7.0 ----------
+  const ACL = "ACL:\r\n03 FB38B387E417DCBDC97E8DF46BF8B8C2EC2A20C98B75D6D1A53E4B8A57030CEB\n03 72A1AC8A92A8ABBB986DD64B2EA673944FF1B5D9806ED1C864CA966FA6CA961D";
+  assert.equal(buildRptOp({ op: "acl.remove", pubkey: "abcd1234" })[0].cmd, "setperm abcd1234 0", "MeshCore 1.18 needs a permission value");
+  await P("settings", { console_enabled: true }); unthrottle();
+  await P("rpt-ops", { ops: [{ op: "read", what: "acl" }] });
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  const psBefore = JSON.parse(kv.get("state:tsim-1") || "{}").heltec_powersaving;
+  await ingest({ type: "cmd", cmd_id: fl[0][0], cmd: "get acl", output: ACL, error: "no reply from Heltec" });
+  tl = await TEL(); assert.equal(tl.rpt.lists.acl.error, null, "raw ACL printout is a reply"); assert(tl.rpt.lists.acl.raw.includes("FB38B387"));
+  assert.notEqual(JSON.parse(kv.get("state:tsim-1") || "{}").heltec_powersaving === true && psBefore !== true, true, "raw printout must not flag power saving");
+  // telemetry block on any post
+  assert.deepEqual(tlFields({ bv: 3.95, bp: 78, sv: 5.1, csq: 99, tc: 41.5, fw: "tsim-updater 1.7.0" }), { battery_v: 3.95, battery_pct: 78, solar_v: 5.1, chip_temp_c: 41.5, fw: "tsim-updater 1.7.0" });
+  assert.equal(tlFields({ bv: 0.1 }).battery_v, undefined, "USB power: no battery reading");
+  await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.0", bv: 3.91, bp: 75, bl: 3.8, sv: 6.2, csq: 17, rsrp: -98, up: 42, heap: 150000, tc: 38.2, lb: 0, glat: 40.1, glon: -77.2, gsats: 8, gat: 1792000000 } });
+  tl = await TEL(); assert.equal(tl.latest.solar_v, 6.2); assert.equal(tl.latest.chip_temp_c, 38.2); assert.equal(tl.latest.csq, 17); assert.equal(tl.latest.gps_cached.sats, 8); assert.equal(tl.latest.fw, "tsim-updater 1.7.0");
+  // settings cache
+  assert.equal((await call("/api/dev/tsim-1/cfglist", { headers: { "X-Device-Key": "bad" } })).status, 401);
+  const cl2 = await (await call("/api/dev/tsim-1/cfglist", { headers: { "X-Device-Key": dev.ingest_key } })).text();
+  assert(cl2.includes("get name\n") && cl2.includes("get acl\n") && cl2.includes("region home\n") && !/^(set |password )/m.test(cl2));
+  assert(cfgListCmds({}).length <= 48);
+  r = await P("cache-settings", { en: true, int_h: 12 }); assert.equal(r.status, 200); j = await r.json(); assert.equal(j.queued.cmd, "CFGSNAP en=1 int=12"); assert.equal(j.wake, null, "no text unless refresh now");
+  assert.equal((await P("cache-settings", { en: true, int_h: 5 })).status, 400);
+  await ingest({ type: "cfgsnap", part: 0, items: [["get name", "  -> > Cached Name"], ["get radio.fem.rxgain", "  -> Error: unsupported"], ["get tx", ""], ["get acl", ACL], ["region home", "  -> home is *"]], final: true, count: 5 });
+  tl = await TEL(); assert.equal(tl.rpt.vals.name.value, "Cached Name"); assert.equal(tl.rpt.vals.name.src, "cache"); assert.equal(tl.rpt.vals.tx.value, "20", "missing reply keeps last value");
+  assert.equal(tl.rpt.lists.acl.src, "cache"); assert.equal(tl.cache.last.items, 4); assert.equal(tl.cache.settings.int_h, 12); assert.equal(tl.cache.pending, true);
+  // older firmware never receives CFGSNAP (it would go to the repeater CLI)
+  await ingest({ type: "status", fw: "tsim-updater 1.6.9" });
+  let cl3 = await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text(); assert(!cl3.includes("CFGSNAP"));
+  assert.equal((await P("cache-settings", { en: false })).status, 409);
+  await ingest({ type: "status", fw: "tsim-updater 1.7.0" });
+  cl3 = await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text(); assert(cl3.includes("CFGSNAP en=1 int=12"));
+  const ph4 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); assert(ph4.includes('id="cacheon"')); for (const m of ph4.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  await P("commands", { cancel: true }); await ingest({ type: "status", fw: "tsim-updater 1.6.8" });
+  console.log("v1.7.0 cache / telemetry / ACL tests OK");
   await P("settings", { console_enabled: false });
 }
