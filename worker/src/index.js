@@ -687,7 +687,8 @@ export const rptGetCmd = (k) => (RPT_INDEX[k] && RPT_INDEX[k].get) || (k === "po
 const rptSetPrefix = (i) => i.set || (i.k === "powersaving" ? "powersaving " : i.k === "password" ? "password " : "set " + i.k + " ");
 export const RPT_READ_KEYS = Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => i.k);
 // "Read all": everything except diagnostics, and bridge settings only once the repeater reported a bridge type.
-export const rptReadAllKeys = (vals = {}) => Object.values(RPT_INDEX).filter((i) => !i.wo && !i.noAll && (!i.dep || (vals[i.dep] && vals[i.dep].value != null))).map((i) => i.k);
+export const rptReadAllKeys = (vals = {}) => Object.values(RPT_INDEX).filter((i) => !i.wo && !i.noAll && (!i.dep || depOk(vals[i.dep]))).map((i) => i.k);
+export function depOk(v) { return !!(v && v.value != null && !/^(none|no|off|-|n\/a)?$/i.test(String(v.value).trim())); }
 const RPT_GETMAP = Object.fromEntries(Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => [rptGetCmd(i.k).toLowerCase(), i.k]));
 const RPT_SETS = Object.values(RPT_INDEX).filter((i) => !i.ro).map((i) => [rptSetPrefix(i).toLowerCase(), i.k]).sort((a, b) => b[0].length - a[0].length);
 // Parse a reply to a settings get/set command: { key, op, value?, unsupported?, error? } or null.
@@ -1614,7 +1615,7 @@ details.card>summary::after{content:"▸";color:var(--mut)}details[open].card>su
 .sens{filter:blur(5px);user-select:none;transition:filter .15s}.showsens .sens{filter:none;user-select:auto}.eye{border:0;background:none;padding:0 2px;cursor:pointer;font-size:13px;width:auto;min-width:0}
 .term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:10px 12px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}.term .pr{color:#3fb950}.term .ts{color:#8b949e;font-size:11px}.term .to{color:#e6edf3;margin:0 0 6px 14px}.term .te{color:#ff7b72;margin:0 0 6px 14px}
 .term-in{background:#0d1117;border-radius:8px;padding:4px 8px;align-items:center}.term-in .pr{color:#3fb950;font-family:ui-monospace,monospace}.term-in input{background:transparent;color:#e6edf3;border:0;flex:1}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.rscat{margin-top:10px}.rsr{padding:1px 8px;font-size:11px;margin-left:6px;vertical-align:middle}.nowrap{white-space:nowrap}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
+.rscat{margin-top:10px}.rssec{margin:0}.rsr{padding:1px 8px;font-size:11px;margin-left:6px;vertical-align:middle}.nowrap{white-space:nowrap}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
 .psnote{background:#d1242f1a;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px;font-size:13px}.dim{opacity:.45}
 .tog{display:flex;gap:8px;align-items:center;margin:8px 0;color:var(--fg);font-size:15px}.tog input{width:auto;margin:0}
 pre.o{margin:0;max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px}code{font-size:12px}
@@ -2027,7 +2028,8 @@ $("adcf").onsubmit=async ev=>{ev.preventDefault();const mv=+ev.target.mv.value;c
  adcPost({op:"set",meter_v:mv},"Set the repeater's battery multiplier from "+p.current.toFixed(3)+" to "+p.new_mult.toFixed(3)+" (repeater "+p.reported_v.toFixed(2)+" V, meter "+p.meter_v.toFixed(2)+" V)? One text is sent now.")};
 $("adcreset").onclick=()=>adcPost({op:"reset"},"Reset the repeater's battery multiplier to the board default? One text is sent now.");
 const RS=${JSON.stringify(RPT_SETTINGS)},RP=${JSON.stringify(RADIO_PRESETS)},PERWAKE0=${CMDS_PER_WAKE};let PERWAKE=PERWAKE0;
-let RV={},RQ={},RLOAD=false;
+let RV={},RQ={},RLOAD=false;const TYPED=new Set();
+const depOkC=v=>!!(v&&v.value!=null&&!/^(none|no|off|-|n\\/a)?$/i.test(String(v.value).trim()));
 const rsId=k=>"rs-"+k;
 function rsInput(i){const id=rsId(i.k);
  if(i.ro)return '<div class="rsro'+(i.mono?' mono':'')+'" id="'+id+'">—</div>';
@@ -2035,21 +2037,28 @@ function rsInput(i){const id=rsId(i.k);
  if(i.type==="num")return '<span class="rsnum"><input id="'+id+'" data-k="'+i.k+'" type="number" min="'+i.min+'" max="'+i.max+'" step="'+i.step+'">'+(i.unit?'<small class="mut">'+e(i.unit)+'</small>':'')+'</span>';
  if(i.type==="radio")return '<select id="rs-preset" data-k="radio"><option value="">Preset… (or enter values below)</option>'+RP.map(g=>'<optgroup label="'+e(g[0])+'">'+g[1].map(p=>'<option value="'+p.slice(1,5).join(",")+'" data-ph="'+(p[5]||"")+'">'+e(p[0])+' · '+p[1]+' MHz / '+p[2]+' kHz / SF'+p[3]+' / CR'+p[4]+'</option>').join("")+'</optgroup>').join("")+'</select>'+
   '<div class="rsradio"><label>Freq (MHz)<input id="rs-radio-f" data-k="radio" type="number" min="300" max="2500" step="0.001"></label><label>BW (kHz)<select id="rs-radio-bw" data-k="radio"><option value=""></option>'+["7.8","10.4","15.6","20.8","31.25","41.7","62.5","125","250","500"].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>SF<select id="rs-radio-sf" data-k="radio"><option value=""></option>'+[5,6,7,8,9,10,11,12].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>CR<select id="rs-radio-cr" data-k="radio"><option value=""></option>'+[5,6,7,8].map(x=>'<option>'+x+'</option>').join("")+'</select></label></div><div id="rs-phnote" class="small mut"></div>';
- return '<input id="'+id+'" data-k="'+i.k+'" type="'+(i.type==="secret"?"password":"text")+'" maxlength="'+i.max+'" autocomplete="off" autocapitalize="none"'+(i.wo?' placeholder="new password"':'')+'>'}
+ if(i.type==="secret")return '<form class="rssec" autocomplete="off" onsubmit="return false"><input id="'+id+'" data-k="'+i.k+'" name="rs_secret_'+i.k.replace(/\\W/g,"_")+'" type="password" maxlength="'+i.max+'" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" readonly onfocus="this.removeAttribute(\\'readonly\\')" autocapitalize="none" spellcheck="false" placeholder="'+(i.wo?"new password":"unchanged")+'"></form>';
+ return '<input id="'+id+'" data-k="'+i.k+'" name="rs_'+i.k.replace(/\\W/g,"_")+'" type="text" maxlength="'+i.max+'" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocapitalize="none">'}
 function rsBuild(){$("rsgrid").innerHTML=RS.map((c,ci)=>'<details id="rscat'+ci+'" class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
  c.items.map(i=>'<div class="rsrow"><div class="rsl">'+e(i.label)+(i.risk?' <span class="warn" title="Risky change">⚠</span>':'')+(i.wo?'':' <button type="button" class="g sm rsr" data-rs1="'+e(i.k)+'" title="Read just this setting">Read</button>')+'</div><div class="rsi">'+rsInput(i)+'</div><div class="small" id="rsst-'+i.k+'"></div>'+(i.help?'<div class="small mut">'+e(i.help)+'</div>':'')+'</div>').join("")+
  '<button type="button" class="g sm" data-rsread="'+ci+'">Read this group</button></div></details>').join("");
- $("rsgrid").addEventListener("input",ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(!k)return;
+ const markTyped=ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(k&&ev.isTrusted)TYPED.add(k)};
+ ["keydown","paste","drop","cut"].forEach(t=>$("rsgrid").addEventListener(t,markTyped,true));
+ $("rsgrid").addEventListener("change",ev=>{if(ev.target.tagName==="SELECT")markTyped(ev)},true);
+ $("rsgrid").addEventListener("pointerdown",ev=>{if(ev.target.type==="number")markTyped(ev)},true);
+ $("rsgrid").addEventListener("input",ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(!k)return;if(ev.target.tagName==="SELECT"&&ev.isTrusted)TYPED.add(k);
   if(ev.target.id==="rs-preset"){const v=ev.target.value;if(v){const p=v.split(",");["f","bw","sf","cr"].forEach((x,j)=>$("rs-radio-"+x).value=x==="bw"?String(+p[j]):p[j]);const ph=ev.target.selectedOptions[0].dataset.ph;
    $("rs-phnote").textContent=ph?"This mesh also uses a "+ph+"-byte path hash (Repeating & routing › Advert path hash size = "+(ph-1)+"). Change it separately if you want to match.":""}}
   else if(k==="radio")$("rs-preset").value="";rsDirty()});
  $("rsgrid").addEventListener("click",ev=>{const b1=ev.target.closest("[data-rs1]");if(b1){const k=b1.dataset.rs1,it=RS.flatMap(c=>c.items).find(i=>i.k===k);return rsRead([k],"just "+it.label)}
   const b=ev.target.closest("[data-rsread]");if(b)rsRead(RS[+b.dataset.rsread].items.filter(i=>!i.wo).map(i=>i.k),RS[+b.dataset.rsread].cat)})}
 function rsCur(i){if(i.type==="radio"){const p=["f","bw","sf","cr"].map(x=>$("rs-radio-"+x).value.trim());return p.every(x=>x!=="")?p.join(","):""}const el=$(rsId(i.k));return el?el.value.trim():""}
-function rsNorm(i,v){v=String(v??"").trim();if(v==="")return"";if(i.type==="num")return String(+v);if(i.type==="radio")return v.split(",").map(x=>String(+x)).join(",");if(i.type==="sel")return v.toLowerCase();return v}
+function rsNorm(i,v){v=String(v??"").trim();if(v==="")return"";if(i.type==="num"){const n=parseFloat(v);return isFinite(n)?String(n):v}if(i.type==="radio")return v.split(",").map(x=>String(+x)).join(",");if(i.type==="sel")return v.toLowerCase();return v}
 function rsChanges(){const ch=[];for(const c of RS)for(const i of c.items){if(i.ro)continue;const cur=rsCur(i),rv=RV[i.k]&&RV[i.k].value;
- if(cur==="")continue;if(i.wo||rsNorm(i,cur)!==rsNorm(i,rv))ch.push(i)}return ch}
-function rsDirty(){const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
+ if(cur==="")continue;if(!TYPED.has(i.k))continue;if(i.type==="secret"||rsNorm(i,cur)!==rsNorm(i,rv))ch.push(i)}return ch}
+function rsScrub(){for(const c of RS)for(const i of c.items){if(TYPED.has(i.k))continue;const el=$(rsId(i.k));if(!el)continue;
+ if(i.type==="secret"){if(el.value)el.value=""}else if(i.type==="text"){const rv=RV[i.k]&&RV[i.k].value;if(el.value&&el.value!==(rv??""))el.value=rv??""}}}
+function rsDirty(){rsScrub();const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
  document.querySelectorAll(".rsrow").forEach(r=>r.classList.remove("dirty"));rsChanges().forEach(i=>{const el=$(i.type==="radio"?"rs-preset":rsId(i.k));el&&el.closest(".rsrow").classList.add("dirty")})}
 function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);RV=R.vals||{};RQ=R.queued||{};PERWAKE=R.per_wake||PERWAKE0;
  if(!RLOAD){rsBuild();RLOAD=true}
@@ -2060,9 +2069,10 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
    if(i.ro){const el=$(rsId(i.k));el.textContent=v.value}
    else if(i.type==="radio"){if(!document.querySelector(".rsrow.dirty #rs-preset")){const p=String(v.value).split(",");if(p.length===4){$("rs-radio-f").value=String(+p[0]);$("rs-radio-bw").value=String(+p[1]);$("rs-radio-sf").value=String(+p[2]);$("rs-radio-cr").value=String(+p[3]);
      const m=[].find.call($("rs-preset").options,o=>o.value&&o.value.split(",").map(Number).join()===p.map(Number).join());$("rs-preset").value=m?m.value:""}}}
-   else if(!i.wo){const el=$(rsId(i.k));if(el&&!el.closest(".rsrow").classList.contains("dirty"))el.value=i.type==="sel"?String(v.value).toLowerCase():i.type==="num"?String(+v.value):v.value}}
+   else if(!i.wo){const el=$(rsId(i.k));if(el&&!el.closest(".rsrow").classList.contains("dirty"))el.value=i.type==="sel"?String(v.value).toLowerCase():i.type==="num"?String(parseFloat(v.value)):i.type==="secret"?"":v.value}}
   st.innerHTML=q?'<span class="mut">⏳ '+(q==="sent"?"sent to the T-SIM, waiting for the reply":"queued for the next wake")+'</span>':v.unsupported?'<span class="mut">Not supported by this repeater'+(v.at?" · "+e(t(v.at)):"")+'</span>':v.error?'<span class="err">'+e(v.error)+(v.at?" · "+e(t(v.at)):"")+'</span>':v.at?'<span class="mut">'+(v.set?"Changed "+e(t(v.at))+(v.msg?" · "+e(v.msg):""):"Read "+e(t(v.at)))+'</span>':i.wo?"":'<span class="mut">Not read yet</span>'}
- RS.forEach((c,ci)=>{if(c.dep)$("rscat"+ci).hidden=!(RV[c.dep]&&RV[c.dep].value!=null)});showTools(d);
+ rsScrub();
+ RS.forEach((c,ci)=>{if(c.dep)$("rscat"+ci).hidden=!depOkC(RV[c.dep])});showTools(d);
  RS.forEach((c,ci)=>{const ks=c.items.filter(i=>!i.wo).map(i=>i.k),ats=ks.map(k=>RV[k]&&RV[k].at).filter(Boolean).sort();$("rssum"+ci).textContent=ats.length?"read "+ago(ats[ats.length-1]):"not read"});
  const nq=Object.values(RQ).filter(x=>x==="queued").length,ns=Object.values(RQ).filter(x=>x==="sent").length;
  $("rsq").innerHTML=nq||ns?(ns?"⏳ "+ns+" sent, waiting for replies. ":"")+(nq?nq+" queued"+(ns?"":' <button type="button" class="g sm" id="rscont">Send next batch (1 text)</button>'):""):"";
@@ -2071,7 +2081,7 @@ function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.po
 async function rsRead(keys,what){const w=Math.ceil(keys.length/PERWAKE);
  if(!confirm("Read "+(what||"all repeater settings")+"? This queues "+keys.length+" commands and sends one text now."+(w>1?"\\n\\nThe T-SIM runs "+PERWAKE+" commands per wake, so this needs "+w+" wakes: after the first batch, press \\"Send next batch\\" for the rest.":"")))return;
  const r=await post("rpt-read",{keys});const j=await rj(r);say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(j.queued?"Queued "+j.queued+" reads. "+(j.wake&&j.wake.sent?"Text sent; values appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Already queued."):(j.error||friendly(j,r.status)));load()}
-$("rsreadall").onclick=()=>rsRead(RS.filter(c=>!c.noAll).flatMap(c=>c.items.filter(i=>!i.wo&&(!i.dep||(RV[i.dep]&&RV[i.dep].value!=null))).map(i=>i.k)));
+$("rsreadall").onclick=()=>rsRead(RS.filter(c=>!c.noAll).flatMap(c=>c.items.filter(i=>!i.wo&&(!i.dep||depOkC(RV[i.dep]))).map(i=>i.k)));
 $("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const changes={};ch.forEach(i=>changes[i.k]=rsCur(i));
  const risky=ch.filter(i=>i.risk),lines=ch.map(i=>"• "+i.label+": "+(i.type==="secret"?"(hidden)":i.type==="radio"?changes[i.k].replace(/,/g," / ")+"  (MHz / kHz / SF / CR)":changes[i.k])+(i.risk?"  ⚠":""));
  let msg="Send these changes to the repeater now (one text)?\\n\\n"+lines.join("\\n");
@@ -2079,7 +2089,7 @@ $("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const ch
  if(!confirm(msg))return;
  let typed="";if(ch.some(i=>i.typed)){typed=prompt("Changing the admin password. Anyone with the old password loses admin access, and the new password is stored in this dashboard's history until it runs.\\n\\nType CHANGE to confirm.")||"";if(typed.trim().toUpperCase()!=="CHANGE")return say("rsmsg",false,"Not sent: admin password change not confirmed.")}
  const r=await post("rpt-save",{changes,risk_ok:risky.length>0,typed});const j=await rj(r);
- if(r.ok){ch.forEach(i=>{if(i.type==="secret"){$(rsId(i.k)).value=""}document.querySelectorAll(".rsrow.dirty").forEach(x=>x.classList.remove("dirty"))})}
+ if(r.ok){ch.forEach(i=>{TYPED.delete(i.k);if(i.type==="secret"){$(rsId(i.k)).value=""}document.querySelectorAll(".rsrow.dirty").forEach(x=>x.classList.remove("dirty"))})}
  say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?"Queued "+j.queued+" change"+(j.queued>1?"s":"")+". "+(j.wake&&j.wake.sent?"Text sent; results appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status))+(changes.radio?" Radio changes apply after Reboot radio.":""):(j.error||friendly(j,r.status)));load()};
 document.querySelectorAll("[data-rsact]").forEach(b=>b.onclick=async()=>{const a=b.dataset.rsact;if(!confirm(b.textContent+" now? This sends one text."))return;const r=await post("rpt-action",{act:a});const j=await rj(r);say("rsmsg",r.ok,r.ok?(j.wake&&j.wake.sent?"Text sent.":"Queued; wake text not sent."):(j.error||friendly(j,r.status)));load()});
 // terminal console: history + up/down recall

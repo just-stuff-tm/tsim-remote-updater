@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -824,6 +824,11 @@ console.log("tag/asset version ok");
   assert.equal((await P("rpt-read", { keys: ["password"] })).status, 400, "write-only can't be read");
   assert.equal(buildRptOp({ op: "sensor.get", key: "temp" })[0].cmd, "sensor get temp");
   assert(ph3.includes("data-rs1"));
+  // bridge hidden when the repeater reports "none"; secret fields can't be autofilled
+  assert.equal(depOk({ value: "none" }), false); assert.equal(depOk({ unsupported: true, value: null }), false); assert.equal(depOk({ value: "rs232" }), true);
+  assert(!rptReadAllKeys({ "bridge.type": { value: "none" } }).includes("bridge.secret"));
+  const sj = ph3.match(/<script>([\s\S]*?)<\/script>/g).join("");
+  assert(sj.includes('autocomplete="new-password"') && sj.includes('data-1p-ignore') && sj.includes('data-lpignore') && sj.includes("rs_secret_") && sj.includes("TYPED.has(i.k)"));
   console.log("regions / ACL / tools tests OK");
   // 1.6.9: whole Read all batch in one wake
   assert.equal(cmdsPerWake("tsim-updater 1.6.8"), 10); assert.equal(cmdsPerWake("tsim-updater 1.6.9"), 40); assert.equal(cmdsPerWake(null), 10);
