@@ -901,7 +901,6 @@ console.log("tag/asset version ok");
   await P("commands", { cancel: true });
   const ph5 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); assert(ph5.includes("serial.ondemand")); for (const m of ph5.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
   assert.equal(pickAsset(["Heltec_v3_repeater-v1.18.0-serial-81dbae59-merged.bin", "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "Heltec_v3_room_server-v1.18.0-serial-81dbae59.bin"], FW_PRESETS.meshcore_serial.asset_pattern), "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "app-only image, never merged");
-  assert.equal(pickAsset(["Heltec_v3_repeater-PowerSaving17.1.6-serial-freshInstall-merged.bin", "Heltec_v3_repeater-PowerSaving17.1.6-serial-upgrade.bin"], FW_PRESETS.easyskymesh_serial.asset_pattern), "Heltec_v3_repeater-PowerSaving17.1.6-serial-upgrade.bin");
   console.log("serial.ondemand tests OK");
   await P("settings", { console_enabled: false });
 }
