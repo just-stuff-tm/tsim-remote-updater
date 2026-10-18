@@ -110,7 +110,7 @@ The SIM7672G modem has a built-in GNSS receiver. It needs a **GNSS antenna on th
 
 The dashboard's default Heltec update source is the power-saving MeshCore build: [just-stuff-tm/MeshCore](https://github.com/just-stuff-tm/MeshCore), branch [`powersaving`](https://github.com/just-stuff-tm/MeshCore/tree/powersaving) (MeshCore + EasySkyMesh power saving, with serial.ondemand and headless Heltec V3 builds). Downloads are on its [releases page](https://github.com/just-stuff-tm/MeshCore/releases) (`vX.Y.Z-powersaving`); the dashboard picks the app-only `Heltec_v3_repeater-vX.Y.Z-powersaving-<commit>.bin` from the latest release, never `-merged` or `_headless`. serial.ondemand keeps the repeater's serial CLI reachable from the T-SIM while power saving is on.
 
-For the first install over USB (MeshCore web flasher, which file to pick for ESP32 and nRF52, headless builds, first commands), see [How to flash](https://github.com/just-stuff-tm/MeshCore/blob/powersaving/serial/README.md#how-to-flash). After that, **Check for updates** and **Update Heltec** in the dashboard install new releases over LTE.
+For the first install over USB with the [MeshCore web flasher](https://flasher.meshcore.io) (Chrome or Edge, **Custom Firmware**; which file to pick for ESP32 and nRF52, headless builds, first commands), see [How to flash](https://github.com/just-stuff-tm/MeshCore/blob/powersaving/serial/README.md#how-to-flash). After that, **Check for updates** and **Update Heltec** in the dashboard install new releases over LTE.
 
 ## Costs and notes
 
