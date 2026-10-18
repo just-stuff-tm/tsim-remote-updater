@@ -106,6 +106,12 @@ The SIM7672G modem has a built-in GNSS receiver. It needs a **GNSS antenna on th
 - **Set repeater location** (LoRa radio tab › Settings, optional): after you confirm, it sends the MeshCore CLI commands `set lat <deg>` and `set lon <deg>` with the latest fix to the repeater and shows its replies. It never runs automatically.
 - **Privacy:** coordinates and the map are blurred by default. The eye button shows them, and the dashboard remembers your choice in this browser, the same way as the cellular IP. The location is stored in the Worker's KV for your devices only. The map loads tiles from openstreetmap.org, so OSM sees the map area you view. Once you set it on the repeater, the position goes out in its adverts and anyone on the mesh can see it.
 
+## Repeater firmware: MeshCore + power saving
+
+The dashboard's default Heltec update source is the power-saving MeshCore build: [just-stuff-tm/MeshCore](https://github.com/just-stuff-tm/MeshCore), branch [`powersaving`](https://github.com/just-stuff-tm/MeshCore/tree/powersaving) (MeshCore + EasySkyMesh power saving, with serial.ondemand and headless Heltec V3 builds). Downloads are on its [releases page](https://github.com/just-stuff-tm/MeshCore/releases) (`vX.Y.Z-powersaving`); the dashboard picks the app-only `Heltec_v3_repeater-vX.Y.Z-powersaving-<commit>.bin` from the latest release, never `-merged` or `_headless`. serial.ondemand keeps the repeater's serial CLI reachable from the T-SIM while power saving is on.
+
+For the first install over USB (MeshCore web flasher, which file to pick for ESP32 and nRF52, headless builds, first commands), see [How to flash](https://github.com/just-stuff-tm/MeshCore/blob/powersaving/serial/README.md#how-to-flash). After that, **Check for updates** and **Update Heltec** in the dashboard install new releases over LTE.
+
 ## Costs and notes
 
 - **Incoming SMS is free** on Hologram. The Worker sends each text through the Hologram API; for outgoing SMS costs see [Hologram's current pricing](https://www.hologram.io/pricing). **The T-SIM never sends SMS**, it reports over data only.
