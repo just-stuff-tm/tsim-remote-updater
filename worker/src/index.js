@@ -412,6 +412,8 @@ export async function heltecImageRisk(url, tsimFw) {
 export const FW_PRESETS = {
   easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" },
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
+  meshcore_serial: { label: "MeshCore + serial on demand (just-stuff-tm/MeshCore)", enabled: true, repo: "just-stuff-tm/MeshCore", tag_prefix: "", asset_pattern: "Heltec_v3_repeater-v*-serial-*.bin", direct_url: "", note: "Stock MeshCore, rebuilt automatically for every new release with serial.ondemand: the console keeps working while power saving. App-only image, keeps identity and settings." },
+  easyskymesh_serial: { label: "EasySkyMesh PowerSaving + serial on demand (just-stuff-tm/EasySkyMesh)", enabled: true, repo: "just-stuff-tm/EasySkyMesh", tag_prefix: "", asset_pattern: "Heltec_v3_repeater-*-serial-upgrade.bin", direct_url: "", note: "EasySkyMesh PowerSaving firmware with serial.ondemand. Based on MeshCore 1.17 (older than stock), so prefer the MeshCore + serial preset unless you need EasySkyMesh's extra power features." },
 };
 
 // Resolve what "latest" means for this device's update source.
@@ -501,7 +503,7 @@ async function handleIngest(request, env, id) {
       else continue;  // a missing reply keeps the last good value
       n++;
     }
-    await putJson(env, `rptcfg:${id}`, cv); await putJson(env, `rptlist:${id}`, L);
+    await putJson(env, `rptcfg:${id}`, cv); await putJson(env, `rptlist:${id}`, L); await syncOnDemand(env, id, cv);
     const meta = (await kvJson(env, `rptcache:${id}`)) || {};
     meta.last_part_at = entry.received_at; meta.parts = (t.part === 0 ? 0 : meta.parts || 0) + 1; meta.items = (t.part === 0 ? 0 : meta.items || 0) + n;
     if (t.final) { meta.at = entry.received_at; meta.count = typeof t.count === "number" ? t.count : meta.items; meta.error = t.error ? String(t.error).slice(0, 80) : null; }
@@ -581,12 +583,14 @@ async function handleIngest(request, env, id) {
       else if (rs.ok) cv[rs.key] = { value: c.val ?? prevV.value ?? null, at: entry.received_at, set: true, msg: rs.key.includes("password") ? "" : rs.msg };
       else cv[rs.key] = { ...prevV, unsupported: !!rs.unsupported, error: rs.unsupported ? null : rs.error, at: entry.received_at };
       if (rs.key === "password") { delete cv.password.value; c.cmd = "password ••••••"; c.output = rs.ok ? "OK (password hidden)" : c.output; await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
-      await putJson(env, `rptcfg:${id}`, cv);
+      await putJson(env, `rptcfg:${id}`, cv); await syncOnDemand(env, id, cv);
     }
     if (/^tsimupdate /.test(ran)) { /* T-SIM system command: says nothing about the Heltec CLI */ }
     else if (t.heltec_cli === "asleep" || /no reply/i.test(String(t.error || ""))) await setPowersaving(env, id, true, "console: no CLI reply");
     else if (!t.error && ran === "powersaving on" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving on");
-    else if (!t.error && reply) await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : "console: CLI answered");
+    else if (!t.error && ran === "powersaving" && /^on\b/i.test(reply)) await setPowersaving(env, id, true, "console: powersaving reads on");
+    else if (!t.error && reply && (ran === "powersaving off" || ran === "powersaving" || ((await kvJson(env, `state:${id}`)) || {}).serial_ondemand !== true))
+      await setPowersaving(env, id, false, ran === "powersaving off" ? "console: powersaving off" : ran === "powersaving" ? "console: powersaving reads off" : "console: CLI answered");
     const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
     await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at });
     await logActivity(env, id, { type: "cmd", msg: `${sys ? "System" : "Console"}: ${(c ? c.cmd : String(t.cmd || "?")).slice(0, 60)} → ${out.split("\n")[0].slice(0, 80)}` });
@@ -634,6 +638,17 @@ async function handleIngest(request, env, id) {
 // on: true | false | null (unknown). After a radio flash the state is unknown until fresh evidence.
 // A bare "no reply" only asserts power saving if this firmware has answered the CLI since the last flash;
 // otherwise it stays unknown (the new firmware may simply not have been polled successfully yet).
+// Power saving blocks the console unless the repeater firmware has serial.ondemand on.
+export const psBlocks = (st) => !!st && st.heltec_powersaving === true && st.serial_ondemand !== true;
+async function syncOnDemand(env, id, cv) {
+  const v = cv && cv["serial.ondemand"];
+  const on = v && v.value != null ? /^on\b/i.test(String(v.value)) : v && v.unsupported ? false : undefined;
+  if (on === undefined) return;
+  const st = (await kvJson(env, `state:${id}`)) || {};
+  if (st.serial_ondemand === on) return;
+  st.serial_ondemand = on; await putJson(env, `state:${id}`, st);
+  await logActivity(env, id, { type: "event", msg: `Repeater serial on demand ${on ? "ON: console keeps working during power saving" : "off/not supported: power saving pauses the console"}` });
+}
 export function psDecision(st, on, source, nowIso = new Date().toISOString()) {
   const lf = st.radio_flashed && st.radio_flashed.at;
   if (on === true && /no (CLI )?reply/i.test(source) && lf && !(st.cli_ok_at && st.cli_ok_at >= lf)) return null;
@@ -694,7 +709,8 @@ export const RPT_SETTINGS = [
     { k: "flood.advert.interval", label: "Flood advert every", type: "num", min: 3, max: 168, step: 1, unit: "h" },
     { k: "advert.interval", label: "Zero-hop advert every", type: "num", min: 0, max: 240, step: 2, unit: "min", help: "60–240, or 0 for off." } ] },
   { cat: "Power & battery", items: [
-    { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, help: "On = the repeater sleeps between transmissions and stops answering this dashboard's console." },
+    { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, help: "On = the repeater sleeps between transmissions. Stock firmware then stops answering this dashboard's console; firmware with Serial on demand keeps answering." },
+    { k: "serial.ondemand", label: "Serial on demand", type: "sel", opts: ONOFF, help: "On = while power saving, the T-SIM's serial line wakes the repeater, so the console and settings keep working. Needs the serial.ondemand firmware (just-stuff-tm/MeshCore releases); stock firmware shows Not supported." },
     { k: "adc.multiplier", label: "Battery multiplier", ro: true, help: "Calibrate it from a multimeter reading in Repeater battery calibration." } ] },
   { cat: "GPS", note: "Only on repeaters built with GPS support; others answer \"not supported\".", items: [
     { k: "gps", label: "GPS receiver", type: "sel", opts: ONOFF, get: "gps", set: "gps ", first: true },
@@ -1215,7 +1231,7 @@ async function deviceApi(request, env, dev, action) {
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
-      powersaving: { on: s.heltec_powersaving === true, unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
+      powersaving: { on: s.heltec_powersaving === true, ondemand: s.serial_ondemand === true, blocks: psBlocks(s), unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
       progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS,
       update_status: statuses(latest, mesh, s, history, rel, tsimRel) });
@@ -1305,7 +1321,7 @@ async function deviceApi(request, env, dev, action) {
       await putJson(env, `cmds:${id}`, list);
       return json({ cancelled: n });
     }
-    if (pst.heltec_powersaving === true) return json({ error: PS_NOTE, powersaving: true }, 409);
+    if (psBlocks(pst)) return json({ error: PS_NOTE, powersaving: true }, 409);
     const cmd = String(b.cmd || "").trim();
     if (!cmd || cmd.length > CMD_MAX_LEN || !/^[\x20-\x7e]+$/.test(cmd)) return json({ error: `command must be 1-${CMD_MAX_LEN} printable ASCII chars` }, 400);
     if (RISKY_CMD_RE.test(cmd) && b.force !== true) return json({ error: "risky command: confirm required", risky: true }, 409);
@@ -1320,7 +1336,7 @@ async function deviceApi(request, env, dev, action) {
   if (action === "rpt-read" || action === "rpt-save" || action === "rpt-action" || action === "rpt-ops") {
     const settings = await getSettings(env, id);
     if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; repeater settings use it." }, 403);
-    if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE + ". Turn power saving off first.", powersaving: true }, 409);
+    if (psBlocks(await kvJson(env, `state:${id}`))) return json({ error: PS_NOTE + ". Turn power saving off first.", powersaving: true }, 409);
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const queuedCmds = new Set(list.filter((c) => c.status === "queued").map((c) => c.cmd));
@@ -1364,7 +1380,7 @@ async function deviceApi(request, env, dev, action) {
   if (action === "adc-cal") {
     const settings = await getSettings(env, id);
     if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; calibration uses it." }, 403);
-    if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE + ". Calibration needs the console, so turn power saving off first.", powersaving: true }, 409);
+    if (psBlocks(await kvJson(env, `state:${id}`))) return json({ error: PS_NOTE + ". Calibration needs the console, so turn power saving off first.", powersaving: true }, 409);
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     const a = (await kvJson(env, `adc:${id}`)) || {}, mesh = (await kvJson(env, `mesh:${id}`)) || {};
     let cmds;
@@ -1392,7 +1408,7 @@ async function deviceApi(request, env, dev, action) {
   if (action === "wake-cmd") {
     const settings = await getSettings(env, id);
     if (!settings.console_enabled) return json({ error: "Repeater console is off for this device." }, 403);
-    if (((await kvJson(env, `state:${id}`)) || {}).heltec_powersaving === true) return json({ error: PS_NOTE, powersaving: true }, 409);
+    if (psBlocks(await kvJson(env, `state:${id}`))) return json({ error: PS_NOTE, powersaving: true }, 409);
     const [o, c] = await manualSend(env, dev, "CMD", "CMD (console)"); return json(o, c);
   }
   if (action === "tsim-source") {
@@ -1511,7 +1527,7 @@ async function deviceApi(request, env, dev, action) {
     const [gps, cmds, lreq, pst] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `cmds:${id}`), kvJson(env, `locreq:${id}`), loadState(env, id)]);
     const f = gps && gps.fix;
     if (!f) return json({ error: "No GPS location yet. Press Get location on the T-SIM tab first." }, 409);
-    if (pst.heltec_powersaving === true) return json({ error: PS_NOTE, powersaving: true }, 409);
+    if (psBlocks(pst)) return json({ error: PS_NOTE, powersaving: true }, 409);
     const list = cmds || [];
     const lp = locProgress(lreq, list);
     if (lp.state === "queued" || lp.state === "sending") return json({ error: "The repeater location is already being set. Wait for the result." }, 409);
@@ -1559,7 +1575,7 @@ async function fleetApi(env, acc) {
       solar_v: l.solar_v ?? null, csq: l.csq ?? null, rsrp: l.rsrp ?? null,
       heltec_fw: m.heltec_fw || (st && st.heltec_fw) || null, node_name: m.node_name || null,
       neighbors: m.neighbors ? m.neighbors.length : null, packets: m.packets || null, radio: m.radio || null, mesh_at: m.received_at || null, mesh_test: !!m.test,
-      powersaving: !!(st && st.heltec_powersaving), console_enabled: settings.console_enabled, schedule_hours: settings.schedule_hours,
+      powersaving: psBlocks(st), console_enabled: settings.console_enabled, schedule_hours: settings.schedule_hours,
       update_status: statuses(L, mesh, st || {}, hist, rel, trel),
       progress: { heltec: { state: ph.state, step: ph.step, pct: ph.pct, finished_at: ph.finished_at }, tsim: { state: pt.state, step: pt.step, pct: pt.pct, finished_at: pt.finished_at } } });
   }
@@ -2013,8 +2029,8 @@ async function load(){unitsBtn();
  $("schinfo").innerHTML=kv([["Status",S.schedule_hours?"On: wakes the T-SIM "+(HL[S.schedule_hours]||"every "+S.schedule_hours+" h"):"Off: the T-SIM only wakes when you press a button"],["Next check",S.schedule_hours?t(sc.next_run)+" ET":null],["Last automatic check",lr?t(lr.at)+" ET"+(lr.sent?" (text sent)":" (not sent: "+(lr.error||"error")+")"):"none yet"]]);
  $("consum").textContent=S.console_enabled?"on":"off";
  if(first){$("schon").checked=!!S.schedule_hours;$("sch").value=String(S.schedule_hours||24);$("sch").disabled=!S.schedule_hours;$("conon").checked=!!S.console_enabled;first=false}
- const PS=!!(d.powersaving&&d.powersaving.on);
- $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PS?'<span class="badge mut">Power saving</span>':(d.powersaving&&d.powersaving.unknown?'<span class="badge mut" title="'+e(d.powersaving.source||"")+'">Power saving: unknown</span>':''));
+ const PSON=!!(d.powersaving&&d.powersaving.on),PS=PSON&&!d.powersaving.ondemand;
+ $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PSON?'<span class="badge mut">Power saving'+(PS?'':' · serial on demand')+'</span>':(d.powersaving&&d.powersaving.unknown?'<span class="badge mut" title="'+e(d.powersaving.source||"")+'">Power saving: unknown</span>':''));
  $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Updates",utext(US.radio)],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
  $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Updates",utext(US.tsim)],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
@@ -2028,7 +2044,7 @@ async function load(){unitsBtn();
 function setPresets(p){PRE=p;const s=$("preset");for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
 $("preset").onchange=ev=>{const v=PRE[ev.target.value],f=$("srcf");if(!v){$("presetnote").textContent="";return}
  f.enabled.checked=v.enabled;f.repo.value=v.repo;f.asset_pattern.value=v.asset_pattern;f.tag_prefix.value=v.tag_prefix||"";f.direct_url.value=v.direct_url;
- $("presetnote").textContent=ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). It follows the newest release tagged repeater-* (MeshCore also publishes companion and room-server releases). Press Save to use it.":"Press Save to use it."};
+ $("presetnote").textContent=v.note?v.note+" Press Save to use it.":ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). It follows the newest release tagged repeater-* (MeshCore also publishes companion and room-server releases). Press Save to use it.":"Press Save to use it."};
 let tsimLoaded=false;
 function showTsim(s){const f=$("tsimf");$("tsimsum").textContent=s.mode==="url"?"direct link":s.repo+" · "+s.asset;
  if(!tsimLoaded){f.mode.value=s.mode;f.repo.value=s.repo||"";f.asset.value=s.asset||"";f.url.value=s.url||"";f.checksum.value=s.checksum||"";tsimLoaded=true}}
@@ -2086,7 +2102,7 @@ async function queue(wake,force){const c=$("cmd").value.trim();if(!c)return;cliR
  say("conmsg",r.ok&&(!j.wake||j.wake.sent),r.ok?("Queued"+(j.wake?(j.wake.sent?". Text sent, the reply will appear here within a few minutes.":". The wake text wasn't sent: "+friendly(j.wake,j.wake.status)):". It runs the next time the T-SIM wakes.")):friendly(j,r.status));
  if(r.ok)$("cmd").value="";load();}
 let ADC={},ADCM={};
-function showAdc(d){const A=d.adc||{},M=d.mesh||{},C=M.core||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);ADC=A;ADCM=M;
+function showAdc(d){const A=d.adc||{},M=d.mesh||{},C=M.core||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.blocks);ADC=A;ADCM=M;
  const rep=C.battery_mv==null?null:C.battery_mv/1000,stale=A.set_at&&M.received_at&&M.received_at<A.set_at;
  $("adcsum").textContent=A.supported===false?"not supported":A.pending?"sent, waiting for reply":A.mult!=null?"x"+A.mult.toFixed(3)+(A.set===0?" (board default)":""):"not read yet";
  $("adcps").hidden=!PS;$("adccon").hidden=!!S.console_enabled||PS;$("adcui").hidden=PS||!S.console_enabled;
@@ -2141,7 +2157,7 @@ function rsScrub(){for(const c of RS)for(const i of c.items){if(TYPED.has(i.k))c
  if(i.type==="secret"){if(el.value)el.value=""}else if(i.type==="text"){const rv=RV[i.k]&&RV[i.k].value;if(el.value&&el.value!==(rv??""))el.value=rv??""}}}
 function rsDirty(){rsScrub();const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
  document.querySelectorAll(".rsrow").forEach(r=>r.classList.remove("dirty"));rsChanges().forEach(i=>{const el=$(i.type==="radio"?"rs-preset":rsId(i.k));el&&el.closest(".rsrow").classList.add("dirty")})}
-function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);RV=R.vals||{};RQ=R.queued||{};PERWAKE=R.per_wake||PERWAKE0;
+function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.blocks);RV=R.vals||{};RQ=R.queued||{};PERWAKE=R.per_wake||PERWAKE0;
  if(!RLOAD){rsBuild();RLOAD=true}
  $("rsps").hidden=!PS;$("rscon").hidden=!!S.console_enabled||PS;const off=PS||!S.console_enabled;
  ["rsreadall","rssave"].forEach(x=>$(x).disabled=off||(x==="rssave"&&!rsChanges().length));
@@ -2195,7 +2211,7 @@ function snParse(raw){const r=[];String(raw||"").split("\\n").forEach(l=>{const 
 function snVal(L,x){const g=L["sensor:"+x.k],base=L.sensors;if(g&&(!base||g.at>base.at))return g.error?{v:x.v,st:'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(g.error)?"Not supported":g.error)+'</span>'}:{v:g.raw.replace(/^>\\s*/,"").replace(/^[A-Za-z0-9_.]+=/,""),st:'<span class="mut">Read '+e(t(g.at))+'</span>'};return{v:x.v,st:base?'<span class="mut">Read '+e(t(base.at))+'</span>':""}}
 const PERM=["Guest","Read-only","Read-write","Admin"];
 function lstat(L,k){const x=L[k];return x?(x.error&&!(x.raw&&/no reply/i.test(x.error))?'<span class="err">'+e(/unsupported|unknown|\\?\\?/i.test(x.error)?"Not supported by this repeater":x.error)+'</span> · '+e(t(x.at)):'<span class="mut">'+(x.src==="cache"?"Cached by T-SIM ":"Read ")+e(t(x.at))+'</span>'):'<span class="mut">Not read yet</span>'}
-function showTools(d){const R=d.rpt||{},L=R.lists||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.on);$("rtools").classList.toggle("dim",PS||!S.console_enabled);
+function showTools(d){const R=d.rpt||{},L=R.lists||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.blocks);$("rtools").classList.toggle("dim",PS||!S.console_enabled);
  const rg=rgParse(L.regions&&!L.regions.error?L.regions.raw:"");
  $("rgst").innerHTML=lstat(L,"regions")+(L.home&&!L.home.error?' · home: <b>'+e(L.home.raw.replace(/^>\\s*/,"").replace(/^home is\\s*/i,"")||"none")+'</b>':"")+(L.default&&!L.default.error?' · default scope: <b>'+e(L.default.raw.replace(/^>\\s*/,"").replace(/^default scope is\\s*/i,"").replace("<null>","none")||"none")+'</b>':"");
  $("rglist").innerHTML=rg.length?'<table class="small"><thead><tr><th>Region</th><th>Flooding</th><th></th></tr></thead><tbody>'+rg.map(r=>'<tr><td style="padding-left:'+(r.depth*14)+'px">'+e(r.name)+(r.home?' <span class="badge">home</span>':'')+'</td><td>'+(r.flood?'<span class="ok">allowed</span>':'<span class="mut">blocked</span>')+'</td><td class="nowrap"><button type="button" class="g sm" data-rg="flood" data-n="'+e(r.name)+'" data-a="'+(r.flood?0:1)+'">'+(r.flood?"Block":"Allow")+'</button> <button type="button" class="g sm" data-rg="home" data-n="'+e(r.name)+'">Home</button> <button type="button" class="g sm" data-rg="default" data-n="'+e(r.name)+'">Default</button>'+(r.name==="*"?"":' <button type="button" class="g sm" data-rg="remove" data-n="'+e(r.name)+'">✕</button>')+'</td></tr>').join("")+'</tbody></table>':'<p class="small mut">'+(L.regions?"No regions defined.":"Press Read regions.")+'</p>';

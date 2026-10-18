@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { pickAsset, FW_PRESETS, psBlocks, tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -879,5 +879,29 @@ console.log("tag/asset version ok");
   const ph4 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); assert(ph4.includes('id="cacheon"')); for (const m of ph4.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
   await P("commands", { cancel: true }); await ingest({ type: "status", fw: "tsim-updater 1.6.8" });
   console.log("v1.7.0 cache / telemetry / ACL tests OK");
+  // ---------- serial.ondemand ----------
+  assert.deepEqual(parseSettingReply("get serial.ondemand", "  -> > on"), { key: "serial.ondemand", op: "get", value: "on" });
+  assert.equal(parseSettingReply("get serial.ondemand", "  -> ??: serial.ondemand").unsupported, true, "stock get = not supported");
+  assert.equal(parseSettingReply("set serial.ondemand on", "  -> unknown config: serial.ondemand on").unsupported, true, "stock set = not supported");
+  assert.equal(parseSettingReply("set serial.ondemand off", "  -> OK - serial.ondemand off (stock powersaving)").ok, true);
+  assert.equal(psBlocks({ heltec_powersaving: true }), true); assert.equal(psBlocks({ heltec_powersaving: true, serial_ondemand: true }), false); assert.equal(psBlocks({ heltec_powersaving: false }), false);
+  { const sx = JSON.parse(kv.get("state:tsim-1")); sx.heltec_powersaving = true; kv.set("state:tsim-1", JSON.stringify(sx)); }
+  tl = await TEL(); assert.equal(tl.powersaving.blocks, true);
+  assert.equal((await P("rpt-ops", { ops: [{ op: "read", what: "acl" }] })).status, 409, "stock power saving blocks the console");
+  await ingest({ type: "cfgsnap", part: 0, items: [["get serial.ondemand", "  -> > on"]], final: true, count: 1 });
+  tl = await TEL(); assert.equal(tl.rpt.vals["serial.ondemand"].value, "on"); assert.equal(tl.powersaving.on, true); assert.equal(tl.powersaving.ondemand, true); assert.equal(tl.powersaving.blocks, false);
+  r = await P("rpt-ops", { ops: [{ op: "read", what: "acl" }] }); assert.equal(r.status, 200, "serial on demand: console allowed during power saving");
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  const aclRow = fl.find((x) => x[1] === "get acl"); assert(aclRow);
+  await ingest({ type: "cmd", cmd_id: aclRow[0], cmd: "get acl", output: "ACL:\n03 " + "AB".repeat(32) });
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).heltec_powersaving, true, "a reply doesn't mean power saving is off when serial on demand is on");
+  await ingest({ type: "cfgsnap", part: 0, items: [["get serial.ondemand", "  -> ??: serial.ondemand"]], final: true, count: 1 });
+  tl = await TEL(); assert.equal(tl.rpt.vals["serial.ondemand"].unsupported, true); assert.equal(tl.powersaving.blocks, true, "stock firmware again: blocked");
+  { const sx = JSON.parse(kv.get("state:tsim-1")); sx.heltec_powersaving = false; kv.set("state:tsim-1", JSON.stringify(sx)); }
+  await P("commands", { cancel: true });
+  const ph5 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); assert(ph5.includes("serial.ondemand")); for (const m of ph5.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  assert.equal(pickAsset(["Heltec_v3_repeater-v1.18.0-serial-81dbae59-merged.bin", "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "Heltec_v3_room_server-v1.18.0-serial-81dbae59.bin"], FW_PRESETS.meshcore_serial.asset_pattern), "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "app-only image, never merged");
+  assert.equal(pickAsset(["Heltec_v3_repeater-PowerSaving17.1.6-serial-freshInstall-merged.bin", "Heltec_v3_repeater-PowerSaving17.1.6-serial-upgrade.bin"], FW_PRESETS.easyskymesh_serial.asset_pattern), "Heltec_v3_repeater-PowerSaving17.1.6-serial-upgrade.bin");
+  console.log("serial.ondemand tests OK");
   await P("settings", { console_enabled: false });
 }
