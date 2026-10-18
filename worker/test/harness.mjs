@@ -1107,3 +1107,86 @@ console.log("serial.ondemand tests OK");
   assert.equal(m.computeProgress("heltec", [], st, Date.parse("2026-10-18T20:06:00Z")).state, "done");
   console.log("firmware family compare tests OK");
 }
+
+// ---- power-saving settings (serial.ondemand, powersaving, radio.rxps, reboot.interval, powerlog) ----
+{
+  const m = await import("../src/index.js");
+  const I = m.RPT_INDEX;
+  assert.equal(I["serial.ondemand"].cat, "Power & battery"); assert.equal(I["radio.rxps"].cat, "Power & battery"); assert.equal(I["reboot.interval"].cat, "Power & battery");
+  assert.match(I["serial.ondemand"].help, /^Keeps the Heltec's serial port reachable during power saving so the T-SIM can still send commands; off = stock power saving\. Requires MeshCore \+ power saving \+ serial firmware \(just-stuff-tm\/MeshCore\)\.$/);
+  // get commands (exact firmware syntax)
+  assert.equal(m.rptGetCmd("serial.ondemand"), "get serial.ondemand"); assert.equal(m.rptGetCmd("powersaving"), "powersaving");
+  assert.equal(m.rptGetCmd("radio.rxps"), "get radio.rxps"); assert.equal(m.rptGetCmd("reboot.interval"), "get reboot.interval"); assert.equal(m.rptGetCmd("powerlog"), "powerlog");
+  // set commands
+  assert.equal(m.buildSettingCmd("serial.ondemand", "on"), "set serial.ondemand on"); assert.equal(m.buildSettingCmd("serial.ondemand", "off"), "set serial.ondemand off");
+  assert.equal(m.buildSettingCmd("powersaving", "off"), "powersaving off");
+  assert.equal(m.buildSettingCmd("radio.rxps", "off"), "set radio.rxps off"); assert.equal(m.buildSettingCmd("radio.rxps", "level 6"), "set radio.rxps level 6"); assert.equal(m.buildSettingCmd("radio.rxps", "level 10"), "set radio.rxps level 10");
+  assert.throws(() => m.buildSettingCmd("radio.rxps", "level 11")); assert.throws(() => m.buildSettingCmd("radio.rxps", "custom")); assert.throws(() => m.buildSettingCmd("powerlog", "x"));
+  assert.equal(m.buildSettingCmd("reboot.interval", "24"), "set reboot.interval 24"); assert.equal(m.buildSettingCmd("reboot.interval", "0"), "set reboot.interval 0"); assert.throws(() => m.buildSettingCmd("reboot.interval", "256"));
+  // replies
+  assert.equal(m.parseSettingReply("get serial.ondemand", "  -> > off").value, "off"); assert.equal(m.parseSettingReply("get serial.ondemand", "  -> > on (always)").value, "on");
+  assert.equal(m.parseSettingReply("set serial.ondemand off", "  -> OK - serial.ondemand off (stock powersaving)").ok, true);
+  assert.equal(m.parseSettingReply("get reboot.interval", "  -> disabled").value, "0"); assert.equal(m.parseSettingReply("get reboot.interval", "  -> > 24").value, "24");
+  let r = m.parseSettingReply("get radio.rxps", "  -> > desired=on,effective=armed,supported=yes,err=0,fail=0,level=6,catch=10.0,preamble=0,rx=1200,sleep=5000");
+  assert.equal(r.value, "level 6"); assert.match(r.detail, /effective=armed/);
+  assert.equal(m.parseSettingReply("get radio.rxps", "  -> > desired=off,effective=continuous,supported=yes,err=0,fail=0,level=0,preamble=0,rx=0,sleep=0").value, "off");
+  assert.equal(m.parseSettingReply("get radio.rxps", "  -> > desired=on,effective=armed,supported=yes,err=0,fail=0,level=0,preamble=0,rx=900,sleep=4000").value, "custom");
+  assert.equal(m.parseSettingReply("get radio.rxps", "  -> > desired=on,effective=armed,supported=yes,err=0,fail=0,level=9(overdrive),preamble=0,rx=1,sleep=2").value, "level 9");
+  // stock firmware answers -> unsupported
+  assert.equal(m.parseSettingReply("get serial.ondemand", "  -> ??: serial.ondemand").unsupported, true);
+  assert.equal(m.parseSettingReply("get radio.rxps", "  -> ??: radio.rxps").unsupported, true);
+  assert.equal(m.parseSettingReply("get reboot.interval", "  -> ??: reboot.interval").unsupported, true);
+  assert.equal(m.parseSettingReply("powerlog", "  -> Unknown command").unsupported, true);
+  assert.equal(m.parseSettingReply("set reboot.interval 5", "  -> unknown config: reboot.interval 5").unsupported, true);
+  // risk only when turning serial.ondemand off; rxps levels 9/10
+  assert.equal(m.settingRisky(I["serial.ondemand"], "off"), true); assert.equal(m.settingRisky(I["serial.ondemand"], "on"), false);
+  assert.equal(m.settingRisky(I["radio.rxps"], "level 10"), true); assert.equal(m.settingRisky(I["radio.rxps"], "level 6"), false); assert.equal(m.settingRisky(I["reboot.interval"], "24"), false);
+  assert(m.RISKY_CMD_RE.test("set serial.ondemand off") && !m.RISKY_CMD_RE.test("set serial.ondemand on") && m.RISKY_CMD_RE.test("set radio.rxps level 10"));
+  // Read all + settings cache include them; lists always survive the 48-command cap
+  const ra = m.rptReadAllKeys({}); for (const k of ["powersaving", "serial.ondemand", "radio.rxps", "reboot.interval"]) assert(ra.includes(k), k); assert(!ra.includes("powerlog"));
+  const cl = m.cfgListCmds({ "bridge.type": { value: "espnow" } }); assert(cl.length <= 48); for (const c of ["get acl", "region", "get serial.ondemand", "get radio.rxps", "get reboot.interval", "powersaving"]) assert(cl.includes(c), c);
+  assert.equal(m.cfgListCmds({})[0], "region");
+
+  // server: save gate, ingest, restore
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.8")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const unthrottle = () => { for (const k of ["state:tsim-1", "sent:tsim-1"]) { const x = JSON.parse(kv.get(k) || "{}"); delete x.last_send_ts; kv.set(k, JSON.stringify(x)); } };
+  await P("settings", { console_enabled: true }); kv.set("cmds:tsim-1", "[]");
+  const st0 = JSON.parse(kv.get("state:tsim-1") || "{}"); st0.heltec_powersaving = false; kv.set("state:tsim-1", JSON.stringify(st0));
+  const h0 = holo;
+  unthrottle(); r = await P("rpt-save", { changes: { "serial.ondemand": "off" } }); let j = await r.json();
+  assert.equal(r.status, 409); assert(j.risky); assert.match(j.error, /T-SIM may no longer reach the Heltec's CLI/); assert.equal(holo, h0, "nothing sent without confirmation");
+  unthrottle(); r = await P("rpt-save", { changes: { "serial.ondemand": "on", "reboot.interval": "24", "radio.rxps": "level 6" } }); j = await r.json(); assert.equal(r.status, 200, JSON.stringify(j));
+  unthrottle(); r = await P("rpt-save", { changes: { "radio.rxps": "level 10" } }); assert.equal(r.status, 409);
+  unthrottle(); r = await P("rpt-save", { changes: { "serial.ondemand": "off" }, risk_ok: true }); assert.equal(r.status, 200);
+  let fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  const sent = fl.map((x) => x[1]); for (const x of ["set serial.ondemand on", "set reboot.interval 24", "set radio.rxps level 6", "set serial.ondemand off"]) assert(sent.includes(x), x);
+  for (const [cid, cc] of fl) await ingest({ type: "cmd", cmd_id: cid, cmd: cc, output: cc.includes("rxps") ? "  -> OK - on,level=6,preamble=0,rx=1200,sleep=5000" : "  -> OK" });
+  let cv = JSON.parse(kv.get("rptcfg:tsim-1")); assert.equal(cv["reboot.interval"].value, "24"); assert.equal(cv["radio.rxps"].value, "level 6");
+  // reads: unsupported on stock
+  unthrottle(); r = await P("rpt-read", { keys: ["serial.ondemand", "radio.rxps", "reboot.interval", "powerlog"] }); assert.equal(r.status, 200, await r.clone().text());
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.deepEqual(fl.map((x) => x[1]).sort(), ["get radio.rxps", "get reboot.interval", "get serial.ondemand", "powerlog"]);
+  for (const [cid, cc] of fl) await ingest({ type: "cmd", cmd_id: cid, cmd: cc, output: cc === "powerlog" ? "  -> Unknown command" : cc === "get radio.rxps" ? "  -> > desired=on,effective=armed,supported=yes,err=0,fail=0,level=3,preamble=0,rx=1,sleep=2" : "  -> ??: " + cc.slice(4) });
+  cv = JSON.parse(kv.get("rptcfg:tsim-1")); assert.equal(cv["serial.ondemand"].unsupported, true); assert.equal(cv["reboot.interval"].unsupported, true); assert.equal(cv.powerlog.unsupported, true);
+  assert.equal(cv["radio.rxps"].value, "level 3"); assert.match(cv["radio.rxps"].detail, /desired=on/);
+  // backup + restore carry them; serial.ondemand off is risky in the restore plan and stays before powersaving
+  kv.set("rptcfg:tsim-1", JSON.stringify({ "serial.ondemand": { value: "off" }, "radio.rxps": { value: "level 4" }, "reboot.interval": { value: "12" }, powersaving: { value: "on" } }));
+  r = await P("backup-create", {}); const bk = (await r.json()).backup; for (const k of ["serial.ondemand", "radio.rxps", "reboot.interval", "powersaving"]) assert(bk.repeater.settings[k], k);
+  kv.set("rptcfg:tsim-1", JSON.stringify({ "serial.ondemand": { value: "on" }, "radio.rxps": { value: "custom" }, "reboot.interval": { value: "0" }, powersaving: { value: "off" } }));
+  j = await (await P("backup-preview", { backup: bk })).json();
+  const row = (k) => j.plan.settings.find((x) => x.key === k) || (j.plan.powersaving && j.plan.powersaving.key === k ? j.plan.powersaving : null);
+  assert.equal(row("serial.ondemand").cmd, "set serial.ondemand off"); assert.equal(row("serial.ondemand").risk, true); assert.match(row("serial.ondemand").warn, /T-SIM may no longer reach/);
+  assert.equal(row("radio.rxps").cmd, "set radio.rxps level 4"); assert.equal(row("reboot.interval").cmd, "set reboot.interval 12");
+  const cmds = m.restoreCommands(j.plan, { settings: true }).map((x) => x.cmd); assert(cmds.indexOf("set serial.ondemand off") < cmds.indexOf("powersaving on"));
+  const bk2 = JSON.parse(JSON.stringify(bk)); bk2.repeater.settings["radio.rxps"] = { value: "custom" };
+  kv.set("rptcfg:tsim-1", JSON.stringify({})); j = await (await P("backup-preview", { backup: bk2 })).json(); assert(j.plan.skipped.some((x) => /console/.test(x.why)));
+  // UI: console picker + settings render
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  for (const x of ["get serial.ondemand", "set serial.ondemand on", "set serial.ondemand off", "get radio.rxps", "set radio.rxps level ", "get reboot.interval", "set reboot.interval ", "powerlog"]) assert(pg.includes(`<option value="${x}">`), x);
+  assert(pg.includes("Not supported by this firmware")); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  await P("settings", { console_enabled: false });
+  console.log("power-saving settings tests OK");
+}

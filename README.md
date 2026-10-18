@@ -239,6 +239,18 @@ Settings → **Repeater backup & restore**:
 - **Read private key for backup** (behind a confirmation, texts the T-SIM once) runs `get prv.key` on the repeater's serial console. The key is stored hidden on the Worker (never shown in history or activity) until **Forget stored key**. Tick **Include the private key** to put it in a backup; such files are marked **SENSITIVE**.
 - **Restore**: pick a backup file to see the differences from the current values, tick the groups (dashboard config, repeater settings, regions, ACL, identity), and press **Restore selected**. Dashboard config is applied at once. Repeater changes are staged as the matching CLI commands (`set ...`, `region put/allowf/home/default` + `region save`, `setperm`, and for identity `set prv.key` followed by `reboot`). Nothing is sent until you press **Send part N**, which queues one wake's worth (up to 40 commands / 6000 bytes) and texts the T-SIM once. Larger restores are split into parts. Risky changes need a confirmation, and identity needs **IDENTITY** typed in. Regions and ACL entries that aren't in the backup are kept, not removed.
 
+### Power-saving settings (Repeater settings → Power & battery)
+
+Each has a Read button and is included in Read all, the T-SIM settings cache, the console's command picker and backups / restores. Syntax is taken from the firmware source (just-stuff-tm/MeshCore `powersaving` / `powersaving-serial`). Stock firmware answers `??:` / `Unknown command`, shown as *Not supported by this firmware*.
+
+| Setting | Read | Save |
+|---|---|---|
+| Power saving | `powersaving` | `powersaving on` / `powersaving off` (risky: confirmation) |
+| Serial on demand | `get serial.ondemand` | `set serial.ondemand on` / `set serial.ondemand off` (off is risky: with power saving on, the T-SIM may no longer reach the Heltec's CLI) |
+| RX duty cycle | `get radio.rxps` | `set radio.rxps off` / `set radio.rxps level <1-10>` (3 = on/conservative, 6 = balanced, 8 = max; 9 overdrive and 10 riskyWorkingMax need confirmation). Custom `set radio.rxps <rx_us> <sleep_us>` is console-only |
+| Scheduled reboot | `get reboot.interval` (`disabled` = 0) | `set reboot.interval <0-255>` hours, 0 = off |
+| Reset reason (Diagnostics) | `powerlog` | read-only |
+
 ## SMS commands (what the Worker sends)
 
 | Text | Effect |
