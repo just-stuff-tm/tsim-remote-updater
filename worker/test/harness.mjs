@@ -16,6 +16,9 @@ globalThis.fetch = async (url, init = {}) => {
   if (url.includes("api.github.com/repos/meshcore-dev/MeshCore/releases?")) { ghList++; const A = (v, h) => [{ id: 1, name: `Heltec_v3_repeater-v${v}-${h}-merged.bin`, browser_download_url: `https://g/m/${v}-merged.bin` }, { id: 2, name: `Heltec_v3_repeater-v${v}-${h}.bin`, browser_download_url: `https://github.com/meshcore-dev/MeshCore/releases/download/repeater-v${v}/Heltec_v3_repeater-v${v}-${h}.bin` }];
     return new Response(JSON.stringify([{ tag_name: "companion-v1.18.0", published_at: "2026-10-15T10:20:19Z", assets: [] }, { tag_name: "repeater-v1.18.0", published_at: "2026-10-15T10:03:13Z", assets: A("1.18.0", "81dbae5") },
       { tag_name: "room-server-v1.18.0", published_at: "2026-10-15T10:01:34Z", assets: [] }, { tag_name: "repeater-v1.19.0-rc1", prerelease: true, published_at: "2026-10-16T00:00:00Z", assets: A("1.19.0", "x") }, { tag_name: "repeater-v1.17.1", published_at: "2026-08-14T13:32:04Z", assets: A("1.17.1", "d929643") }])); }
+  if (url.includes("api.github.com/repos/just-stuff-tm/MeshCore/releases/latest")) { const T = "v1.18.0-powersaving-serial", H = "8ba35c2d", D = `https://github.com/just-stuff-tm/MeshCore/releases/download/${T}/`;
+    const names = [`Heltec_v3_repeater-${T}-${H}-merged.bin`, `Heltec_v3_repeater_headless-${T}-${H}.bin`, `Heltec_v3_room_server-${T}-${H}.bin`, `Heltec_v3_repeater-${T}-${H}.bin`, "SHA256SUMS.txt"];
+    return new Response(JSON.stringify({ tag_name: T, published_at: "2026-10-18T20:30:00Z", body: "MeshCore v1.18.0 + power saving", assets: names.map((n, i) => ({ id: 100 + i, name: n, browser_download_url: D + n })) })); }
   if (url.includes("api.github.com")) return new Response(JSON.stringify({ tag_name: "PowerSaving17.2", assets: [
     { id: 5, name: "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin", browser_download_url: "https://github.com/x/y/releases/download/t/Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin" }] }));
   if (url.includes("hologram")) { holo++; assert.equal(JSON.parse(init.body).deviceid, 1234567);
@@ -36,6 +39,8 @@ assert.equal((await call("/admin/devices")).status, 401);
 assert.equal((await call("/admin/devices", { headers: { Authorization: "Bearer wrong" } })).status, 401);
 let r = await admin("/admin/devices", "POST", { id: "tsim-1", name: "Test", hologram_device_id: "1234567", heltec_fw: "base" });
 assert.equal(r.status, 201); const created = await r.json(); assert(created.password && created.ingest_key);
+// the update-flow tests below use an explicitly chosen EasySkyMesh source (saved by the user after v2, so never migrated)
+kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 2 }));
 assert.equal((await admin("/admin/devices", "POST", { id: "tsim-1", hologram_device_id: "1" })).status, 409);
 assert.equal((await admin("/admin/devices", "POST", { id: "Bad Id", hologram_device_id: "1" })).status, 400);
 const list = await (await admin("/admin/devices")).json();
@@ -347,7 +352,7 @@ console.log("ALL TESTS PASSED");
   assert.equal(updateStatus(null, { tag: "direct", asset_name: "a.bin" }, { tag: "direct", asset_name: "a.bin" }).state, "current");
   assert.equal(updateStatus(null, { tag: "v1.10.0", asset_name: "Heltec_v3_repeater-v1.10.0.bin" }, { tag: "v1.9.1" }).state, "available");
   const of = globalThis.fetch; let n = 0, sms = 0;
-  globalThis.fetch = async (u) => { if (/hologram/i.test(String(u))) sms++; n++; return new Response(JSON.stringify({ tag_name: "v9.9.9", assets: [{ id: 1, name: "firmware.bin", browser_download_url: "https://g/f.bin" }, { id: 2, name: "Heltec_v3_repeater-x-upgrade.bin", browser_download_url: "https://g/h.bin" }] }), { status: 200 }); };
+  globalThis.fetch = async (u) => { if (/hologram/i.test(String(u))) sms++; n++; return new Response(JSON.stringify({ tag_name: "v9.9.9", assets: [{ id: 1, name: "firmware.bin", browser_download_url: "https://g/f.bin" }, { id: 2, name: "Heltec_v3_repeater-x-upgrade.bin", browser_download_url: "https://g/h.bin" }, { id: 3, name: "Heltec_v3_repeater-v9.9.9-powersaving-serial-abc.bin", browser_download_url: "https://g/p.bin" }] }), { status: 200 }); };
   const r1 = await refreshReleases(env); const n1 = n; await refreshReleases(env);
   assert.equal(sms, 0); assert.equal(n, n1, "second run uses cache"); assert(r1.length >= 1);
   globalThis.fetch = of;
@@ -900,8 +905,44 @@ console.log("tag/asset version ok");
   { const sx = JSON.parse(kv.get("state:tsim-1")); sx.heltec_powersaving = false; kv.set("state:tsim-1", JSON.stringify(sx)); }
   await P("commands", { cancel: true });
   const ph5 = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); assert(ph5.includes("serial.ondemand")); for (const m of ph5.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
-  assert.equal(pickAsset(["Heltec_v3_repeater-v1.18.0-serial-81dbae59-merged.bin", "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "Heltec_v3_room_server-v1.18.0-serial-81dbae59.bin"], FW_PRESETS.meshcore_serial.asset_pattern), "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "app-only image, never merged");
+  assert.equal(pickAsset(["Heltec_v3_repeater-v1.18.0-serial-81dbae59-merged.bin", "Heltec_v3_repeater-v1.18.0-serial-81dbae59.bin", "Heltec_v3_room_server-v1.18.0-serial-81dbae59.bin"], FW_PRESETS.meshcore_serial.asset_pattern), undefined, "builds without power saving (vX.Y.Z-serial) are not picked by the default");
   assert.equal(pickAsset(["Heltec_v3_repeater_headless-v1.18.0-powersaving-serial-8ba35c2d.bin", "Heltec_v3_repeater-v1.18.0-powersaving-serial-8ba35c2d-merged.bin", "Heltec_v3_repeater-v1.18.0-powersaving-serial-8ba35c2d.bin"], FW_PRESETS.meshcore_serial.asset_pattern), "Heltec_v3_repeater-v1.18.0-powersaving-serial-8ba35c2d.bin", "powersaving-serial naming: app-only, not headless, not merged");
-  console.log("serial.ondemand tests OK");
+  // default source + migration of the old EasySkyMesh default
+{
+  const { migrateSource, latestRelease, FW_PRESETS: FP } = await import("../src/index.js");
+  const NEW = { repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-serial-*.bin" };
+  let m = migrateSource(null); assert.equal(m.src.repo, NEW.repo); assert.equal(m.src.asset_pattern, NEW.asset_pattern); assert(!m.migrated && !m.stale, "no stored source: new default, nothing written");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" });
+  assert(m.migrated && m.src.repo === NEW.repo && m.src.v === 2, "untouched old default migrates");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin" });
+  assert(m.migrated, "old default missing optional fields still counts as untouched");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-PowerSaving17*-upgrade.bin", tag_prefix: "", direct_url: "" });
+  assert(!m.migrated && m.src.repo === "IoTThinks/EasySkyMesh" && m.src.asset_pattern.includes("PowerSaving17") && m.src.v === 2, "customized pattern kept");
+  m = migrateSource({ enabled: false, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "https://x/y.bin" });
+  assert(!m.migrated && m.src.enabled === false && m.src.direct_url === "https://x/y.bin", "disabled / direct URL kept");
+  m = migrateSource({ enabled: true, repo: "meshcore-dev/MeshCore", asset_pattern: "Heltec_v3_repeater-v*.bin", tag_prefix: "repeater-", direct_url: "" });
+  assert(!m.migrated && m.src.repo === "meshcore-dev/MeshCore", "stock MeshCore choice kept");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 2 });
+  assert(!m.migrated && m.src.repo === "IoTThinks/EasySkyMesh", "EasySkyMesh picked again after the change is respected");
+  // through the API: old default stored -> migrated once, logged, release cache cleared, persisted with v2
+  kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" }));
+  kv.set("release:tsim-1", JSON.stringify({ tag: "PowerSaving17.2" }));
+  let s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json();
+  assert.equal(s.repo, NEW.repo); assert.equal(s.asset_pattern, NEW.asset_pattern);
+  assert.equal(JSON.parse(kv.get("source:tsim-1")).v, 2); assert.equal(kv.get("release:tsim-1"), undefined);
+  s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json(); assert.equal(s.repo, NEW.repo, "stable after migration");
+  // saving EasySkyMesh again sticks
+  let r2 = await P("source", { repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin" });
+  assert.equal(r2.status, 200); s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json(); assert.equal(s.repo, "IoTThinks/EasySkyMesh", "explicit EasySkyMesh choice is kept");
+  // default preset first, alternatives still offered
+  assert.deepEqual(Object.keys(FP), ["meshcore_serial", "easyskymesh", "meshcore"]); assert(FP.meshcore_serial.default);
+  assert.equal(FP.meshcore_serial.asset_pattern, NEW.asset_pattern);
+  // new default resolves to the app-only repeater image, never merged or headless
+  const rel = await latestRelease({}, { enabled: true, ...NEW, tag_prefix: "", direct_url: "" });
+  assert.equal(rel.tag, "v1.18.0-powersaving-serial"); assert.equal(rel.asset_name, "Heltec_v3_repeater-v1.18.0-powersaving-serial-8ba35c2d.bin");
+  assert(!/merged|headless/.test(rel.url));
+  console.log("default source / migration tests OK");
+}
+console.log("serial.ondemand tests OK");
   await P("settings", { console_enabled: false });
 }
