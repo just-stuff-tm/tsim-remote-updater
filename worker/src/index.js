@@ -5,18 +5,27 @@
 //
 // Bindings: KV STATE; secrets HOLOGRAM_API_KEY, ADMIN_TOKEN, SESSION_SECRET; optional GITHUB_TOKEN.
 
-// Default Heltec update source: MeshCore + EasySkyMesh power saving + serial.ondemand (just-stuff-tm/MeshCore,
-// releases vX.Y.Z-powersaving-serial). The app-only image keeps the Heltec's identity and settings; "-merged" is skipped.
-const DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-serial-*.bin", tag_prefix: "", direct_url: "" };
-// Saved sources carry v: SOURCE_VERSION. A source saved before v2 that is exactly the old default (EasySkyMesh preset,
-// nothing customized) is migrated to the new default once; anything else the user set is kept as it is.
-export const SOURCE_VERSION = 2;
+// Default Heltec update source: MeshCore + power saving, with serial.ondemand and headless builds as features
+// (just-stuff-tm/MeshCore, releases vX.Y.Z-powersaving; older releases were named vX.Y.Z-powersaving-serial and still match).
+// The app-only Heltec_v3_repeater image keeps the Heltec's identity and settings; "-merged" and "_headless" are skipped.
+const DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-*.bin", tag_prefix: "", direct_url: "" };
+// Saved sources carry v: SOURCE_VERSION. Sources saved before the current version that are exactly an old default
+// (nothing customized) move to the new default once; anything else the user set is kept as it is.
+export const SOURCE_VERSION = 3;
 export const LEGACY_DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
+// v2 default (releases were named vX.Y.Z-powersaving-serial)
+export const V2_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-serial-*.bin", tag_prefix: "", direct_url: "" };
+const isExactly = (stored, def) => Object.keys(def).every((k) => (stored[k] ?? def[k]) === def[k]);
 export function migrateSource(stored) {
   if (!stored || typeof stored !== "object") return { src: { ...DEFAULT_SOURCE }, migrated: false, stale: false };
   if (stored.v >= SOURCE_VERSION) return { src: { ...DEFAULT_SOURCE, ...stored }, migrated: false, stale: false };
-  const legacy = Object.keys(LEGACY_DEFAULT_SOURCE).every((k) => (stored[k] ?? LEGACY_DEFAULT_SOURCE[k]) === LEGACY_DEFAULT_SOURCE[k]);
-  if (legacy) return { src: { ...DEFAULT_SOURCE, v: SOURCE_VERSION, migrated_from: LEGACY_DEFAULT_SOURCE.repo }, migrated: true, stale: true };
+  if (!(stored.v >= 2) && isExactly(stored, LEGACY_DEFAULT_SOURCE))
+    return { src: { ...DEFAULT_SOURCE, v: SOURCE_VERSION, migrated_from: LEGACY_DEFAULT_SOURCE.repo }, migrated: true, stale: true };
+  // the old default pattern (repo + pattern unchanged): only the pattern moves; enabled/prefix/URL choices stay
+  if (stored.repo === V2_DEFAULT_SOURCE.repo && stored.asset_pattern === V2_DEFAULT_SOURCE.asset_pattern) {
+    const { migrated_from, ...rest } = stored;
+    return { src: { ...DEFAULT_SOURCE, ...rest, asset_pattern: DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: V2_DEFAULT_SOURCE.asset_pattern }, migrated: true, stale: true };
+  }
   return { src: { ...DEFAULT_SOURCE, ...stored, v: SOURCE_VERSION }, migrated: false, stale: true };
 }
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
@@ -84,7 +93,9 @@ const getSource = async (env, id) => {
     await putJson(env, `source:${id}`, src);
     if (migrated) {
       await env.STATE.delete(`release:${id}`);
-      await logActivity(env, id, { type: "action", msg: `Update source moved to the new default: ${src.repo} ${src.asset_pattern} (was the old default ${LEGACY_DEFAULT_SOURCE.repo}; pick EasySkyMesh under Firmware preset to go back)` });
+      await logActivity(env, id, { type: "action", msg: src.migrated_from === LEGACY_DEFAULT_SOURCE.repo
+        ? `Update source moved to the new default: ${src.repo} ${src.asset_pattern} (was the old default ${LEGACY_DEFAULT_SOURCE.repo}; pick EasySkyMesh under Firmware preset to go back)`
+        : `Update source pattern updated for the renamed releases: ${src.asset_pattern} (was ${src.migrated_from}; matches both the new -powersaving- and the old -powersaving-serial- files)` });
     }
   }
   return src;
@@ -188,10 +199,10 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 // ---------- GitHub / Hologram ----------
 // Fallback when the GitHub API rate-limits shared Worker IPs (403/429): read the public release page.
-// Asset choice: matches the pattern; "-merged" full-flash images are skipped unless the pattern asks for them.
+// Asset choice: matches the pattern; "-merged" full-flash images and "_headless" builds are skipped unless the pattern asks for them.
 export function pickAsset(names, pattern) {
-  const re = globToRegex(pattern), wantMerged = /merged/i.test(pattern);
-  return names.find((n) => re.test(n) && (wantMerged || !/-merged\.bin$/i.test(n)));
+  const re = globToRegex(pattern), wantMerged = /merged/i.test(pattern), wantHeadless = /headless/i.test(pattern);
+  return names.find((n) => re.test(n) && (wantMerged || !/-merged\.bin$/i.test(n)) && (wantHeadless || !/_headless\b/i.test(n)));
 }
 async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
   let tag = "";
@@ -435,7 +446,7 @@ export async function heltecImageRisk(url, tsimFw) {
   return null;
 }
 export const FW_PRESETS = {
-  meshcore_serial: { label: "MeshCore + power saving + serial on demand (default, just-stuff-tm/MeshCore)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. MeshCore with EasySkyMesh power saving and serial.ondemand (the console keeps working while power saving), release vX.Y.Z-powersaving-serial from the powersaving-serial branch. Uses the Heltec_v3_repeater app-only image (keeps identity and settings), never the -merged file. Fresh installs default to powersaving on; an update keeps your current setting." },
+  meshcore_serial: { label: "MeshCore + power saving (default, just-stuff-tm/MeshCore)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. MeshCore with EasySkyMesh power saving; features: serial.ondemand (the console keeps working while power saving) and headless Heltec V3 builds. Releases vX.Y.Z-powersaving (older ones vX.Y.Z-powersaving-serial also match) from the powersaving branch. Uses the Heltec_v3_repeater app-only image (keeps identity and settings), never the -merged or _headless file. Fresh installs default to powersaving on; an update keeps your current setting." },
   easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" },
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
 };
@@ -1991,14 +2002,15 @@ const vcmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a
 const vstr = (v) => "v" + v.join(".");
 // Firmware identity, so different firmware families are never compared by raw numbers (EasySkyMesh "PowerSaving17.1.6" is
 // MeshCore 1.17.1 + their revision 6, not version 17). family + MeshCore base version + build commit when present.
-export const FW_FAMILY_NAMES = { easyskymesh: "EasySkyMesh PowerSaving", "meshcore-powersaving-serial": "MeshCore + power saving + serial", "meshcore-serial": "MeshCore + serial", "meshcore-powersaving": "MeshCore + power saving", meshcore: "stock MeshCore" };
+// vX.Y.Z-powersaving and the older vX.Y.Z-powersaving-serial names are the same firmware line (serial.ondemand is a feature).
+export const FW_FAMILY_NAMES = { easyskymesh: "EasySkyMesh PowerSaving", "meshcore-serial": "MeshCore + serial", "meshcore-powersaving": "MeshCore + power saving", meshcore: "stock MeshCore" };
 export function fwIdent(x) {
   const s = String(x || ""); if (!s) return null;
   const cm = s.match(/(?:^|[-_ ])((?=[0-9]*[a-f])[0-9a-f]{7,40})(?=$|[-_. (])/i), commit = cm ? cm[1].toLowerCase() : null;
   const e = s.match(/powersaving[\s_.-]?(\d+)\.(\d+)(?:\.(\d+))?/i);
   if (e) return { family: "easyskymesh", base: [1, +e[1], +e[2]], ver: [+e[1], +e[2], +(e[3] || 0)], commit };
   const v = verOf(s); if (!v) return null;
-  const family = /-powersaving-serial\b/i.test(s) ? "meshcore-powersaving-serial" : /-serial\b/i.test(s) ? "meshcore-serial" : /-powersaving\b/i.test(s) ? "meshcore-powersaving" : "meshcore";
+  const family = /-powersaving\b/i.test(s) ? "meshcore-powersaving" : /-serial\b/i.test(s) ? "meshcore-serial" : "meshcore";
   return { family, base: v, ver: v, commit };
 }
 const relIdent = (rel) => (rel ? fwIdent(rel.asset_name) || fwIdent(rel.tag) : null);

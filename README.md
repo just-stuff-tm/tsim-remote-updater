@@ -206,7 +206,7 @@ Open your Worker URL and log in with a device id or fleet login and its password
 
 The repeater page shows firmware, last seen (with a **stale** badge after 26 hours), wake cause, uptime, battery and solar, signal (CSQ/RSRP/RSRQ), operator, IP, the Heltec firmware, the latest `upgrade.bin` on GitHub, and an activity log. It refreshes every 30 s.
 
-**Update source** (per device, in the dashboard): GitHub repo (default `just-stuff-tm/MeshCore`), asset filename pattern (`*` = anything, default `Heltec_v3_repeater-v*-powersaving-serial-*.bin`), an optional direct `https://` URL, or an uploaded file (see below). Update status compares like with like: firmware family (stock MeshCore, MeshCore + power saving + serial, EasySkyMesh PowerSaving), MeshCore base version and build commit. A repeater running a different family from the selected source shows *Update available (different firmware source)*. When the GitHub source is turned off, Check and Update use the direct URL, or are disabled if it's empty.
+**Update source** (per device, in the dashboard): GitHub repo (default `just-stuff-tm/MeshCore`), asset filename pattern (`*` = anything, default `Heltec_v3_repeater-v*-powersaving-*.bin`: releases `vX.Y.Z-powersaving` and the older `vX.Y.Z-powersaving-serial`; `-merged` and `_headless` files are skipped; a source saved with the old default pattern is updated once), an optional direct `https://` URL, or an uploaded file (see below). Update status compares like with like: firmware family (stock MeshCore, MeshCore + power saving, EasySkyMesh PowerSaving), MeshCore base version and build commit. A repeater running a different family from the selected source shows *Update available (different firmware source)*. When the GitHub source is turned off, Check and Update use the direct URL, or are disabled if it's empty.
 
 **Mesh** section: repeater name, firmware, clock, the Heltec's own battery and uptime, radio (noise floor, last RSSI/SNR, airtime), packet counters and a neighbors table (id, SNR, last heard), from the latest snapshot.
 
@@ -222,7 +222,7 @@ The repeater page shows firmware, last seen (with a **stale** badge after 26 hou
 
 **Update progress:** each update gets a progress bar and step list (Waiting for T-SIM to wake, Downloading, Verifying, Writing / flashing, Rebooting, Done/Failed) with times, the target file and a plain-English failure reason. It's built from the events the firmware already posts (`UPDATE start`, `Download done`, `SUCCESS`/`FAIL` for the Heltec; `TSIM OTA start / downloaded / written / OK / FAIL` for the T-SIM). The page refreshes every 5 s while an update runs, and an update with no result after 15 minutes is shown as "No response". Fleet cards show a small badge while an update is running or just finished.
 
-**Firmware presets** (Heltec update source): *EasySkyMesh PowerSaving* (GitHub `IoTThinks/EasySkyMesh`, `Heltec_v3_repeater-*-upgrade.bin`) or *Stock MeshCore repeater* (a direct link to the official `meshcore-dev/MeshCore` app-only image `Heltec_v3_repeater-v<ver>-<hash>.bin`; the newest release of that repo is often a companion build, so the preset uses a direct link). Use the non-`merged` file to keep the repeater's identity.
+**Firmware presets** (Heltec update source): *MeshCore + power saving* (default; GitHub `just-stuff-tm/MeshCore`, branch `powersaving`, `Heltec_v3_repeater-v*-powersaving-*.bin`; features serial.ondemand and headless Heltec V3 builds), *EasySkyMesh PowerSaving* (GitHub `IoTThinks/EasySkyMesh`, `Heltec_v3_repeater-*-upgrade.bin`) or *Stock MeshCore repeater* (a direct link to the official `meshcore-dev/MeshCore` app-only image `Heltec_v3_repeater-v<ver>-<hash>.bin`; the newest release of that repo is often a companion build, so the preset uses a direct link). Use the non-`merged` file to keep the repeater's identity.
 
 **Safety check:** T-SIM firmware before 1.6.2 decided "merged image" by file name or by "starts with 0xE9 and is over 1 MiB", so current app-only Heltec V3 images (EasySkyMesh `upgrade.bin` ~1.19 MB, stock MeshCore ~1.17 MB) would be written at 0x0 over the Heltec's bootloader. From 1.6.2 the T-SIM ignores the file name: an image is merged only if it has a partition table (0xAA 0x50) at 0x8000 (or an app header at 0x10000 after an erased gap) and goes to 0x0; an app-only image (0xE9 at offset 0) goes to 0x10000; anything else is refused. While a device reports T-SIM firmware older than 1.6.2, **Update Heltec** checks the file first and refuses app-only images over 1 MiB.
 
@@ -241,7 +241,7 @@ Settings → **Repeater backup & restore**:
 
 ### Power-saving settings (Repeater settings → Power & battery)
 
-Each has a Read button and is included in Read all, the T-SIM settings cache, the console's command picker and backups / restores. Syntax is taken from the firmware source (just-stuff-tm/MeshCore `powersaving` / `powersaving-serial`). Stock firmware answers `??:` / `Unknown command`, shown as *Not supported by this firmware*.
+Each has a Read button and is included in Read all, the T-SIM settings cache, the console's command picker and backups / restores. Syntax is taken from the firmware source (just-stuff-tm/MeshCore branches `powersaving` and `powersaving-port`). Stock firmware answers `??:` / `Unknown command`, shown as *Not supported by this firmware*.
 
 | Setting | Read | Save |
 |---|---|---|
