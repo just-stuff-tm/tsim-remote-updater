@@ -39,6 +39,7 @@ export function validateSource(b) {
     o.direct_url = String(b.direct_url).trim();
     if (o.direct_url && (!/^https:\/\/\S+$/.test(o.direct_url) || o.direct_url.length > 300)) throw new Error("direct URL must start with https:// (max 300 chars)");
   }
+  if (b.upload !== undefined && b.upload !== null && b.upload !== "") { if (!/^[0-9a-f]{32}$/.test(String(b.upload))) throw new Error("unknown uploaded file"); o.upload = String(b.upload); }
   return o;
 }
 // T-SIM's own firmware (OTA self-update, firmware >= 1.6.0)
@@ -392,10 +393,10 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
       reason: cancel.note || "Cancel requested." };
   // Version check: if the device already runs the target (or newer), the update is done, whatever the log says.
   if (state !== "done" && sent) {
-    const tv = verOf(sent.tag) || verOf(sent.asset_name);
+    const ti = kind === "tsim" ? (fwIdent(sent.tag) || fwIdent(sent.asset_name)) : relIdent(sent);
     const inst = kind === "tsim" ? st.tsim_fw : (st.radio_ver_at && Date.parse(st.radio_ver_at) >= startAt ? st.radio_ver : null);
     const iv = verOf(inst);
-    if (tv && iv && vcmp(iv, tv) >= 0) {
+    if (ti && iv && fwReached(inst, ti)) {
       const at = (kind === "tsim" ? st.tsim_fw_at : st.radio_ver_at) || null;
       return { state: "done", step: 5, steps: STEPS, times: { ...times, 5: at }, target, started_at: times[0], finished_at: at, reason: null, pct: 100,
         resolved: `${kind === "tsim" ? "T-SIM" : "Repeater"} reports ${vstr(iv)}`, ...(flash ? { flash } : {}) };
@@ -442,6 +443,11 @@ export const FW_PRESETS = {
 // Resolve what "latest" means for this device's update source.
 export async function resolveTarget(env, id) {
   const src = await getSource(env, id);
+  if (src.upload) {
+    const it = ((await kvJson(env, `fwup:${id}`)) || []).find((x) => x.token === src.upload);
+    if (!it) return { src, rel: { skipped: "The uploaded firmware file was deleted. Upload it again or pick another update source." } };
+    return { src, rel: { tag: "upload", asset_id: it.token, asset_name: it.name, url: it.url, published_at: it.uploaded_at, via: "upload", sha256: it.sha256, md5: it.md5 || null, size: it.size, merged: !!it.merged, kind: it.kind } };
+  }
   if (src.enabled) return { src, rel: await latestRelease(env, src) };
   if (src.direct_url) {
     const name = decodeURIComponent(src.direct_url.split(/[?#]/)[0].split("/").pop() || "firmware.bin");
@@ -566,12 +572,18 @@ async function handleIngest(request, env, id) {
   }
   if (entry.type === "cmd") {
     const cmdId = String(t.cmd_id || "").slice(0, 16);
-    const out = String(t.output ?? "").slice(0, CMD_OUT_MAX);
+    let out = String(t.output ?? "").slice(0, CMD_OUT_MAX);
     // MeshCore prints some replies raw (e.g. "get acl", "log") without the "-> " marker; older T-SIM firmware then
     // flags "no reply" even though the output is there. Real output means the repeater answered.
     if (t.error && /no reply/i.test(String(t.error)) && cleanCli(out) && !/^\s*$/.test(out)) { const o1 = cleanCli(out), cmd1 = String(t.cmd || "").trim(); if (o1 !== cmd1) delete t.error; }
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const c = list.find((x) => x.id === cmdId);
+    { // private key: stored for backups only, never left in command history or the activity log
+      const ranCmd = c ? c.cmd : String(t.cmd || "");
+      if (isPrvGet(ranCmd)) { const k = parsePrvKey(out); if (k) { await putJson(env, `prvkey:${id}`, { key: k, at: entry.received_at }); out = "OK: private key read and stored for backups (hidden here)"; } else out = out.replace(PRV_RE_G, "••••"); }
+      if (isPrvSet(ranCmd)) { if (c) c.cmd = redactCmd(c.cmd); out = out.replace(PRV_RE_G, "••••"); }
+      if (isPrvSet(t.cmd)) t.cmd = redactCmd(t.cmd);
+    }
     // System (non-user) commands: T-SIM self-update, firmware-tagged sys, or anything the user never queued.
     const sys = t.sys === true || (c && c.sys) || !c || isSysCmd(c ? c.cmd : t.cmd);
     if (c) { if (sys) c.sys = true; c.status = t.error ? "error" : "done"; c.output = out; c.done_at = entry.received_at; if (t.error) c.error = String(t.error).slice(0, 120); }
@@ -596,7 +608,7 @@ async function handleIngest(request, env, id) {
     if (c && c.op) {
       const L = (await kvJson(env, `rptlist:${id}`)) || {}, txt = cleanCli(out);
       if (c.list) L[c.list] = { raw: txt.slice(0, 1500), at: entry.received_at, error: t.error ? String(t.error).slice(0, 120) : (/^(error|err\b|\?\?)|unsupported|unknown command/i.test(txt) ? txt.slice(0, 120) : null) };
-      else { L.ops = [{ cmd: c.cmd.replace("{{now}}", "(now)"), reply: (txt || t.error || "no reply").slice(0, 200), at: entry.received_at, error: !!t.error || /^(error|err\b|\?\?)/i.test(txt) }, ...(L.ops || [])].slice(0, 10); }
+      else { L.ops = [{ cmd: redactCmd(c.cmd).replace("{{now}}", "(now)"), reply: (txt || t.error || "no reply").slice(0, 200), at: entry.received_at, error: !!t.error || /^(error|err\b|\?\?)/i.test(txt) }, ...(L.ops || [])].slice(0, 10); }
       await putJson(env, `rptlist:${id}`, L);
     }
     const rs = c && c.cfg && !c.op ? parseSettingReply(c.cmd, t.error && !out ? "" : out) : null;
@@ -648,7 +660,8 @@ async function handleIngest(request, env, id) {
     const st = (await kvJson(env, `state:${id}`)) || {};
     st.last_update_result = { at: entry.received_at, msg: entry.msg };
     const m = entry.msg.match(/^SUCCESS:\s*(\S+)/);
-    if (m) { const file = flashFile(entry.msg);
+    if (m) { let file = flashFile(entry.msg);
+      if (/^[0-9a-f]{32}$/.test(file || "")) { const it = ((await kvJson(env, `fwup:${id}`)) || []).find((x) => x.token === file); file = it ? it.name : "uploaded firmware"; }
       st.heltec_fw = file.replace(/\.bin$/, "");
       st.radio_flashed = { at: entry.received_at, file, flash: parseFlashInfo(entry.msg) };
       // new firmware: whatever we knew about power saving is stale
@@ -1017,7 +1030,7 @@ export function locProgress(req, cmds = []) {
   return { ...res, state: cs.some((c) => c.status === "sent") ? "sending" : "queued" };
 }
 // Console history shows only what the user typed (system commands still drive state, they're just hidden).
-export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.cfg && !c.unsolicited && !isSysCmd(c.cmd));
+export const userCommands = (list) => (list || []).filter((c) => !c.sys && !c.cfg && !c.unsolicited && !isSysCmd(c.cmd)).map((c) => (isPrvSet(c.cmd) ? { ...c, cmd: redactCmd(c.cmd) } : c));
 // T-SIM pulls queued console commands (text/plain, one "<id>\t<command>" per line). Marks them sent.
 async function handleDeviceCommands(request, env, id) {
   const dev = await getDevice(env, id);
@@ -1228,6 +1241,335 @@ export async function dupeCheck(env, id, kind, retry, now = Date.now()) {
   return null;
 }
 
+// ---------- uploaded Heltec firmware (stored in KV, served to the T-SIM at /fw/<token>) ----------
+// Heltec V3 = ESP32-S3, 8 MB flash, default_8MB.csv: app partition 0x330000 at 0x10000.
+export const FW_APP_SLOT = 0x330000, FW_UPLOAD_MAX = 4 * 1024 * 1024, FW_UPLOADS_PER_DEVICE = 3, FW_CHIP_ID = 9;
+export const FW_TOKEN_RE = /^[0-9a-f]{32}$/;
+export const MERGED_NAME_RE = /-merged|freshinstall|factory/i;
+const CHIP_NAMES = { 0: "ESP32", 2: "ESP32-S2", 5: "ESP32-C3", 9: "ESP32-S3", 12: "ESP32-C2", 13: "ESP32-C6", 16: "ESP32-H2" };
+export const MERGED_WARN = "This is a full-erase (merged / fresh-install) image. Flashing it wipes the Heltec completely: its identity (private key), node name, all settings and passwords, the access list (ACL) and regions. Back up first, tick the acknowledgement and type ERASE to allow it.";
+const kib = (n) => (n / 1024).toFixed(0) + " KB";
+export const safeFwName = (n) => String(n || "").split(/[\\/]/).pop().replace(/[^A-Za-z0-9.+-]+/g, "_").replace(/^[._]+/, "").slice(0, 100) || "firmware.bin";
+// Same rules as imageKind() in the T-SIM firmware (it picks the flash address from the contents, never the name).
+export function analyzeFirmware(buf, name = "") {
+  const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf), size = b.length;
+  if (size < 4096) throw new Error("That file is too small to be Heltec firmware.");
+  if (size > FW_UPLOAD_MAX) throw new Error(`That file is ${(size / 1048576).toFixed(2)} MB; the limit is ${FW_UPLOAD_MAX / 1048576} MB.`);
+  const two = (o) => [b[o], b[o + 1]];
+  const [h0, h1] = two(0), [p0, p1] = size > 0x8002 ? two(0x8000) : [0, 0], [a0, a1] = size > 0x10010 ? two(0x10000) : [0, 0], [q0, q1] = size > 0x7002 ? two(0x7000) : [0, 0];
+  const app0 = h0 === 0xE9 && h1 >= 1 && h1 <= 16, ptMagic = p0 === 0xAA && p1 === 0x50, gapErased = p0 === 0xFF && p1 === 0xFF;
+  const app10k = a0 === 0xE9 && a1 >= 1 && a1 <= 16, pt7 = q0 === 0xAA && q1 === 0x50;
+  let kind, appOff;
+  if (ptMagic || (app10k && gapErased)) { kind = "merged"; appOff = 0x10000; }
+  else if (pt7 && app0) { kind = "merged-0x1000"; appOff = 0xF000; }
+  else if (app0) { kind = "app"; appOff = 0; }
+  else throw new Error("Not an ESP32 firmware image: it doesn't start with the ESP32 image byte 0xE9 and has no partition table. Pick the Heltec .bin file (not a .zip, .uf2 or .hex).");
+  const ho = b[appOff] === 0xE9 ? appOff : 0, chipId = b[ho + 12] | (b[ho + 13] << 8), chip = CHIP_NAMES[chipId] || `unknown chip (id ${chipId})`;
+  if (chipId !== FW_CHIP_ID) throw new Error(`This image is built for ${chip}, but the Heltec V3 is an ESP32-S3. Flashing it would leave the radio unbootable.`);
+  const appSize = size - appOff;
+  if (appSize > FW_APP_SLOT) throw new Error(`Too big for the Heltec's app partition: ${kib(appSize)} of app code, the partition holds ${kib(FW_APP_SLOT)}.`);
+  const nameMerged = MERGED_NAME_RE.test(name), warnings = [];
+  if (kind === "app" && nameMerged) warnings.push("The file name says merged / fresh install but the contents are an app-only image (the T-SIM writes it at 0x10000). It is still treated as a full erase to be safe; check you picked the right file.");
+  if (kind !== "app" && !nameMerged) warnings.push("The file name doesn't say merged, but the contents are a merged (full flash) image with a bootloader and partition table.");
+  return { kind, merged: kind !== "app" || nameMerged, chip, size, app_size: appSize, warnings };
+}
+const fwList = async (env, id) => (await kvJson(env, `fwup:${id}`)) || [];
+export function targetMerged(src, rel, list = []) {
+  if (src && src.upload) { const it = list.find((x) => x.token === src.upload); return !!(it && it.merged); }
+  const name = (rel && rel.asset_name) || "";
+  return MERGED_NAME_RE.test(name) || (!!src && src.enabled && /merged/i.test(src.asset_pattern || "")) || (!!src && !src.enabled && MERGED_NAME_RE.test(src.direct_url || ""));
+}
+async function handleFwUpload(request, env, dev) {
+  const id = dev.id;
+  if ((+request.headers.get("Content-Length") || 0) > FW_UPLOAD_MAX) return json({ error: `That file is too large (limit ${FW_UPLOAD_MAX / 1048576} MB).` }, 413);
+  const list = await fwList(env, id);
+  if (list.length >= FW_UPLOADS_PER_DEVICE) return json({ error: `You already have ${list.length} uploaded files (max ${FW_UPLOADS_PER_DEVICE}). Delete one first.` }, 409);
+  const buf = await request.arrayBuffer();
+  if (buf.byteLength > FW_UPLOAD_MAX) return json({ error: `That file is too large (limit ${FW_UPLOAD_MAX / 1048576} MB).` }, 413);
+  let raw = request.headers.get("X-File-Name") || ""; try { raw = decodeURIComponent(raw); } catch {}
+  const name = safeFwName(raw);
+  let info; try { info = analyzeFirmware(buf, name); } catch (e) { return json({ error: e.message }, 400); }
+  const sha256 = hex(await crypto.subtle.digest("SHA-256", buf));
+  let md5 = null; try { md5 = hex(await crypto.subtle.digest("MD5", buf)); } catch {}
+  const dup = list.find((x) => x.sha256 === sha256);
+  if (dup) return json({ uploaded: false, duplicate: true, item: dup, note: `This file is already uploaded as ${dup.name}.` });
+  const token = randomHex(16);
+  const item = { token, name, url: `${new URL(request.url).origin}/fw/${token}`, sha256, md5, ...info, uploaded_at: new Date().toISOString() };
+  await env.STATE.put(`fwblob:${token}`, buf, { metadata: { id, size: info.size, sha256 } });
+  list.unshift(item); await putJson(env, `fwup:${id}`, list);
+  await logActivity(env, id, { type: "action", msg: `Firmware uploaded: ${name} (${info.size} bytes, ${info.merged ? "FULL-ERASE merged image" : "app-only"}, sha256 ${sha256.slice(0, 12)}…)` });
+  return json({ uploaded: true, item }, 201);
+}
+async function handleFwDelete(request, env, dev) {
+  const id = dev.id;
+  let b = {}; try { b = await request.json(); } catch {}
+  const list = await fwList(env, id), it = list.find((x) => x.token === b.token);
+  if (!it) return json({ error: "No such uploaded file." }, 404);
+  const st = await loadState(env, id), p = computeProgress("heltec", (await kvJson(env, `telem:${id}:history`)) || [], st);
+  if ((p.state === "running") && st.last_update_sent && st.last_update_sent.url === it.url) return json({ error: "An update using this file is in progress. Wait for it to finish (or cancel it) before deleting the file." }, 409);
+  await env.STATE.delete(`fwblob:${it.token}`);
+  await putJson(env, `fwup:${id}`, list.filter((x) => x !== it));
+  const src = await getSource(env, id);
+  if (src.upload === it.token) { delete src.upload; await putJson(env, `source:${id}`, src); await env.STATE.delete(`release:${id}`); }
+  await logActivity(env, id, { type: "action", msg: `Uploaded firmware deleted: ${it.name}` });
+  return json({ deleted: true, source: src });
+}
+// Public download for the T-SIM: unguessable 128-bit token, no underscores, exact Content-Length, single Range supported.
+async function handleFwDownload(request, env, token) {
+  const nf = () => new Response("not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+  if (!FW_TOKEN_RE.test(token)) return nf();
+  const value = await env.STATE.get(`fwblob:${token}`, { type: "arrayBuffer" });
+  if (!value) return nf();
+  const total = value.byteLength;
+  const h = { "Content-Type": "application/octet-stream", "Cache-Control": "no-store", "Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff", "Content-Disposition": 'attachment; filename="firmware.bin"' };
+  let status = 200, body = value;
+  const m = /^bytes=(\d*)-(\d*)$/.exec((request.headers.get("Range") || "").trim());
+  if (m && (m[1] || m[2])) {
+    let s, e;
+    if (m[1]) { s = +m[1]; e = m[2] ? Math.min(+m[2], total - 1) : total - 1; } else { s = Math.max(0, total - +m[2]); e = total - 1; }
+    if (s >= total || s > e) return new Response(null, { status: 416, headers: { ...h, "Content-Range": `bytes */${total}` } });
+    body = value.slice(s, e + 1); status = 206; h["Content-Range"] = `bytes ${s}-${e}/${total}`;
+  }
+  h["Content-Length"] = String(body.byteLength);
+  return new Response(request.method === "HEAD" ? null : body, { status, headers: h });
+}
+export function uploadImageRisk(rel, tsimFw) {
+  if (fwAtLeast(tsimFw, "1.6.2") || rel.merged || !(rel.size > 1024 * 1024)) return null;
+  return `Blocked for safety: ${rel.asset_name} is an app-only image of ${(rel.size / 1048576).toFixed(2)} MB. The current T-SIM firmware would write it at address 0x0 (over the Heltec's bootloader) and brick it. Update the T-SIM firmware to 1.6.2 or newer first (Update T-SIM firmware), then try again.`;
+}
+
+// ---------- repeater backup / restore ----------
+export const BACKUP_FORMAT = "tsim-repeater-backup", BACKUP_VERSION = 1, BACKUPS_PER_DEVICE = 5, BACKUP_MAX_BYTES = 256 * 1024;
+const PRV_RE = /\b([0-9a-fA-F]{128}|[0-9a-fA-F]{64})\b/, PRV_RE_G = /[0-9a-fA-F]{64,128}/g;
+export const isPrvGet = (cmd) => /^get prv\.key\s*$/i.test(String(cmd || "").trim());
+export const isPrvSet = (cmd) => /^set prv\.key\s/i.test(String(cmd || "").trim());
+export const redactCmd = (cmd) => (isPrvSet(cmd) ? "set prv.key ••••••" : cmd);
+export function parsePrvKey(out) { const r = cleanCli(out); if (!r || /error|unsupported|unknown/i.test(r)) return null; const m = r.match(PRV_RE); return m ? m[1].toLowerCase() : null; }
+// Same parsers as the dashboard's region / ACL tables.
+export function rgParse(raw) {
+  const out = [], st = [];
+  String(raw || "").split("\n").forEach((l) => {
+    if (!l.trim() || /^(err|error|\?\?)/i.test(l.trim())) return;
+    const ind = l.replace(/^\s*->\s?/, "").match(/^\s*/)[0].length, tok = l.trim().replace(/^->\s*/, "").split(/\s+/), home = /\^$/.test(tok[0]), name = tok[0].replace(/\^$/, "");
+    if (!name || !/^(\*|[#A-Za-z0-9_.\-]+)$/.test(name)) return;
+    while (st.length && st[st.length - 1].ind >= ind) st.pop();
+    const parent = st.length ? st[st.length - 1].name : ""; st.push({ ind, name });
+    out.push({ name, home, flood: /\bF\b/.test(tok.slice(1).join(" ")), parent, depth: st.length - 1 });
+  });
+  return out;
+}
+export function aclParse(raw) {
+  const r = [];
+  String(raw || "").split("\n").forEach((l) => {
+    l = l.trim(); let m = l.match(/^([0-9A-Fa-f]{2})\s+([0-9A-Fa-f]{16,64})$/);
+    if (m) return r.push({ pk: m[2].toUpperCase(), perm: parseInt(m[1], 16) & 3 });
+    m = l.match(/([0-9A-Fa-f]{16,64})\W+([0-3])\b/); if (m) r.push({ pk: m[1].toUpperCase(), perm: +m[2] });
+  });
+  return r;
+}
+const cleanHome = (raw) => String(raw || "").replace(/^>\s*/, "").replace(/^home is\s*/i, "").trim();
+const cleanDefault = (raw) => String(raw || "").replace(/^>\s*/, "").replace(/^default scope is\s*/i, "").replace("<null>", "").trim();
+const SRC_FIELDS = ["enabled", "repo", "asset_pattern", "tag_prefix", "direct_url"];
+export async function buildBackup(env, id, dev, includeKey) {
+  const g = (k) => kvJson(env, k);
+  const [cv, L, src, tsrc, settings, power, gcfg, cache, nicks, prv, mesh] = await Promise.all([g(`rptcfg:${id}`), g(`rptlist:${id}`), getSource(env, id), getTsimSource(env, id), getSettings(env, id), g(`power:${id}`), g(`gpscfg:${id}`), g(`cachecfg:${id}`), g(`nicks:${id}`), g(`prvkey:${id}`), g(`mesh:${id}`)]);
+  const vals = cv || {}, lists = {}, settingsOut = {};
+  for (const [k, v] of Object.entries(vals)) if (RPT_INDEX[k] && !RPT_INDEX[k].wo && v && v.value != null && v.value !== "") settingsOut[k] = { value: String(v.value), at: v.at || null };
+  for (const k of ["regions", "home", "default", "acl", "sensors"]) { const x = (L || {})[k]; if (x && !x.error && x.raw) lists[k] = { raw: x.raw, at: x.at || null }; }
+  const key = includeKey && prv && prv.key ? prv.key : null;
+  const pw = ["guest.password", "bridge.secret"].filter((k) => settingsOut[k]);
+  return {
+    format: BACKUP_FORMAT, version: BACKUP_VERSION, created_at: new Date().toISOString(), device: { id, name: dev.name || id },
+    sensitive: { private_key: !!key, passwords: pw, note: key || pw.length ? "SENSITIVE: anyone with this file can " + (key ? "impersonate this repeater (private key)" : "") + (key && pw.length ? " and " : "") + (pw.length ? "log in with its passwords" : "") + ". Keep it private." : "No private key or passwords." },
+    repeater: { node_name: (mesh && mesh.node_name) || (vals.name && vals.name.value) || null, firmware: (mesh && mesh.heltec_fw) || null, settings: settingsOut, lists,
+      regions: rgParse(lists.regions && lists.regions.raw), home: lists.home ? cleanHome(lists.home.raw) : null, default_scope: lists.default ? cleanDefault(lists.default.raw) : null, acl: aclParse(lists.acl && lists.acl.raw) },
+    identity: { public_key: (vals["public.key"] && vals["public.key"].value) || null, private_key: key, private_key_read_at: key ? prv.at : null },
+    dashboard: { update_source: Object.fromEntries(SRC_FIELDS.map((k) => [k, src[k]])), tsim_source: tsrc, settings: { console_enabled: !!settings.console_enabled, schedule_hours: settings.schedule_hours || 0 },
+      power: power || null, gps: gcfg || null, settings_cache: cache || null, nicknames: nicks || {} },
+  };
+}
+export function validateBackup(bk) {
+  if (!bk || typeof bk !== "object" || bk.format !== BACKUP_FORMAT) throw new Error("That isn't a T-SIM repeater backup file.");
+  if (bk.version !== BACKUP_VERSION) throw new Error(`Backup version ${bk.version} isn't supported (expected ${BACKUP_VERSION}).`);
+  return bk;
+}
+const RESTORE_CMD_MAX = 160;
+// Plan a restore: what differs between the backup and what the dashboard currently knows. cur = {vals, lists, src, tsrc, settings, nicks}.
+export function restorePlan(bk, cur) {
+  validateBackup(bk);
+  const R = bk.repeater || {}, vals = cur.vals || {}, L = cur.lists || {}, skipped = [], plan = { dashboard: [], settings: [], regions: [], acl: [], identity: null, skipped };
+  const D = bk.dashboard || {};
+  if (D.update_source) for (const k of SRC_FIELDS) if (D.update_source[k] !== undefined && D.update_source[k] !== cur.src[k]) plan.dashboard.push({ field: "update_source." + k, label: "Update source: " + k, current: cur.src[k] ?? "", backup: D.update_source[k] });
+  if (D.tsim_source) for (const k of ["mode", "repo", "asset", "url", "checksum"]) if (D.tsim_source[k] !== undefined && D.tsim_source[k] !== cur.tsrc[k]) plan.dashboard.push({ field: "tsim_source." + k, label: "T-SIM firmware source: " + k, current: cur.tsrc[k] ?? "", backup: D.tsim_source[k] });
+  if (D.settings) for (const k of ["console_enabled", "schedule_hours"]) if (D.settings[k] !== undefined && D.settings[k] !== cur.settings[k]) plan.dashboard.push({ field: "settings." + k, label: k === "console_enabled" ? "Allow console commands" : "Scheduled check (hours)", current: cur.settings[k], backup: D.settings[k] });
+  if (D.nicknames && JSON.stringify(D.nicknames) !== JSON.stringify(cur.nicks || {})) plan.dashboard.push({ field: "nicknames", label: "Neighbor nicknames", current: Object.keys(cur.nicks || {}).length + " saved", backup: Object.keys(D.nicknames).length + " saved" });
+  let ps = null;
+  for (const [k, v] of Object.entries(R.settings || {})) {
+    const s = RPT_INDEX[k]; if (!s || s.ro || s.wo) continue;
+    const val = String(v && typeof v === "object" ? v.value : v), now = vals[k] && vals[k].value != null ? String(vals[k].value) : null;
+    if (now === val) continue;
+    let cmd; try { cmd = buildSettingCmd(k, val); } catch (e) { skipped.push({ what: s.label, why: e.message }); continue; }
+    if (cmd.length > CMD_MAX_LEN) { skipped.push({ what: s.label, why: "value too long" }); continue; }
+    const row = { key: k, label: s.label, current: s.type === "secret" && now ? "••••" : now, backup: s.type === "secret" ? "••••" : val, cmd, val, risk: !!s.risk };
+    if (k === "powersaving") ps = row; else plan.settings.push(row);
+  }
+  if (ps) plan.settings.push(ps);  // power saving last, so the rest still runs
+  const bR = R.lists && R.lists.regions ? rgParse(R.lists.regions.raw) : (R.regions || []), cR = rgParse(L.regions && !L.regions.error ? L.regions.raw : ""), cMap = Object.fromEntries(cR.map((r) => [r.name, r]));
+  const RG = /^(\*|[#A-Za-z0-9_.\-]{1,30})$/;
+  for (const r of bR) {
+    if (!RG.test(r.name)) { skipped.push({ what: "Region " + r.name, why: "invalid name" }); continue; }
+    const c = cMap[r.name];
+    if (!c && r.name !== "*") plan.regions.push({ cmd: `region put ${r.name}${r.parent && r.parent !== "*" ? " " + r.parent : ""}`, desc: `Add region ${r.name}${r.parent && r.parent !== "*" ? " under " + r.parent : ""}` });
+    if (!c || c.flood !== r.flood) plan.regions.push({ cmd: `region ${r.flood ? "allowf" : "denyf"} ${r.name}`, desc: `${r.flood ? "Allow" : "Block"} flooding in ${r.name}`, risk: r.name === "*" });
+  }
+  const bHome = R.lists && R.lists.home ? cleanHome(R.lists.home.raw) : R.home, cHome = L.home && !L.home.error ? cleanHome(L.home.raw) : null;
+  if (bHome && RG.test(bHome) && bHome !== cHome) plan.regions.push({ cmd: `region home ${bHome}`, desc: `Home region ${bHome}` });
+  const bDef = R.lists && R.lists.default ? cleanDefault(R.lists.default.raw) : R.default_scope, cDef = L.default && !L.default.error ? cleanDefault(L.default.raw) : null;
+  if (bDef != null && (bDef === "" || RG.test(bDef)) && bDef !== cDef && (R.lists && R.lists.default || R.default_scope != null)) plan.regions.push({ cmd: `region default ${bDef || "<null>"}`, desc: `Default scope ${bDef || "none"}` });
+  if (plan.regions.length) { plan.regions.push({ cmd: "region save", desc: "Save regions" }); for (const [cmd, list] of [["region", "regions"], ["region home", "home"], ["region default", "default"]]) plan.regions.push({ cmd, list, desc: "Read back " + list }); }
+  const bA = R.lists && R.lists.acl ? aclParse(R.lists.acl.raw) : (R.acl || []), cA = Object.fromEntries(aclParse(L.acl && !L.acl.error ? L.acl.raw : "").map((a) => [a.pk, a.perm]));
+  for (const a of bA) {
+    if (!/^[0-9A-F]{16,64}$/.test(a.pk) || ![1, 2, 3].includes(a.perm)) continue;
+    if (cA[a.pk] !== a.perm) plan.acl.push({ cmd: `setperm ${a.pk} ${a.perm}`, desc: `${a.pk.slice(0, 8)}… → ${["none", "guest", "read/write", "admin"][a.perm]}`, risk: a.perm === 3 });
+  }
+  if (plan.acl.length) plan.acl.push({ cmd: "get acl", list: "acl", desc: "Read back the access list" });
+  const I = bk.identity || {}, pk = String(I.private_key || "").trim().toLowerCase();
+  if (pk) {
+    if (!/^[0-9a-f]{64}([0-9a-f]{64})?$/.test(pk)) skipped.push({ what: "Private key", why: "not 64 or 128 hex characters" });
+    else plan.identity = { public_key: I.public_key || null, current_public_key: (vals["public.key"] && vals["public.key"].value) || null,
+      same: !!(I.public_key && vals["public.key"] && String(vals["public.key"].value).toUpperCase() === String(I.public_key).toUpperCase()),
+      cmds: [{ cmd: `set prv.key ${pk}`, prv: true, risk: true, desc: "Restore the private key (identity)" }, { cmd: "reboot", desc: "Reboot the repeater so the identity takes effect" }] };
+  }
+  return plan;
+}
+// Public view of a plan (no private key, no command text for secrets).
+export const planView = (p) => ({ dashboard: p.dashboard, settings: p.settings.map(({ val, ...r }) => ({ ...r, cmd: RPT_INDEX[r.key] && RPT_INDEX[r.key].type === "secret" ? r.cmd.replace(/\S+$/, "••••") : r.cmd })),
+  regions: p.regions, acl: p.acl, identity: p.identity ? { public_key: p.identity.public_key, current_public_key: p.identity.current_public_key, same: p.identity.same, commands: ["set prv.key ••••••", "reboot"] } : null, skipped: p.skipped });
+// Order repeater commands for the relay: settings (power saving last but before the reboot), regions, ACL, identity, reboot.
+export function restoreCommands(plan, groups) {
+  const out = [], set = groups.settings ? plan.settings : [], ps = set.filter((r) => r.key === "powersaving"), rest = set.filter((r) => r.key !== "powersaving");
+  for (const r of rest) out.push({ cmd: r.cmd, val: r.val, risk: r.risk });
+  if (groups.regions) for (const r of plan.regions) out.push({ cmd: r.cmd, op: true, ...(r.list ? { list: r.list } : {}), risk: !!r.risk });
+  if (groups.acl) for (const r of plan.acl) out.push({ cmd: r.cmd, op: true, ...(r.list ? { list: r.list } : {}), risk: !!r.risk });
+  const id = groups.identity && plan.identity ? plan.identity.cmds : [];
+  if (id.length) out.push({ cmd: id[0].cmd, op: true, prv: true, risk: true });
+  for (const r of ps) out.push({ cmd: r.cmd, val: r.val, risk: r.risk });
+  if (id.length) out.push({ cmd: "reboot", op: true });
+  return out.filter((c) => c.cmd.length <= RESTORE_CMD_MAX);
+}
+// Next relay part: at most one wake's worth (per-wake command count and the 6000-byte fetch limit) and the queue room.
+export function nextRestorePart(cmds, room, perWake) {
+  const take = []; let bytes = 0;
+  for (const c of cmds) { if (take.length >= Math.min(room, perWake)) break; const n = `xxxxxxxx\t${c.cmd}\n`.length; if (bytes + n > CMD_FETCH_BYTES) break; bytes += n; take.push(c); }
+  return take;
+}
+export const restorePartsLeft = (cmds, perWake) => { let n = 0, rest = cmds.slice(); while (rest.length) { const p = nextRestorePart(rest, CFG_MAX_QUEUE, perWake); if (!p.length) break; rest = rest.slice(p.length); n++; } return n; };
+const backupIndex = async (env, id) => (await kvJson(env, `backups:${id}`)) || [];
+const backupFileName = (id, bk) => `${id}-repeater-backup-${bk.created_at.slice(0, 19).replace(/[:T]/g, "-")}${bk.identity && bk.identity.private_key ? "-PRIVATE-KEY" : ""}.json`;
+async function applyDashboardRestore(env, id, bk, cur) {
+  const D = bk.dashboard || {}, done = [];
+  if (D.update_source) { const src = validateSource({ ...cur.src, ...Object.fromEntries(SRC_FIELDS.filter((k) => D.update_source[k] !== undefined).map((k) => [k, D.update_source[k]])), upload: "" }); delete src.upload; await putJson(env, `source:${id}`, src); await env.STATE.delete(`release:${id}`); done.push("update source"); }
+  if (D.tsim_source) { const t = validateTsimSource({ ...cur.tsrc, ...D.tsim_source }); await putJson(env, `tsimsrc:${id}`, t); await env.STATE.delete(`tsimrel:${id}`); done.push("T-SIM firmware source"); }
+  if (D.settings) {
+    const s = { ...cur.settings };
+    if (typeof D.settings.console_enabled === "boolean") s.console_enabled = D.settings.console_enabled;
+    if (SCHEDULE_CHOICES.includes(Number(D.settings.schedule_hours)) && Number(D.settings.schedule_hours) !== s.schedule_hours) { s.schedule_hours = Number(D.settings.schedule_hours); const st = (await kvJson(env, `state:${id}`)) || {}; st.last_sched_ts = Date.now(); await putJson(env, `state:${id}`, st); }
+    await putJson(env, `settings:${id}`, s); done.push("console / schedule");
+  }
+  if (D.nicknames && typeof D.nicknames === "object") { let n = {}; for (const [h, v] of Object.entries(D.nicknames).slice(0, 200)) { try { n = setNick(n, h, v); } catch {} } await putJson(env, `nicks:${id}`, n); done.push("nicknames"); }
+  return done;
+}
+async function backupApi(request, env, dev, action) {
+  const id = dev.id;
+  if (action === "backup-get" && request.method === "GET") {
+    const bid = new URL(request.url).searchParams.get("bid") || "";
+    if (!/^[0-9a-f]{8}$/.test(bid)) return json({ error: "bad id" }, 400);
+    const bk = await kvJson(env, `backup:${id}:${bid}`); if (!bk) return json({ error: "No such backup." }, 404);
+    return new Response(JSON.stringify(bk, null, 2), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Content-Disposition": `attachment; filename="${backupFileName(id, bk)}"` } });
+  }
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  if (!sameOrigin(request)) return json({ error: "bad origin" }, 403);
+  let b = {}; try { b = await request.json(); } catch {}
+  if (action === "backup-create") {
+    const bk = await buildBackup(env, id, dev, b.include_key === true);
+    const bid = randomHex(4), txt = JSON.stringify(bk);
+    await env.STATE.put(`backup:${id}:${bid}`, txt);
+    let idx = await backupIndex(env, id);
+    idx.unshift({ bid, created_at: bk.created_at, private_key: !!bk.identity.private_key, passwords: bk.sensitive.passwords.length > 0, settings: Object.keys(bk.repeater.settings).length, bytes: txt.length, file: backupFileName(id, bk) });
+    for (const old of idx.slice(BACKUPS_PER_DEVICE)) await env.STATE.delete(`backup:${id}:${old.bid}`);
+    idx = idx.slice(0, BACKUPS_PER_DEVICE); await putJson(env, `backups:${id}`, idx);
+    await logActivity(env, id, { type: "action", msg: `Backup created (${Object.keys(bk.repeater.settings).length} settings${bk.identity.private_key ? ", WITH private key" : ""})` });
+    return json({ created: true, item: idx[0], backup: bk });
+  }
+  if (action === "backup-delete") {
+    const idx = await backupIndex(env, id), it = idx.find((x) => x.bid === b.bid);
+    if (!it) return json({ error: "No such backup." }, 404);
+    await env.STATE.delete(`backup:${id}:${it.bid}`); await putJson(env, `backups:${id}`, idx.filter((x) => x !== it));
+    return json({ deleted: true });
+  }
+  if (action === "prvkey-forget") { await env.STATE.delete(`prvkey:${id}`); await logActivity(env, id, { type: "action", msg: "Stored private key (for backups) deleted from the dashboard" }); return json({ deleted: true }); }
+  const cur = async () => { const [vals, lists, src, tsrc, settings, nicks] = await Promise.all([kvJson(env, `rptcfg:${id}`), kvJson(env, `rptlist:${id}`), getSource(env, id), getTsimSource(env, id), getSettings(env, id), kvJson(env, `nicks:${id}`)]); return { vals: vals || {}, lists: lists || {}, src, tsrc, settings, nicks: nicks || {} }; };
+  if (action === "backup-preview" || action === "restore-prepare") {
+    if (JSON.stringify(b.backup || null).length > BACKUP_MAX_BYTES) return json({ error: "Backup file too large." }, 413);
+    const c = await cur();
+    let plan; try { plan = restorePlan(b.backup, c); } catch (e) { return json({ error: e.message }, 400); }
+    const lat = (await kvJson(env, `telem:${id}:latest`)) || {}, per = cmdsPerWake(lat.fw);
+    if (action === "backup-preview") return json({ plan: planView(plan), device: b.backup.device || null, created_at: b.backup.created_at || null, per_wake: per });
+    const g = b.groups || {}, groups = { dashboard: g.dashboard === true, settings: g.settings === true, regions: g.regions === true, acl: g.acl === true, identity: g.identity === true };
+    const cmds = restoreCommands(plan, groups);
+    if (!groups.dashboard && !cmds.length) return json({ error: "Nothing selected to restore (or nothing differs)." }, 400);
+    if (cmds.some((x) => x.risk) && b.risk_ok !== true) return json({ error: "This restore includes risky changes and needs confirmation.", risky: true }, 409);
+    if (groups.identity && plan.identity && String(b.typed || "").trim().toUpperCase() !== "IDENTITY") return json({ error: "Type IDENTITY to confirm restoring the private key.", typed: "IDENTITY" }, 409);
+    let done = [];
+    if (groups.dashboard && plan.dashboard.length) { try { done = await applyDashboardRestore(env, id, b.backup, c); } catch (e) { return json({ error: "Dashboard config: " + e.message }, 400); } await logActivity(env, id, { type: "action", msg: `Restore: dashboard config applied (${done.join(", ") || "nothing"})` }); }
+    let job = null;
+    if (cmds.length) {
+      job = { at: new Date().toISOString(), total: cmds.length, sent: 0, parts_sent: 0, groups: Object.keys(groups).filter((k) => groups[k] && k !== "dashboard"), cmds };
+      await putJson(env, `restore:${id}`, job);
+      await logActivity(env, id, { type: "action", msg: `Restore staged: ${cmds.length} repeater command(s) (${job.groups.join(", ")}); nothing sent until Send is pressed` });
+    }
+    return json({ applied: done, job: job ? restoreView(job, per) : null });
+  }
+  if (action === "restore-cancel") {
+    await env.STATE.delete(`restore:${id}`);
+    const list = (await kvJson(env, `cmds:${id}`)) || []; let n = 0;
+    for (const x of list) if (x.restore && x.status === "queued") { x.status = "cancelled"; x.cmd = redactCmd(x.cmd); n++; }
+    if (n) await putJson(env, `cmds:${id}`, list);
+    return json({ cancelled: true, dequeued: n });
+  }
+  const settings = await getSettings(env, id);
+  if (!settings.console_enabled) return json({ error: "The repeater console is off. Turn on \"Allow console commands\" in Repeater console first; this uses it." }, 403);
+  if (psBlocks(await kvJson(env, `state:${id}`))) return json({ error: PS_NOTE + ". Turn power saving off first.", powersaving: true }, 409);
+  const list = (await kvJson(env, `cmds:${id}`)) || [], lat = (await kvJson(env, `telem:${id}:latest`)) || {}, per = cmdsPerWake(lat.fw), now = new Date().toISOString();
+  if (action === "prvkey-read") {
+    if (b.confirm !== true) return json({ error: "confirm required" }, 400);
+    if (list.some((x) => x.prv && isPrvGet(x.cmd) && (x.status === "queued" || x.status === "sent"))) return json({ error: "A private-key read is already waiting for the T-SIM." }, 409);
+    list.unshift({ id: randomHex(4), cmd: "get prv.key", status: "queued", queued_at: now, cfg: true, op: true, prv: true });
+    await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await logActivity(env, id, { type: "action", msg: "Reading the repeater private key for backup (serial console)" });
+    const [o, c] = await manualSend(env, dev, "CMD", "CMD (read private key for backup)");
+    return json({ queued: true, wake: { ...o, status: c } });
+  }
+  if (action === "restore-send") {
+    const job = await kvJson(env, `restore:${id}`);
+    if (!job || !job.cmds.length) return json({ error: "No restore is staged." }, 404);
+    const room = CFG_MAX_QUEUE - list.filter((x) => x.status === "queued").length;
+    const part = nextRestorePart(job.cmds, room, per);
+    if (!part.length) return json({ error: `The command queue is full (max ${CFG_MAX_QUEUE}). Wait for the current commands to run, or cancel them in Repeater console.` }, 429);
+    for (const a of part) list.unshift({ id: randomHex(4), cmd: a.cmd, status: "queued", queued_at: now, cfg: true, restore: true, ...(a.op ? { op: true } : {}), ...(a.list ? { list: a.list } : {}), ...(a.val !== undefined ? { val: a.val } : {}), ...(a.prv ? { prv: true } : {}) });
+    await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    job.cmds = job.cmds.slice(part.length); job.sent += part.length; job.parts_sent++;
+    if (job.cmds.length) await putJson(env, `restore:${id}`, job); else await env.STATE.delete(`restore:${id}`);
+    const label = `CMD (restore part ${job.parts_sent}${job.cmds.length ? " of " + (job.parts_sent + restorePartsLeft(job.cmds, per)) : ", last"})`;
+    await logActivity(env, id, { type: "action", msg: `Restore: queued ${part.length} command(s): ${part.map((a) => redactCmd(a.cmd).replace(/(guest\.password|bridge\.secret) .*/, "$1 ••••")).join("; ").slice(0, 200)}` });
+    const [o, c] = await manualSend(env, dev, "CMD", label);
+    return json({ queued: part.length, remaining: job.cmds.length, job: job.cmds.length ? restoreView(job, per) : null, wake: { ...o, status: c } });
+  }
+  return json({ error: "not found" }, 404);
+}
+export const restoreView = (job, per) => job ? { at: job.at, total: job.total, sent: job.sent, remaining: job.cmds.length, parts_sent: job.parts_sent, parts_left: restorePartsLeft(job.cmds, per), next: nextRestorePart(job.cmds, CFG_MAX_QUEUE, per).length, groups: job.groups } : null;
+export const BACKUP_ACTIONS = ["backup-get", "backup-create", "backup-delete", "backup-preview", "restore-prepare", "restore-send", "restore-cancel", "prvkey-read", "prvkey-forget"];
+
 // ---------- device API ----------
 async function deviceApi(request, env, dev, action) {
   const id = dev.id;
@@ -1245,29 +1587,46 @@ async function deviceApi(request, env, dev, action) {
     const [gps, gcfg, greq, lreq, nicks, adcSt] = await Promise.all([kvJson(env, `gps:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `locreq:${id}`), kvJson(env, `nicks:${id}`), kvJson(env, `adc:${id}`)]);
     const rptq = {}; for (const c of cmds || []) if (c.cfg && !c.op && (c.status === "queued" || c.status === "sent")) { const ps = parseSettingReply(c.cmd, "x"); if (ps && !rptq[ps.key]) rptq[ps.key] = c.status; }
     const rptVals = (await kvJson(env, `rptcfg:${id}`)) || {}, rptLists = (await kvJson(env, `rptlist:${id}`)) || {};
-    const rptOpsL = (cmds || []).filter((c) => c.op && (c.status === "queued" || c.status === "sent")), rptOpsQ = rptOpsL.length;
+    const rptOpsL = (cmds || []).filter((c) => c.op && !c.restore && !c.prv && (c.status === "queued" || c.status === "sent")), rptOpsQ = rptOpsL.length;
+    const [fwl, bkIdx, prvK, rjob] = await Promise.all([fwList(env, id), backupIndex(env, id), kvJson(env, `prvkey:${id}`), kvJson(env, `restore:${id}`)]);
+    const perW = cmdsPerWake(latest && latest.fw);
+    const fwup = { items: fwl, selected: source.upload || "", target_merged: targetMerged(source, rel, fwl), slot: FW_APP_SLOT, max: FW_UPLOAD_MAX, per_device: FW_UPLOADS_PER_DEVICE };
+    const rq = (cmds || []).filter((c) => c.restore && (c.status === "queued" || c.status === "sent")).length;
+    const backup = { items: bkIdx, per_device: BACKUPS_PER_DEVICE, prvkey: prvK ? { at: prvK.at, hint: prvK.key.slice(0, 4) + "…" + prvK.key.slice(-4) } : null,
+      prv_pending: (cmds || []).some((c) => c.prv && isPrvGet(c.cmd) && (c.status === "queued" || c.status === "sent")), restore: restoreView(rjob, perW), restore_inflight: rq,
+      settings_known: Object.keys(rptVals).filter((k) => RPT_INDEX[k] && rptVals[k] && rptVals[k].value != null).length };
     const adcq = (cmds || []).filter((c) => /^(get|set) adc\.multiplier\b/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gq = (cmds || []).find((c) => /^gpscfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const gpsInfo = { fix: (gps && gps.fix) || null, attempt: (gps && gps.attempt) || null, settings: { ...DEFAULT_GPS, ...(gcfg || {}) }, settings_pending: gq ? gq.status : null,
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
-    return json({ cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => c.cmd), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, ondemand: s.serial_ondemand === true, blocks: psBlocks(s), unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
       progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS,
-      update_status: statuses(latest, mesh, s, history, rel, tsimRel) });
+      update_status: statuses(latest, mesh, s, history, rel, tsimRel), fwup, backup });
   }
   if (action === "source" && request.method === "GET") return json(await getSource(env, id));
+  if (BACKUP_ACTIONS.includes(action)) return backupApi(request, env, dev, action);
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
   if (!sameOrigin(request)) return json({ error: "bad origin" }, 403);
+  if (action === "fw-upload") return handleFwUpload(request, env, dev);
+  if (action === "fw-delete") return handleFwDelete(request, env, dev);
   if (action === "source") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
-    let src; try { src = validateSource({ ...(await getSource(env, id)), ...b }); } catch (e) { return json({ error: e.message }, 400); }
+    const cur0 = await getSource(env, id); delete cur0.upload;
+    let src; try { src = validateSource({ ...cur0, ...b }); } catch (e) { return json({ error: e.message }, 400); }
+    let up = null;
+    if (src.upload) {
+      up = (await fwList(env, id)).find((x) => x.token === src.upload);
+      if (!up) return json({ error: "That uploaded file no longer exists." }, 404);
+      if (up.merged && b.merged_ack !== true) return json({ error: MERGED_WARN, merged: true }, 409);
+    }
     await putJson(env, `source:${id}`, src);
     await env.STATE.delete(`release:${id}`);
-    await logActivity(env, id, { type: "action", msg: `Update source changed: ${src.enabled ? src.repo + " " + (src.tag_prefix ? src.tag_prefix + "* " : "") + src.asset_pattern : "disabled"}${src.direct_url ? " (direct URL set)" : ""}` });
+    await logActivity(env, id, { type: "action", msg: up ? `Update source changed: uploaded file ${up.name}${up.merged ? " (FULL-ERASE merged image)" : ""}` : `Update source changed: ${src.enabled ? src.repo + " " + (src.tag_prefix ? src.tag_prefix + "* " : "") + src.asset_pattern : "disabled"}${src.direct_url ? " (direct URL set)" : ""}` });
     return json({ saved: true, source: src });
   }
   if (action === "check") {
@@ -1571,14 +1930,20 @@ async function deviceApi(request, env, dev, action) {
     const retry = await bodyRetry(request);
     const d = await dupeCheck(env, id, "heltec", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409);
     const prevSent = ((await kvJson(env, `state:${id}`)) || {}).last_update_sent;
-    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag };
+    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via };
     else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
-    const risk = await heltecImageRisk(rel.url, ((await kvJson(env, `telem:${id}:latest`)) || {}).fw);
+    const merged = rel.merged === true || MERGED_NAME_RE.test(rel.asset_name || "");
+    if (merged) {
+      let ub = {}; try { ub = await request.clone().json(); } catch {}
+      if (ub.erase_ok !== true || String(ub.typed || "").trim().toUpperCase() !== "ERASE") return json({ sent: false, merged: true, needs_erase_confirm: true, error: MERGED_WARN }, 409);
+    }
+    const tfw = ((await kvJson(env, `telem:${id}:latest`)) || {}).fw;
+    const risk = rel.via === "upload" ? uploadImageRisk(rel, tfw) : await heltecImageRisk(rel.url, tfw);
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     if (!(retry && prevSent && prevSent.url)) await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
-    const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${retry ? "retry " : ""}${rel.asset_name}`, async (st) => {
-      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, retry };
+    const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
+      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
     });
     return json({ ...o, release: rel }, c);
   }
@@ -1609,17 +1974,40 @@ async function fleetApi(env, acc) {
 export function verOf(x) { const m = String(x || "").match(/v?(\d+)\.(\d+)(?:\.(\d+))?/); return m ? [+m[1], +m[2], +(m[3] || 0)] : null; }
 const vcmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; };
 const vstr = (v) => "v" + v.join(".");
+// Firmware identity, so different firmware families are never compared by raw numbers (EasySkyMesh "PowerSaving17.1.6" is
+// MeshCore 1.17.1 + their revision 6, not version 17). family + MeshCore base version + build commit when present.
+export const FW_FAMILY_NAMES = { easyskymesh: "EasySkyMesh PowerSaving", "meshcore-powersaving-serial": "MeshCore + power saving + serial", "meshcore-serial": "MeshCore + serial", "meshcore-powersaving": "MeshCore + power saving", meshcore: "stock MeshCore" };
+export function fwIdent(x) {
+  const s = String(x || ""); if (!s) return null;
+  const cm = s.match(/(?:^|[-_ ])((?=[0-9]*[a-f])[0-9a-f]{7,40})(?=$|[-_. (])/i), commit = cm ? cm[1].toLowerCase() : null;
+  const e = s.match(/powersaving[\s_.-]?(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (e) return { family: "easyskymesh", base: [1, +e[1], +e[2]], ver: [+e[1], +e[2], +(e[3] || 0)], commit };
+  const v = verOf(s); if (!v) return null;
+  const family = /-powersaving-serial\b/i.test(s) ? "meshcore-powersaving-serial" : /-serial\b/i.test(s) ? "meshcore-serial" : /-powersaving\b/i.test(s) ? "meshcore-powersaving" : "meshcore";
+  return { family, base: v, ver: v, commit };
+}
+const relIdent = (rel) => (rel ? fwIdent(rel.asset_name) || fwIdent(rel.tag) : null);
+const sameCommit = (a, b) => !a.commit || !b.commit || a.commit.startsWith(b.commit) || b.commit.startsWith(a.commit);
+// true when the installed firmware is the same family and at least the target version (and the same build when both carry a commit)
+export function fwReached(installed, target) {
+  const ii = fwIdent(installed), ti = target; if (!ii || !ti) return false;
+  if (ii.family !== ti.family) return false;
+  const c = vcmp(ii.ver, ti.ver); return c > 0 || (c === 0 && sameCommit(ii, ti));
+}
 // installed: version string reported by the device (or null); flashed: {tag, asset_name} last successfully installed (fallback)
 export function updateStatus(installed, rel, flashed = null) {
   if (!rel || rel.skipped) return { state: "unchecked", text: "Not checked yet", checked_at: null };
-  const at = rel.checked_at || null, lv = verOf(rel.asset_name) || verOf(rel.tag);  // asset names are usually more specific (tag PowerSaving17.1 vs asset ...17.1.6)
-  const latest = lv ? vstr(lv) : rel.asset_name;
-  const iv = verOf(installed) || (flashed && (verOf(flashed.tag) || verOf(flashed.asset_name)));
-  if (lv && iv) {
-    const c = vcmp(lv, iv);
-    return c > 0 ? { state: "available", text: `New update available: ${latest} (installed ${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at,
-        notes: rel.notes || "", release_url: rel.html_url || null, tag: rel.tag || null }
-      : { state: "current", text: `Up to date (${vstr(iv)})`, latest, installed: vstr(iv), checked_at: at };
+  const at = rel.checked_at || null, li = relIdent(rel);  // asset names are usually more specific (tag PowerSaving17.1 vs asset ...17.1.6)
+  const latest = li ? vstr(li.ver) : rel.asset_name;
+  const ii = fwIdent(installed) || (flashed ? fwIdent(flashed.tag) || fwIdent(flashed.asset_name) : null);
+  if (li && ii) {
+    const avail = (text, reason) => ({ state: "available", text, reason, latest, installed: vstr(ii.ver), checked_at: at, notes: rel.notes || "", release_url: rel.html_url || null, tag: rel.tag || null });
+    if (li.family !== ii.family)
+      return { ...avail(`Update available (different firmware source): ${latest} ${FW_FAMILY_NAMES[li.family]}; the repeater runs ${FW_FAMILY_NAMES[ii.family]} ${vstr(ii.ver)}`, "Different firmware source"), family: li.family, installed_family: ii.family };
+    const c = vcmp(li.ver, ii.ver);
+    if (c > 0) return avail(`New update available: ${latest} (installed ${vstr(ii.ver)})`, "Newer version");
+    if (c === 0 && !sameCommit(li, ii)) return avail(`Update available: ${latest} build ${li.commit} (the repeater runs build ${ii.commit})`, "Different build");
+    return { state: "current", text: `Up to date (${vstr(ii.ver)})`, latest, installed: vstr(ii.ver), checked_at: at };
   }
   if (flashed && flashed.asset_name && flashed.asset_name === rel.asset_name && (!flashed.tag || flashed.tag === rel.tag))
     return { state: "current", text: `Up to date (${flashed.asset_name})`, latest, installed: flashed.asset_name, checked_at: at };
@@ -1638,9 +2026,9 @@ export function radioStatus(mesh, s, rel, flashedFallback = null) {
     return { ...base, state: "flashed", text: `Last flashed: ${lf.file} (awaiting repeater confirmation)`, flashed: lf };
   }
   if (lf && meshNew) {
-    const fv = verOf(lf.file), rv = verOf(mesh.heltec_fw);
+    const fi = fwIdent(lf.file), ri = fwIdent(mesh.heltec_fw), fv = fi && fi.ver, rv = ri && ri.ver;
     const u = updateStatus(mesh.heltec_fw, rel, null);
-    if (fv && rv && vcmp(fv, rv) !== 0)
+    if (fi && ri && (fi.family !== ri.family || vcmp(fv, rv) !== 0))
       return { ...u, state: "mismatch", text: `Version mismatch: flashed ${lf.file} but the repeater reports ${vstr(rv)}`, flashed: lf, confirmed: false };
     if (u.state === "current") return { ...u, text: `Up to date (${rv ? vstr(rv) : mesh.heltec_fw}, confirmed)`, confirmed: true, flashed: lf };
     if (u.state === "unchecked" && rv) return { ...u, state: "current", text: `Running ${vstr(rv)} (confirmed)`, confirmed: true, flashed: lf };
@@ -1660,7 +2048,7 @@ export async function refreshReleases(env, now = Date.now()) {
   for (const id of await listDeviceIds(env)) {
     try {
       const src = await getSource(env, id), cur = await kvJson(env, `release:${id}`);
-      if (src.enabled && !(cur && cur.checked_at && cur.notes !== undefined && now - Date.parse(cur.checked_at) < REFRESH_MS)) {
+      if (src.enabled && !src.upload && !(cur && cur.checked_at && cur.notes !== undefined && now - Date.parse(cur.checked_at) < REFRESH_MS)) {
         const rel = await get(src);
         if (!rel.skipped) { await putJson(env, `release:${id}`, { ...rel, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":radio"); }
       }
@@ -1731,6 +2119,7 @@ details.card>summary::after{content:"▸";color:var(--mut)}details[open].card>su
 .term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:10px 12px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}.term .pr{color:#3fb950}.term .ts{color:#8b949e;font-size:11px}.term .to{color:#e6edf3;margin:0 0 6px 14px}.term .te{color:#ff7b72;margin:0 0 6px 14px}
 .term-in{background:#0d1117;border-radius:8px;padding:4px 8px;align-items:center}.term-in .pr{color:#3fb950;font-family:ui-monospace,monospace}.term-in input{background:transparent;color:#e6edf3;border:0;flex:1}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .rscat{margin-top:10px}.rssec{margin:0}.rsr{padding:1px 8px;font-size:11px;margin-left:6px;vertical-align:middle}.nowrap{white-space:nowrap}.rscat.risky{border-left:3px solid var(--warn)}.rsrow{padding:6px 0;border-top:1px solid var(--line)}.rsrow.dirty{background:#1f6feb14;box-shadow:inset 3px 0 var(--acc)}.rsl{font-weight:600;font-size:14px}.rsi select,.rsi input{max-width:100%}.rsnum{display:flex;gap:6px;align-items:center}.rsradio{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:6px}.rsro{word-break:break-all}.warn{color:var(--warn)}.warnb{background:#b547081f;color:var(--warn)}
+.danger{background:#d1242f1f;border:2px solid var(--bad);padding:10px 12px;border-radius:8px;margin:10px 0}.danger b.h{color:var(--bad)}.danger input:not([type]){display:block;margin-top:4px}
 .psnote{background:#d1242f1a;border-left:3px solid var(--bad);padding:8px 10px;border-radius:6px;font-size:13px}.dim{opacity:.45}
 .tog{display:flex;gap:8px;align-items:center;margin:8px 0;color:var(--fg);font-size:15px}.tog input{width:auto;margin:0}
 pre.o{margin:0;max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px}code{font-size:12px}
@@ -1849,7 +2238,16 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <button data-a="reboot" class="g" data-c="Restart the LoRa radio (repeater)?">Reboot radio</button>
 <button data-a="check" data-c="" class="g">Check for updates</button>
 </div>
-<section><h2>Firmware</h2><div class="card"><div id="c-upd"></div><div id="p-heltec"></div></div></section>
+<section><h2>Firmware</h2><div id="mwarn" class="danger" hidden><b class="h">⚠ Full-erase (merged / fresh-install) firmware selected</b>
+<p class="small">Flashing it <b>erases the Heltec completely</b>: its identity (private key, so the mesh sees a brand-new repeater), node name, all settings and passwords, the access list (ACL) and regions. Only use it for a fresh install or to recover a broken radio.</p>
+<p class="small"><b>Take a backup first:</b> <a href="#" data-bk="1">Create &amp; download a backup now ›</a> (read the private key in Backup &amp; restore first if you want to keep the identity).</p>
+<label class="tog"><input type="checkbox" id="mwack"> I understand this erases the identity, name, settings, ACL and regions</label>
+<label>Type ERASE to allow the update<input id="mwtyped" autocomplete="off" autocapitalize="characters" spellcheck="false"></label></div><div class="card"><div id="c-upd"></div><div id="p-heltec"></div></div>
+<details class="card" id="upbox"><summary><b>Upload firmware file</b> <small id="upsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Pick a Heltec V3 <code>.bin</code> on this computer or phone and upload it. The T-SIM downloads it over LTE when you press <b>Update radio firmware</b>; nothing is sent before that. Use the app-only file (keeps identity and settings). Merged / fresh-install files are accepted with extra warnings. Limits: 3 files, app code up to 3.19 MB (the Heltec app partition).</p>
+<input type="file" id="upfile" accept=".bin,application/octet-stream"><div id="upcheck" class="small"></div>
+<div class="acts"><button type="button" id="upbtn">Upload</button><span id="upmsg" class="msg"></span></div>
+<div class="bar" id="upbar" hidden><i style="width:0%"></i></div><div id="uplist"></div></div></details></section>
 <section><h2>Mesh <small class="mut small" id="meshat"></small></h2>
 <p class="psnote" id="meshps" hidden>Mesh polling is paused: the repeater is in power saving and its serial CLI isn't answering. Showing the last snapshot taken while it was awake. It resumes automatically when a status check gets a CLI reply. ${PS_HTML}</p>
 <div class="grid" id="meshgrid">
@@ -1899,6 +2297,15 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small mut">Battery multiplier: use <a href="#" onclick="document.getElementById('adcbox').open=true;document.getElementById('adcbox').scrollIntoView();return false">Repeater battery calibration</a>. Console-only on purpose: factory reset (erase), private key, OTA and power off.</p>
 </div></section>
 <section><h2>Settings</h2>
+<details class="card" id="bkbox"><summary><b>Repeater backup &amp; restore</b> <small id="bksum" class="mut"></small></summary><div class="in">
+<p class="small mut">A backup is a JSON file with the repeater settings this dashboard has read (Read all, or the T-SIM settings cache), regions, the access list, and this dashboard's per-device config (update source, schedule, power / GPS settings, nicknames). It never contains the dashboard passwords, the Hologram key or other Worker secrets. The last 5 backups are also kept here.</p>
+<p class="small" id="bkknown"></p><div id="bkkey" class="small"></div>
+<div class="acts"><button type="button" class="g sm" id="prvread">Read private key for backup</button><button type="button" class="g sm" id="prvforget" hidden>Forget stored key</button></div>
+<label class="tog"><input type="checkbox" id="bkinc"> Include the private key (the file becomes SENSITIVE)</label>
+<div class="acts"><button type="button" id="bkmake">Create backup &amp; download</button><span id="bkmsg" class="msg"></span></div>
+<div id="bklist"></div>
+<h3>Restore</h3><p class="small mut">Pick a backup file to compare it with the current values, then choose what to restore.</p>
+<input type="file" id="bkfile" accept=".json,application/json"><div id="bkprev"></div><div id="bkjob"></div></div></details>
 <details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
 <label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
 <p class="small mut" id="presetnote"></p>
@@ -2026,7 +2433,7 @@ var DS={};
 async function load(){unitsBtn();
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.power)showPower(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  $("seen").textContent=seen?(stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale?" stale":"");
  $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last report",t(L.received_at)],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
@@ -2076,10 +2483,10 @@ $("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const j=await rj(r);say("tsimmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
 let srcLoaded=false;
 function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+(s.tag_prefix?s.tag_prefix+"* · ":"")+s.asset_pattern:(s.direct_url?"direct link":"not set");
- const off=!s.enabled&&!s.direct_url;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
+ const off=!s.enabled&&!s.direct_url&&!s.upload;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
  if(!srcLoaded){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.tag_prefix.value=s.tag_prefix||"";f.direct_url.value=s.direct_url||"";srcLoaded=true;}}
 $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
- const r=await post("source",{enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,tag_prefix:f.tag_prefix.value,direct_url:f.direct_url.value});
+ const r=await post("source",{upload:"",enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,tag_prefix:f.tag_prefix.value,direct_url:f.direct_url.value});
  const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
 function bpct(v){v=+v;if(!isFinite(v)||!v)return"";return "≈"+(v>=4.15?100:v<=3.3?0:Math.round((v-3.3)*100/0.85))+"%"}
 let pwrLoaded=false,PWR={};
@@ -2282,26 +2689,124 @@ function setUpd(a,kind,p,pend){const s=pend&&(!p||p.state==="idle"||p.state==="d
 async function updClick(b,a){const kind=UKIND[a],mode=b.dataset.mode||"update";
  if(mode==="cancel"){if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return null;
   const r=await post("update-cancel",{kind});const j=await rj(r);if(r.ok){delete pending[kind];toast(j.note,"ok")}else toast(friendly(j,r.status),"bad");return true}
- if(mode==="retry"){if(!confirm("Retry the same update? This sends one text to wake the T-SIM."))return null;
-  const r=await post(a,{retry:true});const j=await rj(r);if(j.sent){pending[kind]=new Date();toast("Retry sent. "+OKMSG[a],"ok")}else toast(friendly(j,r.status),"bad");return true}
+ if(mode==="retry"){let xb={retry:true};if(a==="update-latest"&&TGTM){const z=eraseBody();if(!z||!confirm(MCONF))return null;Object.assign(xb,z)}else if(!confirm("Retry the same update? This sends one text to wake the T-SIM."))return null;
+  const r=await post(a,xb);const j=await rj(r);if(j.sent){pending[kind]=new Date();toast("Retry sent. "+OKMSG[a],"ok")}else toast(friendly(j,r.status),"bad");return true}
  return false}
 document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
  const a=b.dataset.a;if(b.dataset.busy)return;
  if(UKIND[a]&&b.dataset.mode&&b.dataset.mode!=="update"){b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
   try{await updClick(b,a)}catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
   delete b.dataset.busy;b.textContent=old;b.disabled=false;load();return}
- if(b.dataset.c&&!confirm(b.dataset.c))return;b.dataset.busy=1;
+ let xb;if(a==="update-latest"&&TGTM){xb=eraseBody();if(!xb||!confirm(MCONF))return}else if(b.dataset.c&&!confirm(b.dataset.c))return;b.dataset.busy=1;
  b.disabled=true;const old=b.textContent;b.textContent="Working…";
  try{
   if(a==="check"){const[r1,r2]=await Promise.all([post("check"),post("tsim-check")]);const[j1,j2]=await Promise.all([rj(r1),rj(r2)]);
    const parts=[r1.ok?"Heltec: "+j1.latest_available.asset_name:"Heltec: "+friendly(j1,r1.status),r2.ok?"T-SIM: "+j2.latest_available.asset_name+(j2.latest_available.tag&&j2.latest_available.tag!=="url"?" ("+j2.latest_available.tag+")":""):"T-SIM: "+friendly(j2,r2.status)];
    toast("Latest available. "+parts.join(" · "),r1.ok&&r2.ok?"ok":"bad");}
-  else{const r=await post(a);const j=await rj(r);if(r.status===401){location.href="/";return}
+  else{const r=await post(a,xb);const j=await rj(r);if(r.status===401){location.href="/";return}
    if(j.sent){toast(OKMSG[a],"ok");if(a==="update-latest")pending.heltec=new Date();if(a==="tsim-update")pending.tsim=new Date();}
    else toast(friendly(j,r.status),"bad");}
  }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  delete b.dataset.busy;b.textContent=old;b.disabled=false;load();
 });
+/* ---- firmware upload ---- */
+let FWU={items:[],selected:"",max:4194304,per_device:3},TGTM=false;
+const kb=n=>n>=1048576?(n/1048576).toFixed(2)+" MB":Math.round(n/1024)+" KB";
+function fwKind(u8,name){const L=u8.length,g=o=>[u8[o],u8[o+1]],h=g(0),p=L>0x8002?g(0x8000):[0,0],a=L>0x10010?g(0x10000):[0,0],q=L>0x7002?g(0x7000):[0,0];
+ const app0=h[0]===0xE9&&h[1]>=1&&h[1]<=16,pt=p[0]===0xAA&&p[1]===0x50,gap=p[0]===0xFF&&p[1]===0xFF,app10=a[0]===0xE9&&a[1]>=1&&a[1]<=16,pt7=q[0]===0xAA&&q[1]===0x50,nm=/-merged|freshinstall|factory/i.test(name);
+ if(pt||(app10&&gap)||(pt7&&app0))return{ok:true,merged:true};if(app0)return{ok:true,merged:nm,nameOnly:nm};return{ok:false}}
+function showFwup(d){const F=d.fwup||{items:[]};FWU=F;TGTM=!!F.target_merged;
+ const sel=F.items.find(x=>x.token===F.selected);
+ if(sel){$("srcsum").textContent="Uploaded file: "+sel.name;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=false;b.title=""})}
+ $("upsum").textContent=F.items.length?F.items.length+" file(s)"+(sel?" · Update uses "+sel.name:""):"none";
+ $("mwarn").hidden=!TGTM;
+ const fl=((d.progress||{}).heltec||{}).flash;
+ $("uplist").innerHTML=F.items.length?F.items.map(x=>'<div class="rsrow"><div class="rsl">'+e(x.name)+(x.merged?' <span class="badge failed">FULL ERASE</span>':' <span class="badge">app-only</span>')+(x.token===F.selected?' <span class="badge run">used by Update</span>':'')+'</div>'+
+  '<div class="small mono rsro">'+e(kb(x.size))+' ('+x.size+' bytes) · '+e(x.chip)+'<br>sha256 '+e(x.sha256)+(x.md5?'<br>md5 '+e(x.md5):'')+'</div>'+
+  (x.warnings&&x.warnings.length?'<div class="small warn">'+x.warnings.map(e).join("<br>")+'</div>':'')+
+  (x.md5&&fl&&fl.md5&&x.token===F.selected&&fl.md5===x.md5?'<div class="small ok">✓ The last flash MD5 matches this file</div>':'')+
+  '<div class="small mut">Uploaded '+e(t(x.uploaded_at))+'</div><div class="acts" style="margin-top:4px">'+(x.token===F.selected?'<button type="button" class="g sm" data-fw="unuse">Use the GitHub release instead</button>':'<button type="button" class="sm" data-fw="use" data-tk="'+e(x.token)+'">Use for Update</button>')+'<button type="button" class="g sm" data-fw="del" data-tk="'+e(x.token)+'">Delete</button></div></div>').join(""):'<p class="small mut">No uploaded files.</p>';
+ $("upbtn").disabled=F.items.length>=(F.per_device||3);$("upbtn").title=$("upbtn").disabled?"Delete a file first":""}
+$("upfile").onchange=async()=>{const f=$("upfile").files[0];$("upcheck").innerHTML="";$("upmsg").textContent="";if(!f)return;
+ let k={ok:false};try{k=fwKind(new Uint8Array(await f.slice(0,0x10020).arrayBuffer()),f.name)}catch(x){}
+ let h='<b>'+e(f.name)+'</b> · '+e(kb(f.size));
+ if(!k.ok)h+='<div class="err">Not an ESP32 firmware image (no 0xE9 header). Pick the Heltec .bin file.</div>';
+ else if(k.merged)h+='<div class="danger"><b class="h">⚠ Full-erase (merged / fresh-install) image'+(k.nameOnly?' (by its file name)':'')+'</b><br>Flashing it erases the Heltec&#39;s identity (private key), name, settings, ACL and regions. You can upload it, but Update will need extra confirmation. <a href="#" data-bk="1">Back up first ›</a></div>';
+ else h+='<div class="ok">App-only image (keeps identity and settings).</div>';
+ if(f.size>(FWU.max||4194304))h+='<div class="err">Too large: the limit is '+e(kb(FWU.max||4194304))+'.</div>';
+ $("upcheck").innerHTML=h};
+$("upbtn").onclick=()=>{const f=$("upfile").files[0];if(!f){say("upmsg",false,"Pick a .bin file first");return}
+ if(f.size>(FWU.max||4194304)){say("upmsg",false,"That file is too large");return}
+ const x=new XMLHttpRequest(),bar=$("upbar");bar.hidden=false;bar.firstChild.style.width="0%";$("upbtn").disabled=true;say("upmsg",true,"Uploading…");
+ x.open("POST",API+"fw-upload");x.withCredentials=true;x.setRequestHeader("Content-Type","application/octet-stream");x.setRequestHeader("X-File-Name",encodeURIComponent(f.name));
+ x.upload.onprogress=ev=>{if(ev.lengthComputable)bar.firstChild.style.width=Math.round(ev.loaded*100/ev.total)+"%"};
+ x.onload=()=>{let j={};try{j=JSON.parse(x.responseText)}catch(z){}$("upbtn").disabled=false;bar.hidden=true;
+  if(x.status===401){location.href="/";return}
+  if(x.status<300&&j.item){const it=j.item;say("upmsg",true,(j.duplicate?j.note+" ":"Uploaded: ")+it.size+" bytes · sha256 "+it.sha256);$("upfile").value="";$("upcheck").innerHTML="";toast((j.duplicate?"Already uploaded: ":"Uploaded ")+it.name+" ("+it.size+" bytes). Press Use for Update to flash it.","ok");load()}
+  else say("upmsg",false,friendly(j,x.status))};
+ x.onerror=()=>{$("upbtn").disabled=false;bar.hidden=true;say("upmsg",false,"Upload failed. Check your connection and try again.")};
+ x.send(f)};
+document.addEventListener("click",async ev=>{const b=ev.target.closest("[data-fw],[data-bk]");if(!b)return;
+ if(b.dataset.bk){ev.preventDefault();bkQuick();return}
+ const k=b.dataset.fw,tk=b.dataset.tk;
+ if(k==="del"){if(!confirm("Delete this uploaded firmware file from the dashboard?"))return;const r=await post("fw-delete",{token:tk});const j=await rj(r);r.ok?toast("Deleted","ok"):toast(friendly(j,r.status),"bad");srcLoaded=false;load();return}
+ if(k==="unuse"){const r=await post("source",{upload:""});const j=await rj(r);r.ok?toast("Update uses the GitHub release / direct link again","ok"):toast(friendly(j,r.status),"bad");srcLoaded=false;load();return}
+ if(k==="use"){const it=FWU.items.find(x=>x.token===tk);if(!it)return;
+  if(it.merged&&!confirm("⚠ "+it.name+" is a FULL-ERASE image. Flashing it wipes the Heltec's identity (private key), name, settings, ACL and regions. Use it for the next Update anyway? (Update will still ask you to tick the box and type ERASE.)"))return;
+  const r=await post("source",{upload:tk,merged_ack:!!it.merged});const j=await rj(r);r.ok?toast("Update radio firmware will now flash "+it.name+". Nothing is sent until you press it.","ok"):toast(friendly(j,r.status),"bad");srcLoaded=false;load()}});
+function eraseBody(){if(!$("mwack").checked||$("mwtyped").value.trim().toUpperCase()!=="ERASE"){$("mwarn").hidden=false;$("mwarn").scrollIntoView({behavior:"smooth",block:"center"});toast("This is a full-erase image: tick the box and type ERASE in the red box first.","bad");return null}
+ return{erase_ok:true,typed:"ERASE"}}
+const MCONF="⚠ FULL ERASE: flash a merged / fresh-install image? The Heltec loses its identity (private key), name, settings, passwords, ACL and regions. This sends one text to the T-SIM.";
+/* ---- backup / restore ---- */
+let BK={},BKFILE=null,BKPLAN=null;
+function dl(name,txt){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([txt],{type:"application/json"}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000)}
+function showBackup(d){const B=d.backup||{};BK=B;const I=B.items||[];
+ $("bksum").textContent=I.length?I.length+" saved · last "+t(I[0].created_at):"no backups yet";
+ $("bkkey").innerHTML=B.prvkey?'<span class="warn">🔑 Private key stored for backups ('+e(B.prvkey.hint)+', read '+e(t(B.prvkey.at))+')</span>':B.prv_pending?"⏳ Private-key read queued, waiting for the T-SIM…":'<span class="mut">No private key stored. Backups then hold settings only (restoring them keeps the current identity).</span>';
+ $("bkinc").disabled=!B.prvkey;if(!B.prvkey)$("bkinc").checked=false;$("prvforget").hidden=!B.prvkey;
+ $("bkknown").textContent=(B.settings_known||0)+" repeater settings known"+(B.settings_known?"":": press Read all in Repeater settings (or turn on the T-SIM settings cache) first");
+ $("bklist").innerHTML=I.map(x=>'<div class="rsrow small"><b>'+e(t(x.created_at))+'</b> · '+x.settings+' settings · '+e(kb(x.bytes))+(x.private_key?' <span class="badge failed">SENSITIVE: private key</span>':'')+(x.passwords?' <span class="badge mut">passwords</span>':'')+' <a href="'+API+'backup-get?bid='+e(x.bid)+'" download>Download</a> <button type="button" class="g sm" data-bkdel="'+e(x.bid)+'">Delete</button></div>').join("")||'<p class="small mut">No saved backups.</p>';
+ showJob(B.restore,B.restore_inflight)}
+async function bkMake(){const inc=$("bkinc").checked;if(inc&&!confirm("Include the private key? Anyone with the file can impersonate this repeater. Keep it somewhere private."))return false;
+ const r=await post("backup-create",{include_key:inc});const j=await rj(r);if(!r.ok){say("bkmsg",false,friendly(j,r.status));return false}
+ dl(j.item.file,JSON.stringify(j.backup,null,2));say("bkmsg",true,"Backup saved and downloaded"+(j.backup.identity.private_key?" (SENSITIVE: contains the private key)":""));load();return true}
+$("bkmake").onclick=bkMake;
+function bkQuick(){const bx=$("bkbox");bx.open=true;bx.scrollIntoView({behavior:"smooth"});bkMake()}
+$("prvread").onclick=async()=>{if(!confirm("Read the repeater's private key over the serial console so it can go into backups? This sends one text to wake the T-SIM. The key is then stored on this dashboard (hidden in the history) until you press Forget."))return;
+ const r=await post("prvkey-read",{confirm:true});const j=await rj(r);r.ok?toast("Queued. The T-SIM reads it on its next wake ("+(j.wake&&j.wake.sent?"text sent":"text not sent: "+friendly(j.wake||{},0))+").","ok"):toast(friendly(j,r.status),"bad");load()};
+$("prvforget").onclick=async()=>{if(!confirm("Delete the stored private key from the dashboard? Saved backups that include it keep their copy."))return;const r=await post("prvkey-forget",{});r.ok?toast("Deleted","ok"):toast("Failed","bad");load()};
+$("bkfile").onchange=async()=>{const f=$("bkfile").files[0];$("bkprev").innerHTML="";BKFILE=null;if(!f)return;
+ let bk;try{bk=JSON.parse(await f.text())}catch(x){$("bkprev").innerHTML='<p class="err small">Not a JSON file.</p>';return}
+ const r=await post("backup-preview",{backup:bk});const j=await rj(r);if(!r.ok){$("bkprev").innerHTML='<p class="err small">'+e(friendly(j,r.status))+'</p>';return}
+ BKFILE=bk;BKPLAN=j.plan;renderPlan(j)}
+function renderPlan(j){const p=j.plan,row=(a,b,c)=>'<tr><td>'+e(a)+'</td><td class="mono">'+e(b==null||b===""?"(unknown)":String(b))+'</td><td class="mono">'+e(String(c))+'</td></tr>';
+ const grp=(k,title,n,body,extra)=>'<div class="rsrow"><label class="tog"><input type="checkbox" data-g="'+k+'"'+(n?'':' disabled')+'> <b>'+e(title)+'</b> ('+n+')</label>'+(extra||"")+(n?'<details class="small"><summary>Show changes</summary>'+body+'</details>':'')+'</div>';
+ const tb=rows=>'<div class="tw"><table class="small"><thead><tr><th>Item</th><th>Now</th><th>Backup</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+ const cl=a=>'<ul>'+a.map(x=>'<li class="mono">'+e(x.desc||x.cmd)+(x.risk?" ⚠":"")+'</li>').join("")+'</ul>';
+ const sens=BKFILE.identity&&BKFILE.identity.private_key,I=p.identity;
+ let h='<p class="small">Backup of <b>'+e((j.device||{}).name||"?")+'</b> from '+e(t(j.created_at))+(sens?' <span class="badge failed">SENSITIVE: contains the private key</span>':'')+'. Only differences are listed; (unknown) = not read on this dashboard yet.</p>';
+ h+=grp("dashboard","Dashboard config (applied here right away, nothing sent)",p.dashboard.length,tb(p.dashboard.map(x=>row(x.label,x.current,x.backup)).join("")));
+ h+=grp("settings","Repeater settings",p.settings.length,tb(p.settings.map(x=>row(x.label+(x.risk?" ⚠":""),x.current,x.backup)).join("")));
+ h+=grp("regions","Regions (adds and flood rules; regions not in the backup are kept)",p.regions.filter(x=>!x.list).length,cl(p.regions));
+ h+=grp("acl","Access list (adds and permission changes; extra entries are kept)",p.acl.filter(x=>!x.list).length,cl(p.acl));
+ h+=grp("identity","Identity (private key), then reboot",I?1:0,I?'<p>Backup public key: <span class="mono">'+e(I.public_key||"?")+'</span><br>Current: <span class="mono">'+e(I.current_public_key||"(unknown)")+'</span>'+(I.same?'<br><span class="ok">Same identity as now; no need to restore it.</span>':'')+'</p>':'',I?'<div class="small warn">Restores the private key with set prv.key, then reboots the repeater. You will type IDENTITY to confirm.</div>':'');
+ if(p.skipped.length)h+='<p class="small warn">Skipped: '+p.skipped.map(s=>e(s.what+" ("+s.why+")")).join("; ")+'</p>';
+ h+='<div class="acts"><button type="button" id="bkapply">Restore selected</button><span id="bkamsg" class="msg"></span></div><p class="small mut">Repeater changes are staged first; nothing reaches the T-SIM until you press Send below. Up to '+j.per_wake+' commands run per T-SIM wake.</p>';
+ $("bkprev").innerHTML=h;$("bkapply").onclick=bkApply}
+async function bkApply(){const g={};document.querySelectorAll("#bkprev input[data-g]").forEach(c=>g[c.dataset.g]=c.checked);
+ if(!Object.values(g).some(Boolean)){say("bkamsg",false,"Tick at least one group");return}
+ const p=BKPLAN,risky=!!((g.settings&&p.settings.some(x=>x.risk))||(g.regions&&p.regions.some(x=>x.risk))||(g.acl&&p.acl.some(x=>x.risk))||(g.identity&&p.identity));
+ let typed="";if(risky&&!confirm("⚠ This restore includes risky changes (radio, passwords, admin access or identity). A wrong backup can take the repeater off your mesh or lock you out. Continue?"))return;
+ if(g.identity&&p.identity){typed=prompt("Restoring the private key replaces this repeater's identity and reboots it. Type IDENTITY to confirm.")||"";if(typed.trim().toUpperCase()!=="IDENTITY"){say("bkamsg",false,"Not confirmed");return}}
+ const r=await post("restore-prepare",{backup:BKFILE,groups:g,risk_ok:risky,typed});const j=await rj(r);
+ if(!r.ok){say("bkamsg",false,friendly(j,r.status));return}
+ say("bkamsg",true,(j.applied&&j.applied.length?"Dashboard config applied ("+j.applied.join(", ")+"). ":"")+(j.job?"Repeater restore staged: press Send below.":""));srcLoaded=false;tsimLoaded=false;load()}
+function showJob(J,inflight){const el=$("bkjob");if(!J){el.innerHTML=inflight?'<p class="small">⏳ '+inflight+' restore command(s) waiting for or running on the T-SIM.</p>':"";return}
+ el.innerHTML='<div class="psnote" style="border-left-color:var(--acc);background:#1f6feb14"><b>Restore staged</b> ('+e(J.groups.join(", "))+'): '+J.sent+' of '+J.total+' commands sent, '+J.remaining+' left in '+J.parts_left+' part(s).'+(inflight?' '+inflight+' still waiting on the T-SIM.':'')+'<div class="acts" style="margin-top:6px"><button type="button" class="w sm" id="bksend">Send part '+(J.parts_sent+1)+' ('+J.next+' commands)</button><button type="button" class="g sm" id="bkcancel">Cancel restore</button></div></div>';
+ $("bksend").onclick=async()=>{if(!confirm("Send one text to wake the T-SIM and run "+J.next+" restore command(s) on the repeater?"))return;const r=await post("restore-send",{});const j=await rj(r);
+  r.ok?toast("Queued "+j.queued+" command(s)"+(j.remaining?", "+j.remaining+" left":", that was the last part")+". "+(j.wake&&j.wake.sent?"Text sent.":"Text not sent: "+friendly(j.wake||{},0)+" (they run at the next wake)."),"ok"):toast(friendly(j,r.status),"bad");load()};
+ $("bkcancel").onclick=async()=>{if(!confirm("Cancel the staged restore? Commands already sent to the T-SIM can't be recalled."))return;await post("restore-cancel",{});load()}}
+document.addEventListener("click",async ev=>{const b=ev.target.closest("[data-bkdel]");if(!b)return;if(!confirm("Delete this saved backup?"))return;const r=await post("backup-delete",{bid:b.dataset.bkdel});r.ok?toast("Deleted","ok"):toast("Failed","bad");load()});
 /* ---- location (GPS) ---- */
 let GPS={},gpsLoaded=false,LMAP=null,LMK=null,gpsPend=null;
 const gpsPendResolved=${gpsPendResolved.toString().replace(/^function \w+/, "function")};
@@ -2388,6 +2893,7 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
     const m = request.method;
     try {
+      if (parts[0] === "fw" && parts.length === 2 && (m === "GET" || m === "HEAD")) return await handleFwDownload(request, env, parts[1]);
       if (parts[0] === "ingest" && parts.length === 2 && m === "POST") return await handleIngest(request, env, parts[1]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "commands" && m === "GET") return await handleDeviceCommands(request, env, parts[2]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "cfglist" && m === "GET") return await handleCfgList(request, env, parts[2]);

@@ -946,3 +946,164 @@ console.log("tag/asset version ok");
 console.log("serial.ondemand tests OK");
   await P("settings", { console_enabled: false });
 }
+
+// ---- firmware upload + backup / restore ----
+{
+  const m = await import("../src/index.js");
+  const mkApp = (n = 8192, chip = 9) => { const b = new Uint8Array(n); b[0] = 0xE9; b[1] = 5; b[12] = chip; for (let i = 24; i < n; i++) b[i] = (i * 7) & 0xff; return b; };
+  const mkMerged = () => { const b = new Uint8Array(0x20000).fill(0xFF); b[0] = 0xE9; b[1] = 3; b[12] = 9; b[0x8000] = 0xAA; b[0x8001] = 0x50; b.set(mkApp(0x10000), 0x10000); return b; };
+  let a = m.analyzeFirmware(mkApp(), "Heltec_v3_repeater-v1.18.0.bin"); assert.equal(a.kind, "app"); assert.equal(a.merged, false); assert.equal(a.chip, "ESP32-S3");
+  a = m.analyzeFirmware(mkMerged(), "x.bin"); assert.equal(a.kind, "merged"); assert(a.merged && a.warnings.length, "content-merged flagged even without -merged name");
+  a = m.analyzeFirmware(mkApp(), "Heltec_v3_repeater-v1.18.0-merged.bin"); assert.equal(a.kind, "app"); assert(a.merged, "name says merged: treated as full erase");
+  assert.throws(() => m.analyzeFirmware(new Uint8Array(8192), "a.bin"), /0xE9/);
+  assert.throws(() => m.analyzeFirmware(mkApp(8192, 0), "a.bin"), /ESP32-S3/);
+  assert.throws(() => m.analyzeFirmware(mkApp(100), "a.bin"), /too small/);
+  assert.throws(() => m.analyzeFirmware(mkApp(m.FW_APP_SLOT + 16), "a.bin"), /app partition/);
+  assert.doesNotThrow(() => m.analyzeFirmware(mkApp(m.FW_APP_SLOT), "a.bin"));
+  assert.equal(m.safeFwName("C:\\fakepath\\Heltec v3 (1).bin"), "Heltec_v3_1_.bin");
+  assert.notEqual(m.uploadImageRisk({ asset_name: "a.bin", size: 2e6 }, "tsim-updater 1.6.1"), null); assert.equal(m.uploadImageRisk({ asset_name: "a.bin", size: 2e6 }, "tsim-updater 1.7.0"), null);
+
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.7")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: b === undefined ? undefined : JSON.stringify(b) });
+  const UP = (bytes, name) => call("/api/d/tsim-1/fw-upload", { method: "POST", headers: { Cookie: c, "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(name) }, body: bytes });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const unthrottle = () => { const s = JSON.parse(kv.get("state:tsim-1") || "{}"); delete s.last_send_ts; delete s.last_update_sent; kv.set("state:tsim-1", JSON.stringify(s)); const x = JSON.parse(kv.get("sent:tsim-1") || "{}"); delete x.last_send_ts; delete x.last_update_sent; kv.set("sent:tsim-1", JSON.stringify(x)); };
+  await ingest({ type: "status", fw: "tsim-updater 1.7.0", msg: "STATUS" });
+  const holo0 = holo;
+  assert.equal((await call("/api/d/tsim-1/fw-upload", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: mkApp() })).status, 401, "upload needs login");
+  assert.equal((await call("/api/d/tsim-1/fw-upload", { method: "POST", headers: { Cookie: c, Origin: "https://evil.example" }, body: mkApp() })).status, 403, "cross-origin upload refused");
+  let r = await UP(new Uint8Array(8192), "bad.bin"); assert.equal(r.status, 400); assert.match((await r.json()).error, /0xE9/);
+  const app = mkApp(20000);
+  r = await UP(app, "Heltec_v3_repeater-v1.18.1-powersaving-serial-abc.bin"); assert.equal(r.status, 201); const it = (await r.json()).item;
+  const want = [...new Uint8Array(await crypto.subtle.digest("SHA-256", app))].map((x) => x.toString(16).padStart(2, "0")).join("");
+  assert.equal(it.sha256, want); assert.equal(it.size, 20000); assert.equal(it.kind, "app"); assert.match(it.url, /^https:\/\/w\/fw\/[0-9a-f]{32}$/); assert(!it.url.includes("_"));
+  r = await UP(app, "again.bin"); assert.equal(r.status, 200); assert.equal((await r.json()).duplicate, true, "same file is not stored twice");
+  r = await call(new URL(it.url).pathname); assert.equal(r.status, 200); assert.equal(r.headers.get("Content-Length"), "20000"); assert.equal(r.headers.get("Content-Type"), "application/octet-stream");
+  assert.deepEqual(new Uint8Array(await r.arrayBuffer()), app);
+  r = await call(new URL(it.url).pathname, { headers: { Range: "bytes=0-15" } }); assert.equal(r.status, 206); assert.equal(r.headers.get("Content-Range"), "bytes 0-15/20000"); assert.equal((await r.arrayBuffer()).byteLength, 16);
+  r = await call(new URL(it.url).pathname, { headers: { Range: "bytes=-4" } }); assert.equal(r.status, 206); assert.equal(r.headers.get("Content-Range"), "bytes 19996-19999/20000");
+  r = await call(new URL(it.url).pathname, { headers: { Range: "bytes=30000-" } }); assert.equal(r.status, 416);
+  r = await call(new URL(it.url).pathname, { method: "HEAD" }); assert.equal(r.status, 200); assert.equal(r.headers.get("Content-Length"), "20000");
+  assert.equal((await call("/fw/" + "0".repeat(32))).status, 404); assert.equal((await call("/fw/nope")).status, 404);
+  let tl = await TEL(); assert.equal(tl.fwup.items.length, 1); assert.equal(tl.fwup.target_merged, false);
+  r = await P("source", { upload: it.token }); assert.equal(r.status, 200); assert.equal(holo, holo0, "selecting a file sends nothing");
+  tl = await TEL(); assert.equal(tl.fwup.selected, it.token); assert.equal(tl.source.upload, it.token);
+  r = await P("check"); assert.equal(r.status, 200); assert.equal((await r.json()).latest_available.via, "upload");
+  unthrottle(); kv.set("state:tsim-1", JSON.stringify({ ...JSON.parse(kv.get("state:tsim-1") || "{}"), heltec_powersaving: false }));
+  r = await P("update-latest"); let j = await r.json(); assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.sent, true); assert.equal(holo, holo0 + 1);
+  assert.equal(j.body, `UPDATE ${it.url} `); assert(j.body.length <= 160);
+  assert.equal(JSON.parse(kv.get("sent:tsim-1")).last_update_sent.via, "upload");
+  await ingest({ type: "update", msg: `SUCCESS: ${it.url} | chip=ESP32-S3 image=app-only addr=0x10000 size=20000 written=20000 verify=OK md5=x` });
+  assert.equal(JSON.parse(kv.get("state:tsim-1")).radio_flashed.file, it.name);
+  assert.equal((await P("fw-delete", { token: it.token })).status, 200);
+  assert.equal(kv.get("fwblob:" + it.token), undefined); tl = await TEL(); assert.equal(tl.source.upload, undefined, "deleting the selected file falls back to the release source"); assert.equal(tl.fwup.items.length, 0);
+  r = await UP(mkMerged(), "Heltec_v3_repeater-v1.18.0-merged.bin"); assert.equal(r.status, 201); const mg = (await r.json()).item; assert(mg.merged);
+  assert.equal((await P("source", { upload: mg.token })).status, 409, "merged needs acknowledgement");
+  assert.equal((await P("source", { upload: mg.token, merged_ack: true })).status, 200);
+  tl = await TEL(); assert.equal(tl.fwup.target_merged, true);
+  unthrottle(); const h1 = holo;
+  r = await P("update-latest"); j = await r.json(); assert.equal(r.status, 409); assert(j.needs_erase_confirm); assert.equal(holo, h1, "no text without ERASE");
+  r = await P("update-latest", { erase_ok: true, typed: "erase " }); j = await r.json(); assert.equal(j.sent, true); assert.match(JSON.parse(kv.get("sent:tsim-1")).log[0].msg, /FULL ERASE/);
+  await P("fw-delete", { token: mg.token });
+  for (let i = 0; i < 3; i++) assert.equal((await UP(mkApp(9000 + i), `f${i}.bin`)).status, 201);
+  assert.equal((await UP(mkApp(9100), "f4.bin")).status, 409, "max 3 per device");
+  for (const x of (await TEL()).fwup.items) await P("fw-delete", { token: x.token });
+  await P("source", { upload: "" });
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes('id="upfile"') && pg.includes('id="mwarn"') && pg.includes('id="bkbox"') && pg.includes("ERASE"));
+  for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  console.log("firmware upload tests OK");
+
+  // ---------- backup / restore ----------
+  await P("settings", { console_enabled: true }); unthrottle();
+  kv.set("cmds:tsim-1", "[]");
+  const KEY = "ab".repeat(64), PUB = "CD".repeat(32);
+  kv.set("rptcfg:tsim-1", JSON.stringify({ name: { value: "Hilltop" }, tx: { value: "22" }, radio: { value: "910.525,250,10,5" }, "guest.password": { value: "guestpw" }, "public.key": { value: PUB }, repeat: { value: "on" }, ver: { value: "v1.18.0" } }));
+  kv.set("rptlist:tsim-1", JSON.stringify({ regions: { raw: "*  F\n#USA F\n  #PA^ F" }, home: { raw: "#PA" }, default: { raw: "<null>" }, acl: { raw: "03 " + "F".repeat(64) + "\n01 " + "E".repeat(64) } }));
+  r = await P("backup-create", { include_key: true }); j = await r.json(); assert.equal(r.status, 200);
+  assert.equal(j.backup.identity.private_key, null, "no key stored yet"); assert.equal(j.backup.repeater.settings.name.value, "Hilltop");
+  const bs = JSON.stringify(j.backup); assert(!bs.includes(dev.ingest_key) && !bs.includes("admintok") && !bs.includes("pbkdf2") && !bs.includes("sess-secret") && !bs.includes("1234567"), "no secrets / device credentials in backups");
+  assert.equal(j.backup.repeater.regions.length, 3); assert.equal(j.backup.repeater.acl.length, 2); assert(j.backup.sensitive.passwords.includes("guest.password"));
+  assert.equal((await P("prvkey-read", {})).status, 400);
+  const hk = holo; r = await P("prvkey-read", { confirm: true }); assert.equal(r.status, 200); assert.equal(holo, hk + 1);
+  let fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  assert.deepEqual(fl.map((x) => x[1]), ["get prv.key"]);
+  await ingest({ type: "cmd", cmd_id: fl[0][0], cmd: "get prv.key", output: "  -> " + KEY });
+  assert.equal(JSON.parse(kv.get("prvkey:tsim-1")).key, KEY);
+  assert(!kv.get("cmds:tsim-1").includes(KEY) && !kv.get("telem:tsim-1:history").includes(KEY) && !(kv.get("rptlist:tsim-1") || "").includes(KEY), "key never left in history");
+  tl = await TEL(); assert(!JSON.stringify(tl).includes(KEY), "telemetry never carries the key"); assert(tl.backup.prvkey.hint.startsWith("abab"));
+  r = await P("backup-create", { include_key: true }); j = await r.json(); const full = j.backup; assert.equal(full.identity.private_key, KEY); assert(full.sensitive.private_key); assert.match(j.item.file, /PRIVATE-KEY\.json$/);
+  r = await P("backup-create", { include_key: false }); assert.equal((await r.json()).backup.identity.private_key, null);
+  tl = await TEL(); assert.equal(tl.backup.items.length, 3); assert(!JSON.stringify(tl).includes(KEY));
+  r = await call("/api/d/tsim-1/backup-get?bid=" + tl.backup.items[1].bid, { headers: { Cookie: c } }); assert.equal(r.status, 200); assert.match(r.headers.get("Content-Disposition"), /attachment; filename=".*PRIVATE-KEY\.json"/);
+  assert.equal((await r.json()).identity.private_key, KEY);
+  for (let i = 0; i < 4; i++) await P("backup-create", {});
+  tl = await TEL(); assert.equal(tl.backup.items.length, 5, "keeps the last 5"); assert.equal([...kv.keys()].filter((k) => k.startsWith("backup:tsim-1:")).length, 5);
+  assert.equal((await P("backup-delete", { bid: tl.backup.items[4].bid })).status, 200);
+  kv.set("rptcfg:tsim-1", JSON.stringify({ name: { value: "NewName" }, tx: { value: "22" }, radio: { value: "915,250,11,5" }, "public.key": { value: "AA".repeat(32) } }));
+  kv.set("rptlist:tsim-1", JSON.stringify({ regions: { raw: "*  F" }, acl: { raw: "" } }));
+  assert.equal((await P("backup-preview", { backup: { format: "x" } })).status, 400);
+  r = await P("backup-preview", { backup: full }); j = await r.json(); assert.equal(r.status, 200);
+  const keys = j.plan.settings.map((x) => x.key); assert(keys.includes("name") && keys.includes("radio") && keys.includes("guest.password") && !keys.includes("tx"), keys.join());
+  assert(!JSON.stringify(j).includes(KEY) && !JSON.stringify(j).includes("guestpw"), "preview hides key and passwords");
+  assert(j.plan.regions.some((x) => x.cmd === "region put #USA") && j.plan.regions.some((x) => x.cmd === "region put #PA #USA") && j.plan.regions.some((x) => x.cmd === "region home #PA"));
+  assert(j.plan.acl.some((x) => x.cmd === "setperm " + "F".repeat(64) + " 3" && x.risk)); assert.equal(j.plan.identity.same, false);
+  const hr = holo;
+  assert.equal((await P("restore-prepare", { backup: full, groups: { settings: true } })).status, 409, "radio change needs risk_ok");
+  assert.equal((await P("restore-prepare", { backup: full, groups: { identity: true }, risk_ok: true })).status, 409, "identity needs typed IDENTITY");
+  r = await P("restore-prepare", { backup: full, groups: { dashboard: true, settings: true, regions: true, acl: true, identity: true }, risk_ok: true, typed: "identity" }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(holo, hr, "prepare sends nothing"); assert(j.job.total > 0);
+  const job = JSON.parse(kv.get("restore:tsim-1")); const cmdsAll = job.cmds.map((x) => x.cmd);
+  assert.equal(cmdsAll[cmdsAll.length - 1], "reboot"); assert.equal(cmdsAll[cmdsAll.length - 2], `set prv.key ${KEY}`);
+  assert(cmdsAll.indexOf("region save") > cmdsAll.indexOf("set name Hilltop"));
+  const parts = m.nextRestorePart(Array.from({ length: 100 }, (_, i) => ({ cmd: "set name " + "x".repeat(20) + i })), 40, 40); assert.equal(parts.length, 40);
+  const bigp = m.nextRestorePart(Array.from({ length: 60 }, () => ({ cmd: "x".repeat(150) })), 40, 40); assert(bigp.length < 40 && bigp.reduce((n, x) => n + x.cmd.length + 10, 0) <= 6000);
+  assert.equal(m.nextRestorePart([{ cmd: "a" }, { cmd: "b" }], 40, 10).length, 2); assert.equal(m.nextRestorePart([{ cmd: "a" }], 0, 40).length, 0);
+  unthrottle(); r = await P("restore-send", {}); j = await r.json(); assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(holo, hr + 1, "Send texts once"); assert.equal(j.remaining, 0);
+  assert.equal(kv.get("restore:tsim-1"), undefined);
+  tl = await TEL(); assert(!JSON.stringify(tl).includes(KEY), "queued restore never shows the key"); assert(tl.backup.restore_inflight > 0);
+  fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
+  const pk = fl.find((x) => x[1].startsWith("set prv.key")); assert(pk, "the T-SIM receives the real command"); assert.equal(pk[1], `set prv.key ${KEY}`);
+  for (const [bid, bc] of fl) await ingest({ type: "cmd", cmd_id: bid, cmd: bc, output: "  -> OK" });
+  assert(!kv.get("cmds:tsim-1").includes(KEY) && !kv.get("telem:tsim-1:history").includes(KEY) && !kv.get("rptlist:tsim-1").includes(KEY), "set prv.key redacted after it ran");
+  assert.equal(JSON.parse(kv.get("rptcfg:tsim-1")).name.value, "Hilltop", "restored setting recorded");
+  await P("prvkey-forget", {}); assert.equal(kv.get("prvkey:tsim-1"), undefined);
+  assert.equal((await P("restore-send", {})).status, 404);
+  await P("settings", { console_enabled: false });
+  console.log("backup / restore tests OK");
+}
+
+// ---- version compare across firmware families ----
+{
+  const m = await import("../src/index.js");
+  const PSS = { tag: "v1.18.0-powersaving-serial", asset_name: "Heltec_v3_repeater-v1.18.0-powersaving-serial-12c42054.bin", checked_at: "2026-10-18T20:00:00Z" };
+  assert.deepEqual(m.fwIdent("PowerSaving17.1.6"), { family: "easyskymesh", base: [1, 17, 1], ver: [17, 1, 6], commit: null });
+  assert.deepEqual(m.fwIdent(PSS.asset_name), { family: "meshcore-powersaving-serial", base: [1, 18, 0], ver: [1, 18, 0], commit: "12c42054" });
+  assert.equal(m.fwIdent("v1.18.0-81dbae5 (Build: 15-Oct-2026)").commit, "81dbae5"); assert.equal(m.fwIdent("v1.18.0-81dbae5 (Build: 15-Oct-2026)").family, "meshcore");
+  assert.equal(m.fwIdent("Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin").family, "easyskymesh"); assert.equal(m.fwIdent("Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin").commit, null);
+  // the reported bug: EasySkyMesh 17.1.6 running, MeshCore 1.18.0 powersaving-serial selected
+  let u = m.updateStatus("PowerSaving17.1.6", PSS);
+  assert.equal(u.state, "available"); assert.equal(u.reason, "Different firmware source"); assert.match(u.text, /different firmware source/i); assert.match(u.text, /EasySkyMesh/);
+  u = m.radioStatus({ heltec_fw: "PowerSaving17.1.6", received_at: "2026-10-18T20:10:00Z" }, {}, PSS); assert.equal(u.state, "available"); assert.equal(u.reason, "Different firmware source");
+  // after a flash of the old ESM file, the confirmed path must not say "Up to date" either
+  u = m.radioStatus({ heltec_fw: "PowerSaving17.1.6", received_at: "2026-10-18T20:10:00Z" }, { radio_flashed: { at: "2026-10-18T19:00:00Z", file: "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin" } }, PSS);
+  assert.equal(u.state, "available"); assert(!/Up to date/.test(u.text));
+  // stock MeshCore of the same base version is still a different source
+  assert.equal(m.updateStatus("v1.18.0-81dbae5", PSS).reason, "Different firmware source");
+  // same family, same version, different commit -> different build
+  u = m.updateStatus("v1.18.0-powersaving-serial-8ba35c2d", PSS); assert.equal(u.state, "available"); assert.equal(u.reason, "Different build");
+  // same family + same commit -> current; newer installed -> current
+  assert.equal(m.updateStatus("v1.18.0-powersaving-serial-12c42054", PSS).state, "current");
+  assert.equal(m.updateStatus("v1.18.1-powersaving-serial-aaaa111", PSS).state, "current");
+  assert.equal(m.updateStatus("v1.17.1-powersaving-serial-aaaa111", PSS).reason, "Newer version");
+  // EasySkyMesh vs EasySkyMesh still compares their own numbers
+  assert.equal(m.updateStatus("PowerSaving 17.1.5", { tag: "PowerSaving17.1", asset_name: "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin" }).state, "available");
+  // progress "already running the target" never crosses families
+  const st = { last_update_sent: { at: "2026-10-18T20:00:00Z", asset_name: PSS.asset_name, tag: PSS.tag }, radio_ver: "PowerSaving17.1.6", radio_ver_at: "2026-10-18T20:05:00Z" };
+  assert.notEqual(m.computeProgress("heltec", [], st, Date.parse("2026-10-18T20:06:00Z")).state, "done", "ESM 17.1.6 is not >= MeshCore 1.18.0");
+  st.radio_ver = "v1.18.0-powersaving-serial-12c42054";
+  assert.equal(m.computeProgress("heltec", [], st, Date.parse("2026-10-18T20:06:00Z")).state, "done");
+  console.log("firmware family compare tests OK");
+}
