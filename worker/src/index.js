@@ -412,7 +412,7 @@ export async function heltecImageRisk(url, tsimFw) {
 export const FW_PRESETS = {
   easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" },
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
-  meshcore_serial: { label: "MeshCore + serial on demand (just-stuff-tm/MeshCore)", enabled: true, repo: "just-stuff-tm/MeshCore", tag_prefix: "", asset_pattern: "Heltec_v3_repeater-v*-serial-*.bin", direct_url: "", note: "Stock MeshCore, rebuilt automatically for every new release with serial.ondemand: the console keeps working while power saving. App-only image, keeps identity and settings." },
+  meshcore_serial: { label: "MeshCore + serial on demand (just-stuff-tm/MeshCore)", enabled: true, repo: "just-stuff-tm/MeshCore", tag_prefix: "", asset_pattern: "Heltec_v3_repeater-v*-serial-*.bin", direct_url: "", note: "Stock MeshCore with serial.ondemand (the console keeps working while power saving), built for each new MeshCore release when you sync the fork or press Run workflow. App-only image, keeps identity and settings." },
   easyskymesh_serial: { label: "EasySkyMesh PowerSaving + serial on demand (just-stuff-tm/EasySkyMesh)", enabled: true, repo: "just-stuff-tm/EasySkyMesh", tag_prefix: "", asset_pattern: "Heltec_v3_repeater-*-serial-upgrade.bin", direct_url: "", note: "EasySkyMesh PowerSaving firmware with serial.ondemand. Based on MeshCore 1.17 (older than stock), so prefer the MeshCore + serial preset unless you need EasySkyMesh's extra power features." },
 };
 
