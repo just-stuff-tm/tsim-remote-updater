@@ -1217,3 +1217,79 @@ console.log("serial.ondemand tests OK");
   await P("settings", { console_enabled: false });
   console.log("power-saving settings tests OK");
 }
+
+// ---- v1.7.1 modem watchdog (WDCFG, heartbeat, offline warning) ----
+{
+  const m = await import("../src/index.js");
+  // pure helpers
+  assert.equal(m.wdCfgCmd(m.DEFAULT_WD), "WDCFG int=180 hb=1 sms=0");
+  assert.deepEqual(m.validateWd({}, {}), { int_min: 180, hb: true, sms: false });
+  assert.equal(m.validateWd({}, { int_min: 0 }).int_min, 0); assert.equal(m.validateWd({}, { int_min: 360, sms: true }).sms, true);
+  assert.throws(() => m.validateWd({}, { int_min: 10 })); assert.throws(() => m.validateWd({}, { int_min: 2000 }));
+  assert(m.isSysCmd("WDCFG int=180 hb=1 sms=0"));
+  const rx = "2026-10-20T12:00:00.000Z";
+  const hb = m.parseHeartbeat({ type: "heartbeat", stage: "hard", sms_waiting: 7, wd: { int: 180, hb: 1, sms: 0, chk: 9, ok: 7, soft: 1, hard: 1, fail: 0, fails: 0, next: 10800, ev: [[60, "hard", "ok", 140], [120, "soft", "fail", 85], [-1, "check", "fail", 3], ["x"]] } }, rx);
+  assert.equal(hb.stage, "hard"); assert.equal(hb.sms_waiting, 7); assert.equal(hb.int_min, 180); assert.equal(hb.hb, true); assert.equal(hb.hard, 1);
+  assert.equal(hb.events.length, 3); assert.equal(hb.events[0].at, "2026-10-20T11:59:00.000Z"); assert.equal(hb.events[2].at, null, "pre-boot event has no time");
+  assert.equal(hb.next_at, "2026-10-20T15:00:00.000Z");
+  assert.equal(m.parseHeartbeat({ stage: "<script>" }, rx).stage, "script", "stage is sanitized");
+  // check-in expectations
+  const now = Date.parse(rx);
+  const ago = (h) => new Date(now - h * 3600e3).toISOString();
+  let ci = m.checkinInfo({ received_at: ago(1), wd_int: 180 }, null, null, 0, now); assert.equal(ci.expected_s, 10800); assert.equal(ci.by, "watchdog"); assert.equal(ci.offline, false);
+  ci = m.checkinInfo({ received_at: ago(6.5), wd_int: 180 }, null, null, 0, now); assert.equal(ci.offline, true); assert(ci.missed >= 2);
+  ci = m.checkinInfo({ received_at: ago(6.1), wd_int: 180 }, null, null, 0, now); assert.equal(ci.offline, false, "15 min grace");
+  ci = m.checkinInfo({ received_at: ago(30) }, null, null, 0, now); assert.equal(ci.expected_s, null); assert.equal(ci.offline, false, "pre-1.7.1 T-SIM: no expectation");
+  ci = m.checkinInfo({ received_at: ago(30), wd_int: 180 }, { hb: false }, null, 0, now); assert.equal(ci.offline, false, "heartbeat off: no expectation");
+  ci = m.checkinInfo({ received_at: ago(50) }, null, null, 24, now); assert.equal(ci.by, "schedule"); assert.equal(ci.offline, true);
+  ci = m.checkinInfo({ received_at: ago(1), wd_int: 0 }, null, null, 0, now); assert.equal(ci.expected_s, null);
+  // tl carries the counters
+  const tf = m.tlFields({ fw: "tsim-updater 1.7.1", wdi: 180, wdc: 4, wds: 1, wdh: 0, wdf: 0 });
+  assert.equal(tf.wd_int, 180); assert.equal(tf.wd_checks, 4); assert.equal(tf.wd_soft, 1);
+
+  // server
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.9")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const fetchCmds = async () => (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text());
+  const holo0 = holo;
+  // older firmware: refused, and a queued WDCFG is never delivered to it (it would reach the repeater CLI)
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.0" } })).status, 200);
+  r = await P("watchdog-settings", { int_min: 180 }); assert.equal(r.status, 409);
+  let tl = await TEL(); assert.equal(tl.watchdog.supported, false); assert.equal(tl.watchdog.settings.int_min, 180);
+  // 1.7.1
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.1", wdi: 180, wdc: 0, wds: 0, wdh: 0, wdf: 0 } })).status, 200);
+  r = await P("watchdog-settings", { int_min: 360, hb: true, sms: false }); assert.equal(r.status, 200); let j = await r.json();
+  assert.equal(j.queued.cmd, "WDCFG int=360 hb=1 sms=0"); assert.equal(j.wake, null, "no text unless asked"); assert.equal(holo, holo0);
+  assert.equal((await P("watchdog-settings", { int_min: 7 })).status, 400);
+  r = await P("watchdog-settings", { int_min: 120 }); j = await r.json(); assert.equal(j.queued.cmd, "WDCFG int=120 hb=1 sms=0");
+  const list0 = JSON.parse(kv.get("cmds:tsim-1")); assert.equal(list0.filter((x) => /^WDCFG/.test(x.cmd) && x.status === "queued").length, 1, "newest settings win");
+  tl = await TEL(); assert.equal(tl.watchdog.pending, "queued"); assert.equal(tl.watchdog.supported, true);
+  assert.equal(tl.commands.some((x) => /WDCFG/.test(x.cmd)), false, "hidden from console history");
+  const cl = await fetchCmds(); const line = cl.split("\n").find((l) => l.includes("WDCFG")); assert(line, "delivered to 1.7.1"); assert(cl.includes("WDCFG int=120 hb=1 sms=0"));
+  const [cid] = line.split("\t");
+  assert.equal((await ingest({ type: "cmd", cmd_id: cid, cmd: "WDCFG int=120 hb=1 sms=0", sys: true, output: "WDCFG applied 3: int=120 hb=1 sms=0" })).status, 200);
+  tl = await TEL(); assert(tl.watchdog.settings.applied_at, "applied"); assert.equal(tl.watchdog.pending, null);
+  r = await P("watchdog-settings", { int_min: 120, hb: true, sms: false }); j = await r.json(); assert.equal(j.unchanged, true);
+  // heartbeat: recovery is logged, routine OK is not
+  kv.set("telem:tsim-1:history", "[]"); const act0 = 0;
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.1", stage: "hard", sms_waiting: 7, wd: { int: 120, hb: 1, sms: 0, chk: 3, ok: 2, soft: 1, hard: 1, fail: 0, fails: 0, next: 7200, ev: [[30, "hard", "ok", 150], [90, "soft", "fail", 80]] },
+    tl: { fw: "tsim-updater 1.7.1", bv: 3.95, wdi: 120, wdc: 3, wds: 1, wdh: 1, wdf: 0 } })).status, 200);
+  tl = await TEL(); assert.equal(tl.watchdog.last.stage, "hard"); assert.equal(tl.watchdog.last.sms_waiting, 7); assert.equal(tl.watchdog.last.last_recovery.stage, "hard");
+  assert.equal(tl.watchdog.last.events.length, 2); assert.equal(tl.latest.wd_hard, 1); assert.equal(tl.watchdog.checkin.expected_s, 7200); assert.equal(tl.watchdog.checkin.offline, false);
+  let hist = JSON.parse(kv.get("telem:tsim-1:history") || "[]").filter((x) => /Watchdog/.test(x.msg || "")); assert.equal(hist.length, act0 + 1); assert.match(hist[0].msg, /Watchdog: modem recovered \(power-cycle\).*7 text\(s\) stored/);
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.1", stage: "ok", sms_waiting: 0, wd: { int: 120, hb: 1, chk: 4, ok: 3, soft: 1, hard: 1, fail: 0, fails: 0, next: 7200, ev: [] } })).status, 200);
+  hist = JSON.parse(kv.get("telem:tsim-1:history") || "[]").filter((x) => /Watchdog/.test(x.msg || "")); assert.equal(hist.length, act0 + 1, "routine OK heartbeat not logged");
+  tl = await TEL(); assert.equal(tl.watchdog.last.stage, "ok"); assert.equal(tl.watchdog.last.last_recovery.stage, "hard", "last recovery kept");
+  // offline: last seen 5 h ago with a 2 h watchdog
+  const lat = JSON.parse(kv.get("telem:tsim-1:latest")); lat.received_at = new Date(Date.now() - 5 * 3600e3).toISOString(); kv.set("telem:tsim-1:latest", JSON.stringify(lat));
+  tl = await TEL(); assert.equal(tl.watchdog.checkin.offline, true); assert(tl.watchdog.checkin.missed >= 2);
+  assert.equal(holo, holo0, "nothing texted by any of this");
+  // UI renders and its scripts parse
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  for (const x of ['id="wdf"', 'id="offwarn"', 'id="wdinfo"', "Modem watchdog", '<option value="180">3 hours (default)</option>']) assert(pg.includes(x), x);
+  for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  console.log("v1.7.1 watchdog tests OK");
+}
