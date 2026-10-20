@@ -8,7 +8,7 @@ A **solar-powered MeshCore repeater you can manage from anywhere**. A Heltec WiF
 - optionally run repeater CLI commands,
 - manage **many repeaters** from one fleet dashboard.
 
-Nothing runs on a schedule unless you turn it on. Step-by-step setup: **[docs/SETUP.md](docs/SETUP.md)**. Using an AI agent to build it for someone? See **[docs/FOR-AI-AGENTS.md](docs/FOR-AI-AGENTS.md)**.
+Nothing is texted on a schedule unless you turn it on. Since T-SIM firmware 1.7.1 the T-SIM also wakes itself every 3 hours (no text) to check that its modem is still on the network and recover it if not ([Modem watchdog](#modem-watchdog-self-recovery-t-sim-firmware-171)). Step-by-step setup: **[docs/SETUP.md](docs/SETUP.md)**. Using an AI agent to build it for someone? See **[docs/FOR-AI-AGENTS.md](docs/FOR-AI-AGENTS.md)**.
 
 ## How it works
 
@@ -96,6 +96,23 @@ Only the Heltec V3 has been tested on real hardware. The other boards are expect
 - The T-SIM decides by reading the file contents (not the name), and refuses anything that isn't an ESP32 image or a classic-ESP32 image aimed at a different chip. It can't tell an S3 file from a C3 file, so make sure the file is for your board.
 
 **T-SIM side:** the controller must be a **LilyGO T-SIM7670G / T-SIM7672G** (ESP32-S3 + SIM767x). The firmware's modem pins and AT commands are for that board. Other modems would need code changes.
+
+## Modem watchdog: self-recovery (T-SIM firmware 1.7.1+)
+
+The T-SIM sleeps until a text rings its modem. If the modem drops its LTE registration or hangs while the ESP32 sleeps, texts can't be delivered (Hologram holds them, with no "SMS delivered"), so nothing would ever wake the T-SIM again. Before 1.7.1 that needed a power cycle on site.
+
+- **Timer wake** (default every **3 h**; 30 min to 24 h, or off). It doesn't reset the modem. It pulls DTR low to wake the modem from sleep, then checks that it answers `AT`, the SIM is ready (`AT+CPIN?`), it's registered (`AT+CEREG?` / `AT+CREG?`: home, roaming or SMS-only) and data is attached (`AT+CGATT?`). A healthy check takes a few seconds.
+- **Recovery** (only when that check fails), with bounded timeouts and at most 5 minutes of recovery per wake:
+  1. *Soft*: `AT+CFUN=0` then `AT+CFUN=1`, then up to 60 s for registration.
+  2. *Hard*: `AT+CPOF` if the modem still answers, otherwise a 3 s PWRKEY pulse (GPIO18). Then the normal power-on: RESET (GPIO17, active low) for 2.6 s and a PWRKEY on-pulse, then up to 90 s for registration.
+  3. Afterwards the SMS settings (`AT+CNMI` …) are set again so texts ring the T-SIM, and the modem goes back to sleep (`AT+CSCLK=1`, DTR held high) with the ring wake re-armed.
+  - After a failure it retries sooner (30 min, 60 min, 2 h …, never longer than the interval). Below 3.35 V (idle battery) it only checks and skips recovery and the heartbeat.
+- **Heartbeat**: after every check (default; turn it off to post only after a recovery or a failure), the T-SIM posts `{"type":"heartbeat"}` with its counters (checks, OK, soft, hard, failed), the last 6 recovery attempts and how many texts are stored on the modem. Each one is about 10–20 s of LTE and a few KB of data.
+- **Logged in NVS** (namespace `tsimwd`): settings, counters and the last 6 attempts survive reboots and OTA.
+- **No commands**: a watchdog wake never fetches queued dashboard commands and never sends a text. Texts already stored on the modem (for example ones Hologram delivers after the modem reconnects) wait for the next text or normal wake. You can let watchdog wakes run them with the setting *also run texts already waiting* (off by default).
+- **Dashboard** (T-SIM tab › Modem watchdog): status, last check-in, next check, counters, last recovery, recent attempts and texts waiting. Settings (interval, heartbeat, stored texts) are queued as a `WDCFG int=<min> hb=0|1 sms=0|1` system command, only for T-SIM 1.7.1+, and applied at the next wake. The header badge says **Offline** and a red banner appears when the T-SIM misses 2 expected check-ins (+15 min grace). The expected interval is the watchdog interval the T-SIM reports, when heartbeats are on, or the scheduled check, whichever is shorter.
+- USB serial `WDCHECK` runs one check by hand (bench test).
+- The board has no switch that cuts power to the modem. If the modem ignores both RESET and PWRKEY, only a power cycle on site helps.
 
 ## Location / GPS (T-SIM firmware 1.6.7+, improved in 1.6.8)
 
@@ -193,7 +210,7 @@ esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash -z \
   0x10000 .pio/build/tsim7672g/firmware.bin
 ```
 
-After RST the T-SIM stays awake for 2 minutes (USB serial commands at 115200: `STATUS`, `MESH`, `CMD`, `CLI <command>`, `REBOOT`, `TESTDL <url>`, `UPDATE <url>`, `TSIMUPDATE <url> [sha256:…]`, `LASTLOG`, `SLEEP`, `STAY`), then sleeps until a text arrives.
+After RST the T-SIM stays awake for 2 minutes (USB serial commands at 115200: `STATUS`, `MESH`, `CMD`, `CLI <command>`, `REBOOT`, `TESTDL <url>`, `UPDATE <url>`, `TSIMUPDATE <url> [sha256:…]`, `WDCHECK`, `LASTLOG`, `SLEEP`, `STAY`), then sleeps until a text arrives or the watchdog timer fires.
 
 ### Partition layout and OTA (v1.6.0)
 
@@ -210,7 +227,7 @@ The config from `include/config.h` (Worker URL, device id, device key, APN) is s
 
 Open your Worker URL and log in with a device id or fleet login and its password. A fleet login opens **/fleet**: one card per repeater with online/stale, last seen, battery, signal, Heltec firmware, neighbor count, packet counts, schedule and console state. Tap a card for the repeater page (**/d/&lt;id&gt;**).
 
-The repeater page shows firmware, last seen (with a **stale** badge after 26 hours), wake cause, uptime, battery and solar, signal (CSQ/RSRP/RSRQ), operator, IP, the Heltec firmware, the latest `upgrade.bin` on GitHub, and an activity log. It refreshes every 30 s.
+The repeater page shows firmware, last seen (with a **stale** badge after 26 hours, or **Offline** when the T-SIM misses 2 expected watchdog/scheduled check-ins), wake cause, uptime, battery and solar, signal (CSQ/RSRP/RSRQ), operator, IP, the Heltec firmware, the latest `upgrade.bin` on GitHub, and an activity log. It refreshes every 30 s.
 
 **Update source** (per device, in the dashboard): GitHub repo (default `just-stuff-tm/MeshCore`), asset filename pattern (`*` = anything, default `Heltec_v3_repeater-v*-powersaving-*.bin`: releases `vX.Y.Z-powersaving` and the older release names from before the rename; `-merged` and `_headless` files are skipped; a source saved with the old default pattern is updated once), an optional direct `https://` URL, or an uploaded file (see below). Update status compares like with like: firmware family (stock MeshCore, MeshCore + power saving, EasySkyMesh PowerSaving), MeshCore base version and build commit. A repeater running a different family from the selected source shows *Update available (different firmware source)*. When the GitHub source is turned off, Check and Update use the direct URL, or are disabled if it's empty.
 
@@ -265,6 +282,7 @@ Each has a Read button and is included in Read all, the T-SIM settings cache, th
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
 | `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
+| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1` | Modem watchdog settings (≥ 1.7.1). A system command queued by the dashboard and picked up at the next wake; never texted |
 | `GPSFIX` / `GPSCFG auto=0\|1 to=<s>` | T-SIM location fix / location settings (≥ 1.6.7). Never texted directly: the dashboard queues them as system commands and wakes the T-SIM with `CMD` (or they ride along with the next `STATUS`) |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 

@@ -851,6 +851,7 @@ static bool doTsimUpdate(const char *args);
 static void pwrApplyCfg(const char *args, char *out, size_t cap);
 static void gpsApplyCfg(const char *args, char *out, size_t cap);
 static void csApplyCfg(const char *args, char *out, size_t cap);
+static void wdApplyCfg(const char *args, char *out, size_t cap);
 static void gpsReport(const char *trigger, char *out, size_t cap);
 static void doConsoleCommands(bool sys_only = false) {
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
@@ -871,7 +872,7 @@ static void doConsoleCommands(bool sys_only = false) {
     static char ec[960], ei[40];
     // Over budget, or the Heltec stopped answering: report the rest as skipped so the Worker doesn't wait on them.
     const char *skip = (millis() - b0 > CMD_BUDGET_MS) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
-    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0) {
+    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0 && strncasecmp(cmd, "WDCFG ", 6) != 0) {
       jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"%s\"}", FW_VERSION, ei, ec, skip);
       ingestSendBig(s_mesh_body); ran++; continue;
@@ -898,6 +899,12 @@ static void doConsoleCommands(bool sys_only = false) {
       static char co[200]; csApplyCfg(cmd + 8, co, sizeof(co));
       static char ce[300]; jsonEsc(ce, sizeof(ce), co); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, ce);
+      ingestSendBig(s_mesh_body); ran++; continue;
+    }
+    if (clean && strncasecmp(cmd, "WDCFG ", 6) == 0) {  // v1.7.1 modem watchdog config (Worker system command)
+      static char wo[200]; wdApplyCfg(cmd + 6, wo, sizeof(wo));
+      static char we[300]; jsonEsc(we, sizeof(we), wo); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, we);
       ingestSendBig(s_mesh_body); ran++; continue;
     }
     if (clean && (strcasecmp(cmd, "GPSFIX") == 0 || strncasecmp(cmd, "GPSCFG ", 7) == 0)) {  // v1.6.7 GNSS (Worker system commands)
@@ -1989,6 +1996,19 @@ static int batPercent(float v) {
 
 static float s_bat_idle_fwd(void) { return s_bat_idle; }
 RTC_DATA_ATTR static int s_sig_csq = -1, s_sig_rsrp = 0;
+// v1.7.1 modem watchdog state (functions further down). Settings and counters live in NVS namespace "tsimwd".
+#define WD_DEFAULT_MIN     180      // check every 3 h by default; 0 disables
+#define WD_MIN_MIN         30
+#define WD_MAX_MIN         1440
+#define WD_LOWBAT_V        3.35f    // below this (valid idle reading): check only, no recovery and no heartbeat
+#define WD_BUDGET_MS       300000UL // hard cap on recovery work per wake
+#define MODEM_PWROFF_PULSE_MS 3000  // SIM7670G/7672G PWRKEY power-off pulse (LilyGO utilities.h)
+static uint32_t s_wd_int_min = WD_DEFAULT_MIN;
+static bool s_wd_hb = true, s_wd_sms = false, s_wd_pend = false;
+static uint32_t s_wd_chk = 0, s_wd_ok = 0, s_wd_soft = 0, s_wd_hard = 0, s_wd_fail = 0;
+static char s_wd_ev[320] = "";                    // "rtc,stage,result,secs;..." newest first
+RTC_DATA_ATTR static int64_t s_wd_due = 0;        // rtcNow() when the next check is due (RTC time runs in deep sleep)
+RTC_DATA_ATTR static uint8_t s_wd_fails = 0;      // consecutive failed checks (retry backoff)
 static void telemRefreshSignal() {
   if (s_tcp_busy) return;
   if (modemAT("AT+CSQ", 3000)) { const char *p = strstr(s_at_resp, "+CSQ:"); int v; if (p && sscanf(p, "+CSQ: %d", &v) == 1) s_sig_csq = v; }
@@ -1999,6 +2019,8 @@ static size_t telemJson(char *out, size_t cap) {
   size_t o = snprintf(out, cap, ",\"tl\":{\"fw\":\"%s\",\"bv\":%.2f,\"bp\":%d,\"bl\":%.2f,\"sv\":%.2f,\"csq\":%d,\"rsrp\":%d,\"up\":%lu,\"wake\":%d,\"heap\":%u,\"tc\":%.1f,\"lb\":%d",
     FW_VERSION, s_bat_idle, batPercent(s_bat_idle), bl, sol, s_sig_csq, s_sig_rsrp, (unsigned long)(millis() / 1000UL), (int)s_wake_cause,
     (unsigned)ESP.getFreeHeap(), temperatureRead(), (int)s_lb_state);
+  if (o < cap) o += snprintf(out + o, cap - o, ",\"wdi\":%u,\"wdc\":%u,\"wds\":%u,\"wdh\":%u,\"wdf\":%u",
+    (unsigned)s_wd_int_min, (unsigned)s_wd_chk, (unsigned)s_wd_soft, (unsigned)s_wd_hard, (unsigned)s_wd_fail);  // v1.7.1
   if (o < cap && now > 1700000000LL) o += snprintf(out + o, cap - o, ",\"ts\":%lld", (long long)now);
   if (o < cap && s_gc_at > 0) o += snprintf(out + o, cap - o, ",\"glat\":%.6f,\"glon\":%.6f,\"gsats\":%d,\"gat\":%lld", s_gc_lat, s_gc_lon, s_gc_sats, (long long)s_gc_at);
   if (o < cap) o += snprintf(out + o, cap - o, "}");
@@ -2187,6 +2209,206 @@ static void cfgSnapshot() {
   csSendOrKeep(s_mesh_body);
   if (total && noreply < 3) { s_cs_last = rtcNow(); Preferences p; p.begin("tsimcs", false); p.putLong64("last", s_cs_last); p.end(); }
   logf("cfgsnap: %d command(s) in %lus", total, (unsigned long)((millis() - t0) / 1000));
+}
+
+// -------------------- v1.7.1 modem watchdog (self-recovery) --------------------
+// The T-SIM normally sleeps until the modem rings it for a text. If the modem drops off LTE or hangs while the
+// ESP32 sleeps, no text can arrive and nothing would ever wake it. The watchdog adds a timer wake (default every
+// 3 h, 0 = off): it wakes the modem from sleep WITHOUT resetting it, checks AT / SIM / registration (CEREG, CREG)
+// / packet attach (CGATT), and only if that fails escalates: soft recovery (AT+CFUN=0/1), then a hard
+// power-cycle (AT+CPOF or a 3 s PWRKEY pulse, then the normal RESET + PWRKEY power-on). Every step has a timeout;
+// the whole wake is capped. Then the modem goes back to sleep with the SMS ring wake re-armed.
+// A heartbeat is posted to the dashboard after a recovery, after a failure that was not reported yet, and (hb=1,
+// default) after every check. Queued dashboard commands are never fetched on a watchdog wake. Texts already stored
+// on the modem are processed only when sms=1 (default off). No SMS is ever sent.
+static void processSmsInbox();
+static void wdSave() {
+  Preferences p; p.begin("tsimwd", false);
+  p.putUInt("chk", s_wd_chk); p.putUInt("ok", s_wd_ok); p.putUInt("soft", s_wd_soft); p.putUInt("hard", s_wd_hard); p.putUInt("fail", s_wd_fail);
+  p.putBool("pend", s_wd_pend); p.putString("ev", s_wd_ev);
+  p.end();
+}
+static void wdLoad() {
+  Preferences p; p.begin("tsimwd", false);
+  s_wd_int_min = p.getUInt("int", WD_DEFAULT_MIN); s_wd_hb = p.getBool("hb", true); s_wd_sms = p.getBool("sms", false);
+  s_wd_chk = p.getUInt("chk", 0); s_wd_ok = p.getUInt("ok", 0); s_wd_soft = p.getUInt("soft", 0); s_wd_hard = p.getUInt("hard", 0); s_wd_fail = p.getUInt("fail", 0);
+  s_wd_pend = p.getBool("pend", false);
+  String ev = p.getString("ev", ""); strncpy(s_wd_ev, ev.c_str(), sizeof(s_wd_ev) - 1); s_wd_ev[sizeof(s_wd_ev) - 1] = 0;
+  p.end();
+  if (s_wd_int_min != 0 && (s_wd_int_min < WD_MIN_MIN || s_wd_int_min > WD_MAX_MIN)) s_wd_int_min = WD_DEFAULT_MIN;
+}
+// Newest first, at most 6 entries: "<rtc s>,<stage>,<result>,<secs>"
+static void wdAddEvent(const char *stage, const char *result, uint32_t secs) {
+  char tmp[sizeof(s_wd_ev)];
+  int n = snprintf(tmp, sizeof(tmp), "%lld,%s,%s,%u", (long long)rtcNow(), stage, result, (unsigned)secs);
+  int kept = 0; const char *q = s_wd_ev;
+  while (*q && kept < 5) {
+    const char *e = strchr(q, ';'); size_t L = e ? (size_t)(e - q) : strlen(q);
+    if (n + 1 + (int)L >= (int)sizeof(tmp)) break;
+    tmp[n++] = ';'; memcpy(tmp + n, q, L); n += L; tmp[n] = 0; kept++;
+    if (!e) break; q = e + 1;
+  }
+  strncpy(s_wd_ev, tmp, sizeof(s_wd_ev) - 1); s_wd_ev[sizeof(s_wd_ev) - 1] = 0;
+  logf("WD event: %s %s %us", stage, result, (unsigned)secs);
+}
+static void wdSchedule(bool ok) {
+  if (!s_wd_int_min) { s_wd_due = 0; return; }
+  int64_t secs = (int64_t)s_wd_int_min * 60;
+  if (!ok) {  // retry sooner after a failure: 30, 60, 120 min ... capped at the interval
+    int64_t b = 1800LL << (s_wd_fails > 1 ? (s_wd_fails - 1 > 4 ? 4 : s_wd_fails - 1) : 0);
+    if (b < secs) secs = b;
+  }
+  s_wd_due = rtcNow() + secs;
+}
+// WDCFG int=<0|30..1440 min> hb=<0|1> sms=<0|1>  (system command from the Worker)
+static void wdApplyCfg(const char *args, char *out, size_t cap) {
+  Preferences p; p.begin("tsimwd", false);
+  char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+  char *save = nullptr; int n = 0; bool rej = false;
+  for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
+    char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
+    if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m == 0 || (m >= WD_MIN_MIN && m <= WD_MAX_MIN)) { s_wd_int_min = m; p.putUInt("int", m); n++; } else rej = true; }
+    else if (!strcmp(k, "hb")) { s_wd_hb = atoi(v) != 0; p.putBool("hb", s_wd_hb); n++; }
+    else if (!strcmp(k, "sms")) { s_wd_sms = atoi(v) != 0; p.putBool("sms", s_wd_sms); n++; }
+  }
+  p.end();
+  s_wd_fails = 0; wdSchedule(true);
+  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d", n, rej ? " (interval REJECTED: 0 or 30-1440 min)" : "",
+           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms);
+  logf("%s", out);
+}
+static int wdRegStat(const char *tag) {
+  const char *p = strstr(s_at_resp, tag); if (!p) return -1;
+  int a, b; if (sscanf(p + strlen(tag), " %d,%d", &a, &b) == 2) return b;
+  return -1;
+}
+// 1 home, 5 roaming, 6/7 SMS only, 9/10 CSFB not preferred = registered
+static bool wdRegOk(int st) { return st == 1 || st == 5 || st == 6 || st == 7 || st == 9 || st == 10; }
+static bool wdRegistered() {
+  if (modemAT("AT+CEREG?", 2000) && wdRegOk(wdRegStat("+CEREG:"))) return true;
+  if (modemAT("AT+CREG?", 2000) && wdRegOk(wdRegStat("+CREG:"))) return true;
+  return false;
+}
+static bool wdWaitReg(uint32_t ms) {
+  uint32_t t0 = millis();
+  do { if (wdRegistered()) return true; delay(2000); } while (millis() - t0 < ms);
+  return false;
+}
+static bool wdAttached() {
+  if (!modemAT("AT+CGATT?", 3000)) return false;
+  const char *p = strstr(s_at_resp, "+CGATT:"); int v = 0;
+  return p && sscanf(p, "+CGATT: %d", &v) == 1 && v == 1;
+}
+static bool wdProbe(int tries) {
+  for (int i = 0; i < tries; i++) { if (modemAT("AT", 1000)) return true; delay(200); }
+  return false;
+}
+static bool wdHealthy(uint32_t cpin_ms, uint32_t reg_ms) {
+  return modemWaitCpinReady(cpin_ms) && wdWaitReg(reg_ms) && wdAttached();
+}
+static bool wdSoft() {
+  logf("WD: soft recovery (AT+CFUN=0/1)");
+  modemAT("AT+CFUN=0", 15000); delay(2000);
+  modemAT("AT+CFUN=1", 15000); delay(1000);
+  s_pdp_up = false;
+  return wdHealthy(20000, 60000);
+}
+static bool wdHard(bool at_alive) {
+  logf("WD: hard power-cycle");
+  if (!(at_alive && modemAT("AT+CPOF", 10000))) {      // graceful power-off when it still answers, else PWRKEY
+    pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+    digitalWrite(MODEM_PWRKEY_PIN, HIGH); delay(MODEM_PWROFF_PULSE_MS); digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  }
+  delay(5000);
+  ModemSerial.end();
+  s_pdp_up = false;
+  if (!modemPowerOn()) return false;                    // RESET pulse + PWRKEY on (the normal boot sequence)
+  modemAT("ATE0"); modemAT("AT+CMEE=2");
+  return wdHealthy(20000, 90000);
+}
+static int wdSmsStored() {
+  if (!modemAT("AT+CPMS?", 3000)) return -1;
+  const char *p = strstr(s_at_resp, "+CPMS:"); if (!p) return -1;
+  p = strchr(p, ','); return p ? atoi(p + 1) : -1;
+}
+static size_t wdJson(char *dst, size_t cap) {
+  int64_t now = rtcNow(), nx = s_wd_due > 0 ? s_wd_due - now : -1;
+  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"ev\":[",
+    (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (unsigned)s_wd_chk, (unsigned)s_wd_ok, (unsigned)s_wd_soft, (unsigned)s_wd_hard,
+    (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx);
+  const char *q = s_wd_ev; bool first = true;
+  while (*q && o < cap) {
+    long long rtc = 0; char st[12] = "", rs[12] = ""; unsigned secs = 0;
+    if (sscanf(q, "%lld,%11[^,],%11[^,],%u", &rtc, st, rs, &secs) == 4) {
+      long long ago = rtc <= now ? now - rtc : -1;   // -1: logged before a cold boot (RTC restarted)
+      o += snprintf(dst + o, cap - o, "%s[%lld,\"%s\",\"%s\",%u]", first ? "" : ",", ago, st, rs, secs); first = false;
+    }
+    const char *e = strchr(q, ';'); if (!e) break; q = e + 1;
+  }
+  if (o < cap) o += snprintf(dst + o, cap - o, "]}");
+  return o < cap ? o : 0;
+}
+static bool wdHeartbeat(const char *stage, int sms) {
+  if (!s_pdp_up && !modemOpenData()) return false;
+  telemRefreshSignal();
+  static char hb[1200];
+  size_t o = snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"fw\":\"%s\",\"stage\":\"%s\",\"sms_waiting\":%d,\"msg\":\"Watchdog check: %s\"",
+                      FW_VERSION, stage, sms, stage);
+  o += wdJson(hb + o, sizeof(hb) - o - 2);
+  snprintf(hb + o, sizeof(hb) - o, "}");
+  return ingestSend(hb);
+}
+// Runs on a watchdog timer wake. Returns true when the modem ends up healthy.
+static bool wdRun() {
+  uint32_t t0 = millis();
+  s_wd_chk++;
+  pinMode(MODEM_DTR_PIN, OUTPUT); digitalWrite(MODEM_DTR_PIN, LOW);   // DTR low: modem leaves CSCLK sleep (no reset)
+  ModemSerial.setRxBufferSize(8192);
+  ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+  delay(150);
+  bool at = wdProbe(5);
+  if (at) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
+  bool ok = at && wdHealthy(5000, 20000);
+  bool lowbat = s_bat_idle >= 2.5f && s_bat_idle < WD_LOWBAT_V;
+  const char *stage = "ok"; bool hard_tried = false;
+  logf("WD: check AT=%d healthy=%d bat=%.2fV", (int)at, (int)ok, s_bat_idle);
+  if (!ok && lowbat) {
+    stage = "lowbat"; wdAddEvent("check", "lowbat", (millis() - t0) / 1000);
+  } else if (!ok) {
+    if (at) {
+      s_wd_soft++; stage = "soft";
+      ok = wdSoft();
+      wdAddEvent("soft", ok ? "ok" : "fail", (millis() - t0) / 1000);
+    }
+    if (!ok && millis() - t0 < WD_BUDGET_MS) {
+      s_wd_hard++; stage = "hard"; hard_tried = true;
+      ok = wdHard(at && wdProbe(2));
+      wdAddEvent("hard", ok ? "ok" : "fail", (millis() - t0) / 1000);
+    }
+    if (ok) { modemConfigureSms(); s_wd_pend = true; }  // CNMI/CMGF are lost after CFUN/reset: re-arm the SMS ring
+  }
+  // Data check: bring up PDP only when a heartbeat is going out; a PDP failure gets one soft recovery.
+  int sms = -1;
+  if (ok && !lowbat && (s_wd_hb || s_wd_pend)) {
+    if (!modemOpenData() && strcmp(stage, "ok") == 0 && millis() - t0 < WD_BUDGET_MS) {
+      s_wd_soft++; stage = "soft";
+      ok = wdSoft();
+      wdAddEvent("soft-pdp", ok ? "ok" : "fail", (millis() - t0) / 1000);
+      if (ok) { modemConfigureSms(); s_wd_pend = true; }
+    }
+    if (ok) {
+      sms = wdSmsStored();
+      if (s_lb_pending[0]) pwrReportPending();
+      if (wdHeartbeat(stage, sms)) s_wd_pend = false;
+    }
+  }
+  if (ok) { if (strcmp(stage, "ok") == 0) s_wd_ok++; s_wd_fails = 0; }
+  else if (strcmp(stage, "lowbat") != 0) { s_wd_fail++; if (s_wd_fails < 255) s_wd_fails++; s_wd_pend = true; if (!hard_tried) wdAddEvent("check", "fail", (millis() - t0) / 1000); }
+  wdSchedule(ok || strcmp(stage, "lowbat") == 0);
+  wdSave();
+  logf("WD: done stage=%s ok=%d in %lus, next check in %lld s", stage, (int)ok, (unsigned long)((millis() - t0) / 1000), (long long)(s_wd_due - rtcNow()));
+  if (ok && s_wd_sms) processSmsInbox();   // optional (default off): run texts already stored on the modem
+  return ok;
 }
 
 static bool handleCommand(const char *from, const char *body) {
@@ -2394,15 +2616,31 @@ static void processSmsInbox() {
   logf("SMS processed: %d", count);
 }
 
+// v1.7.1: one timer for every reason to wake (battery check, GNSS warm window end, modem watchdog). 0 = none.
+static uint64_t sleepTimerSecs() {
+  if (s_ext0_failed) return 60;
+  int64_t best = -1;
+  auto take = [&](int64_t secs) { if (secs < 5) secs = 5; if (best < 0 || secs < best) best = secs; };
+  if (s_lb_en) take((int64_t)s_lb_int_min * 60);
+  if (s_gnss_on) take(s_gnss_off_at - rtcNow());
+  if (s_wd_int_min) { if (s_wd_due <= 0) wdSchedule(true); take(s_wd_due - rtcNow()); }
+  return best < 0 ? 0 : (uint64_t)best;
+}
+static void armWakeups() {
+  s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
+  uint64_t secs = sleepTimerSecs();
+  if (secs) esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
+  logf("sleep: SMS ring wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed",
+       (unsigned long long)secs, s_lb_en ? "on" : "off", s_gnss_on ? "warm" : "off", s_wd_int_min ? "on" : "off");
+}
+
 // Timer-wake path: the modem was never woken, so skip AT+CSCLK; just re-arm wakeups and sleep.
 static void sleepQuick() {
   heltecPinsRelease();
   pinMode(MODEM_RI_PIN, INPUT);
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
   gpio_deep_sleep_hold_en();
-  s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
-  if (s_ext0_failed) esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-  else esp_sleep_enable_timer_wakeup((uint64_t)s_lb_int_min * 60ULL * 1000000ULL);
+  armWakeups();
   Serial.flush(); delay(50);
   esp_deep_sleep_start();
 }
@@ -2417,14 +2655,7 @@ static void goToSleep() {
   pinMode(MODEM_RI_PIN, INPUT);
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
   gpio_deep_sleep_hold_en();
-  s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
-  if (s_ext0_failed) esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-  else if (s_lb_en) { esp_sleep_enable_timer_wakeup((uint64_t)s_lb_int_min * 60ULL * 1000000ULL);  // battery check
-    logf("battery check timer: %u min", (unsigned)s_lb_int_min); }
-  if (!s_ext0_failed && s_gnss_on) {   // v1.6.8: wake when the GNSS warm window ends to power it off
-    int64_t left = s_gnss_off_at - rtcNow(); if (left < 5) left = 5;
-    if (!s_lb_en || (uint64_t)left < (uint64_t)s_lb_int_min * 60ULL) esp_sleep_enable_timer_wakeup((uint64_t)left * 1000000ULL);
-    logf("GNSS warm: off timer %llds", (long long)left); }
+  armWakeups();   // v1.7.1: SMS ring + one timer (battery check / GNSS warm window end / modem watchdog)
   Serial.flush(); delay(100);
   esp_deep_sleep_start();
 }
@@ -2441,6 +2672,7 @@ static void handleUsbLine(char *line) {
   if (strcasecmp(line, "LASTLOG") == 0) { printLastLog(); return; }
   if (strcasecmp(line, "STATUS") == 0) { doStatusReport(); return; }
   if (strcasecmp(line, "MESH") == 0) { meshSnapshot(); return; }
+  if (strcasecmp(line, "WDCHECK") == 0) { wdRun(); return; }   // v1.7.1 run one watchdog check now (bench test)
   if (strcasecmp(line, "CMD") == 0) { doConsoleCommands(); meshSnapshot(); return; }
   if (strncasecmp(line, "CLI ", 4) == 0) { heltecCli(line + 4, s_cli_out, sizeof(s_cli_out)); heltecCliEnd(); Serial.println(s_cli_out); return; }
   if (strcasecmp(line, "REBOOT") == 0) {
@@ -2460,7 +2692,7 @@ static void handleUsbLine(char *line) {
     if (line[2] == ' ') { cmd = line + 3; while (*cmd && isspace((unsigned char)*cmd)) cmd++; }
     modemAT(cmd, 15000); return;
   }
-  logf("USB: AT|REBOOT|UPDATE|TSIMUPDATE|TESTDL|STATUS|MESH|CMD|CLI <cmd>|LASTLOG|SLEEP|STAY");
+  logf("USB: AT|REBOOT|UPDATE|TSIMUPDATE|TESTDL|STATUS|MESH|CMD|CLI <cmd>|WDCHECK|LASTLOG|SLEEP|STAY");
 }
 
 static void interactiveWindow(uint32_t window_ms) {
@@ -2516,8 +2748,25 @@ void setup() {
   analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
   analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
   pwrLoad();
-  gpsLoad(); csLoad();
+  gpsLoad(); csLoad(); wdLoad();
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
+  // v1.7.1 watchdog timer wake. The RTC clock drifts, so a wake up to 10% early still counts; with battery checks off
+  // the watchdog is the only timer left (GNSS warm-window wakes and OTA verification keep the full boot path).
+  bool wd_wake = false;
+  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_wd_int_min && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
+    int64_t tol = (int64_t)s_wd_int_min * 6; if (tol < 60) tol = 60;
+    wd_wake = !s_lb_en || s_wd_due <= 0 || rtcNow() >= s_wd_due - tol;
+  }
+  if (wd_wake) {
+    logf("Watchdog wake (every %u min)", (unsigned)s_wd_int_min);
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+    heltecPinsRelease();
+    if (!LittleFS.begin(true)) logf("LittleFS mount failed");
+    if (s_lb_en) pwrCheck("timer");   // battery check due at the same time: no extra wake
+    wdRun();
+    goToSleep(); return;
+  }
   // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
   if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
     gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
@@ -2544,7 +2793,7 @@ void setup() {
   bool sim = modemWaitCpinReady(20000);
   modemLogDiagnostics();
   if (sim) {
-    modemWaitNetwork(fast ? 30000 : 60000);
+    if (modemWaitNetwork(fast ? 30000 : 60000)) { s_wd_fails = 0; wdSchedule(true); }  // v1.7.1 a good wake restarts the watchdog interval
     modemConfigureSms();
     if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
     if (s_wake_cause != ESP_SLEEP_WAKEUP_TIMER || !s_lb_en) pwrCheck("wake");

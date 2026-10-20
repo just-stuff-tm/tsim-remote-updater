@@ -33,6 +33,7 @@ You are building and deploying this project for a human. Human-oriented steps ar
 ## Never
 - Never commit or paste into public places: passwords, ADMIN_TOKEN, SESSION_SECRET, ingest keys, Hologram key/device ids, phone numbers, emails, Cloudflare account/KV ids, the workers.dev subdomain. `config.h` is gitignored; keep it that way.
 - Never make the T-SIM send SMS. It reports over data only.
+- The modem watchdog (T-SIM 1.7.1+, default every 3 h) is a timer wake plus a data-only heartbeat. It never texts and never fetches queued commands; keep it that way.
 - Never add automatic/periodic texts by default. Send the minimum texts (one per action; Worker rate-limits to 1/60 s). Scheduled checks stay off unless the human asks.
 - Don't defeat repeater power saving (e.g. no auto-reboots of the Heltec to reach the CLI). When power saving is on, the console pauses; that's intended.
 
