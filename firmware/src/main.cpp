@@ -2738,7 +2738,7 @@ static uint64_t sleepTimerSecs() {
 static const char *hwArm() {
   if (!s_hw_en) return "off";
   if (s_hw_auto) return "auto-off";
-  pinMode(HELTEC_HWAKE_PIN, INPUT);
+  pinMode(HELTEC_HWAKE_PIN, INPUT_PULLUP);   // internal ~45k pull-up (an external one is optional); unconnected reads high
   uint32_t t = millis(); int highs = 0;
   while (millis() - t < 1500) { if (digitalRead(HELTEC_HWAKE_PIN)) { if (++highs >= 25) break; } else highs = 0; delay(2); }
   if (highs < 25) {
@@ -2746,8 +2746,12 @@ static const char *hwArm() {
     return "SKIPPED (GPIO6 low)";
   }
   if (esp_sleep_enable_ext1_wakeup(1ULL << HELTEC_HWAKE_PIN, ESP_EXT1_WAKEUP_ANY_LOW) != ESP_OK) return "FAILED";
-  rtc_gpio_pullup_dis((gpio_num_t)HELTEC_HWAKE_PIN);    // external 100k pull-up does the work
+  // Keep the pull-up in deep sleep: RTC pad pull-up (needs the RTC peripheral domain powered; ext0 needs it too).
+  rtc_gpio_init((gpio_num_t)HELTEC_HWAKE_PIN);
+  rtc_gpio_set_direction((gpio_num_t)HELTEC_HWAKE_PIN, RTC_GPIO_MODE_INPUT_ONLY);
   rtc_gpio_pulldown_dis((gpio_num_t)HELTEC_HWAKE_PIN);
+  rtc_gpio_pullup_en((gpio_num_t)HELTEC_HWAKE_PIN);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
   return "armed";
 }
 static void armWakeups() {
@@ -2884,7 +2888,7 @@ void setup() {
   if (s_wake_cause == ESP_SLEEP_WAKEUP_EXT1 && (esp_sleep_get_ext1_wakeup_status() & (1ULL << HELTEC_HWAKE_PIN))) {
     gpio_deep_sleep_hold_dis();          // DTR keeps its own pad hold until we know the modem gets touched
     heltecPinsRelease();
-    pinMode(HELTEC_HWAKE_PIN, INPUT);
+    pinMode(HELTEC_HWAKE_PIN, INPUT_PULLUP);   // also releases the RTC pad config from sleep
     int64_t now = rtcNow();
     bool stuck = true; uint32_t t = millis();
     while (millis() - t < HW_STUCK_MS) { if (digitalRead(HELTEC_HWAKE_PIN)) { stuck = false; break; } delay(5); }

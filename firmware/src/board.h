@@ -35,7 +35,8 @@
 #define HELTEC_BOOT_PIN     2
 #define HELTEC_UART_TX_PIN  42
 #define HELTEC_UART_RX_PIN  41
-// v1.7.3 optional Heltec-reboot wake: Heltec TX43 -> Schottky (cathode to Heltec) -> GPIO6, 100k to 3V3, 100nF to GND.
+// v1.7.3 optional Heltec-reboot wake: Heltec TX43 -> Schottky (cathode to Heltec) -> GPIO6, 47-220nF GPIO6 to GND.
+// Internal pull-up (~45k, kept in deep sleep); an external 100k to 3V3 is optional.
 // GPIO6 is an RTC GPIO (ext1 wake), free on the left header. Any low = the Heltec printed (boot log).
 #define HELTEC_HWAKE_PIN    6
 

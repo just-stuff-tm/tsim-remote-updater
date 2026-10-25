@@ -71,20 +71,20 @@ With one extra wire, a Heltec reboot (for example a `reboot` sent over the mesh)
 
 | Part | Connection |
 |---|---|
-| Schottky diode (BAT54, 1N5819, …) | **cathode (band) to Heltec GPIO43 (TX)**, anode to T-SIM **GPIO6** (left header) |
-| 100 kΩ | T-SIM GPIO6 to T-SIM **3V3** |
-| 100 nF ceramic | T-SIM GPIO6 to **GND** |
+| Schottky diode (1N5817, 1N5819, BAT54, …) | **cathode (band) to Heltec GPIO43 (TX)**, anode to T-SIM **GPIO6** (left header) |
+| 47–220 nF ceramic (100 nF is ideal) | T-SIM GPIO6 to **GND** |
+| *optional* 100 kΩ | T-SIM GPIO6 to T-SIM 3V3. Not needed: the T-SIM turns on GPIO6's internal pull-up (~45 kΩ), awake and in deep sleep |
 
-- Heltec TX idles high. Each low bit it sends pulls GPIO6 low through the diode, and the capacitor holds it low for about 10 ms, so even short serial bits wake the T-SIM. The diode means GPIO6 can never drive the Heltec's TX line. The existing GPIO41 serial wire stays as it is.
-- GPIO6 is an RTC GPIO (deep-sleep wake via ext1, "any low"). The modem ring stays on GPIO3 (ext0). No internal pulls are used.
+- Heltec TX idles high. Each burst of low bits pulls GPIO6 low through the diode within a few µs. The internal pull-up then recharges the capacitor slowly: with ~45 kΩ and 100 nF (RC ≈ 4.5 ms), GPIO6 stays clearly low (below 0.25 × 3.3 V) for about 0.9 ms and stays below the "high" threshold for about 6 ms. With 47 nF that's ~0.4 ms / ~2.7 ms, and with 220 nF ~1.9 ms / ~13 ms. The deep-sleep wake needs only microseconds, so any value in that range works. The diode means GPIO6 can never drive the Heltec's TX line. The existing GPIO41 serial wire stays as it is.
+- GPIO6 is an RTC GPIO (deep-sleep wake via ext1, "any low"). The modem ring stays on GPIO3 (ext0). With the Heltec wake on, the T-SIM enables GPIO6's internal RTC pull-up (pull-down off) and keeps the RTC peripheral domain powered in sleep so the pull-up holds. An unconnected GPIO6 therefore reads high and is safe.
 - Stock MeshCore prints only its boot log on its own, so the line stays quiet while the T-SIM sleeps.
 - Safety: the wake isn't armed for a sleep if GPIO6 isn't steadily high just before sleeping (wire missing, or the Heltec still printing). Accepted wakes are at least 60 s apart, at most 6 per 24 h. 3 spurious wakes in a row (pin stuck low, too soon, over the limit) turn it off until it's ticked again. A Heltec reset the T-SIM did itself doesn't count. Dashboard: T-SIM tab › Modem watchdog › *Heltec reboot wake* (`WDCFG hwake=0|1`, on by default).
 - **Bench test** (USB serial monitor on the T-SIM at 115200):
-  1. With the wire fitted and the Heltec idle, GPIO6 measures about 3.3 V. It dips briefly when the Heltec boots.
+  1. With the wire fitted and the Heltec idle, GPIO6 measures about 3.3 V (once the T-SIM has armed the pull-up, or with the optional 100 kΩ fitted). It dips briefly when the Heltec boots.
   2. Let the T-SIM sleep. The last log line should say `Heltec wake armed`.
   3. Press the Heltec RST button, or send `reboot` to the repeater over the mesh. The T-SIM wakes and logs `Heltec reboot detected (#1 …) -> modem recovery`. The dashboard shows "Heltec reboot detected → Watchdog: modem recovered".
   4. Reboot the Heltec again within 60 s: the wake is logged as ignored ("within 60 s").
-  5. Without the wire (pin floating), check that the T-SIM doesn't keep waking: at most 3 ignored wakes, then the card shows *auto-off*.
+  5. Without the wire, the pull-up holds GPIO6 high, so there should be no Heltec wakes at all (the counters stay at 0).
 
 
 ## Battery calibration and low-battery protection (T-SIM firmware 1.6.5+)
