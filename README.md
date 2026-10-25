@@ -101,7 +101,7 @@ Only the Heltec V3 has been tested on real hardware. The other boards are expect
 
 The T-SIM sleeps until a text rings its modem. If the modem drops its LTE registration or hangs while the ESP32 sleeps, texts can't be delivered (Hologram holds them, with no "SMS delivered"), so nothing would ever wake the T-SIM again. Before 1.7.1 that needed a power cycle on site.
 
-- **Timer wake** (default every **3 h**; 30 min to 24 h, or off). It doesn't reset the modem. It pulls DTR low to wake the modem from sleep, then checks that it answers `AT`, the SIM is ready (`AT+CPIN?`), it's registered (`AT+CEREG?` / `AT+CREG?`: home, roaming or SMS-only) and data is attached (`AT+CGATT?`). A healthy check takes a few seconds.
+- **Timer wake** (default every **3 h**; 30 min to 24 h; off before 1.7.2, 24 h since). It doesn't reset the modem. It pulls DTR low to wake the modem from sleep, then checks that it answers `AT`, the SIM is ready (`AT+CPIN?`), it's registered (`AT+CEREG?` / `AT+CREG?`: home, roaming or SMS-only) and data is attached (`AT+CGATT?`). A healthy check takes a few seconds.
 - **Recovery** (only when that check fails), with bounded timeouts and at most 5 minutes of recovery per wake:
   1. *Soft*: `AT+CFUN=0` then `AT+CFUN=1`, then up to 60 s for registration.
   2. *Hard*: `AT+CPOF` if the modem still answers, otherwise a 3 s PWRKEY pulse (GPIO18). Then the normal power-on: RESET (GPIO17, active low) for 2.6 s and a PWRKEY on-pulse, then up to 90 s for registration.
@@ -109,7 +109,8 @@ The T-SIM sleeps until a text rings its modem. If the modem drops its LTE regist
   - After a failure it retries sooner (30 min, 60 min, 2 h …, never longer than the interval). Below 3.35 V (idle battery) it only checks and skips recovery and the heartbeat.
 - **Heartbeat**: after every check (default; turn it off to post only after a recovery or a failure), the T-SIM posts `{"type":"heartbeat"}` with its counters (checks, OK, soft, hard, failed), the last 6 recovery attempts and how many texts are stored on the modem. Each one is about 10–20 s of LTE and a few KB of data.
 - **Logged in NVS** (namespace `tsimwd`): settings, counters and the last 6 attempts survive reboots and OTA.
-- **No commands**: a watchdog wake never fetches queued dashboard commands and never sends a text. Texts already stored on the modem (for example ones Hologram delivers after the modem reconnects) wait for the next text or normal wake. You can let watchdog wakes run them with the setting *also run texts already waiting* (off by default).
+- **Commands on watchdog wakes (1.7.2+)**: after a successful check the T-SIM fetches and runs queued dashboard commands once (`/commands?wd=1`, no retry, new commands stop after 2 min; skipped below 3.35 V; `WDCFG cmd=0` turns it off). A Heltec *Update radio firmware* is also queued as a watchdog-only backup copy (cancelled when the text starts the update, expires after 24 h). Watchdog wakes never send a text. Texts already stored on the modem only run on watchdog wakes with the setting *also run texts already waiting* (off by default).
+- **Never stuck (1.7.2+)**: every sleep arms a timer (≤ 24 h; interval 0 now means 24 h). Every wake has an awake deadline (20 min, 45 min during an update) that restarts the ESP32, with the RTC hardware watchdog 60 s later as a backstop. After 3 failed recoveries in a row the T-SIM restarts completely (counted in NVS: `rst`, deadline/watchdog resets `dlx`).
 - **Dashboard** (T-SIM tab › Modem watchdog): status, last check-in, next check, counters, last recovery, recent attempts and texts waiting. Settings (interval, heartbeat, stored texts) are queued as a `WDCFG int=<min> hb=0|1 sms=0|1` system command, only for T-SIM 1.7.1+, and applied at the next wake. The header badge says **Offline** and a red banner appears when the T-SIM misses 2 expected check-ins (+15 min grace). The expected interval is the watchdog interval the T-SIM reports, when heartbeats are on, or the scheduled check, whichever is shorter.
 - USB serial `WDCHECK` runs one check by hand (bench test).
 - The board has no switch that cuts power to the modem. If the modem ignores both RESET and PWRKEY, only a power cycle on site helps.
@@ -282,7 +283,7 @@ Each has a Read button and is included in Read all, the T-SIM settings cache, th
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
 | `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
-| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1` | Modem watchdog settings (≥ 1.7.1). A system command queued by the dashboard and picked up at the next wake; never texted |
+| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1 [cmd=0\|1]` | Modem watchdog settings (≥ 1.7.1; `cmd` and int 0 = 24 h since 1.7.2). A system command queued by the dashboard and picked up at the next wake; never texted |
 | `GPSFIX` / `GPSCFG auto=0\|1 to=<s>` | T-SIM location fix / location settings (≥ 1.6.7). Never texted directly: the dashboard queues them as system commands and wakes the T-SIM with `CMD` (or they ride along with the next `STATUS`) |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 

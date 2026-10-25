@@ -686,6 +686,10 @@ async function handleIngest(request, env, id) {
     st.tsim_last_ota = { at: entry.received_at, msg: entry.msg };
     await putJson(env, `state:${id}`, st);
   } else if (entry.type === "update" && entry.msg) {
+    if (/^UPDATE start/.test(entry.msg)) {  // v1.7.2: the update is running, drop the watchdog backup copy
+      const list = (await kvJson(env, `cmds:${id}`)) || [];
+      if (cancelWdOnlyOnTextStart(list)) await putJson(env, `cmds:${id}`, list);
+    }
     const st = (await kvJson(env, `state:${id}`)) || {};
     st.last_update_result = { at: entry.received_at, msg: entry.msg };
     const m = entry.msg.match(/^SUCCESS:\s*(\S+)/);
@@ -969,6 +973,25 @@ export const CFG_MAX_CMDS = 48;
 export const cfgListCmds = (vals = {}) => [...Object.keys(CACHE_LISTS), ...rptReadAllKeys(vals).map(rptGetCmd)].slice(0, CFG_MAX_CMDS);
 // v1.7.1 modem watchdog: the T-SIM wakes on a timer, checks the modem (AT, SIM, registration, packet attach), recovers it
 // (AT+CFUN, then a modem power-cycle) and posts a heartbeat. Settings reach the T-SIM as the WDCFG system command.
+// v1.7.2: watchdog wakes also fetch queued commands ("?wd=1"). A Heltec update is texted as usual AND queued as a
+// watchdog-only backup (wdonly): served only on watchdog fetches, cancelled when the text path starts it, expires after 24 h.
+export const WDCMD_FW = "1.7.2", WDONLY_TTL_MS = 24 * 3600 * 1000;
+export function queueWdUpdate(list, url, nowIso = new Date().toISOString(), idFn = () => randomHex(4)) {
+  for (const c of list) if (c.wdonly && c.status === "queued") { c.status = "cancelled"; c.error = "replaced by a newer update"; }
+  const e = { id: idFn(), cmd: `UPDATE ${url}`, sys: true, wdonly: true, status: "queued", queued_at: nowIso };
+  list.unshift(e); return e;
+}
+export function expireWdOnly(list, nowMs = Date.now()) {
+  let n = 0;
+  for (const c of list) if (c.wdonly && c.status === "queued" && nowMs - Date.parse(c.queued_at || 0) > WDONLY_TTL_MS) { c.status = "cancelled"; c.error = "expired (not picked up by a watchdog check-in within 24 h)"; n++; }
+  return n;
+}
+export function cancelWdOnlyOnTextStart(list) {
+  let n = 0;
+  for (const c of list) if (c.wdonly && c.status === "queued") { c.status = "cancelled"; c.error = "the update text started it"; n++; }
+  return n;
+}
+export const wdOnlyOk = (c, wd, fw) => !c.wdonly || (wd && fwAtLeast(fw, WDCMD_FW));
 export const WD_FW = "1.7.1", DEFAULT_WD = { int_min: 180, hb: true, sms: false };
 export const WD_CHOICES = [0, 30, 60, 120, 180, 360, 720, 1440];
 export const wdCfgCmd = (w) => `WDCFG int=${w.int_min} hb=${w.hb ? 1 : 0} sms=${w.sms ? 1 : 0}`;
@@ -989,6 +1012,7 @@ export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
     at: n(e[0]) != null && e[0] >= 0 ? new Date(rt - e[0] * 1000).toISOString() : null, stage: S(e[1]), result: S(e[2]), secs: n(e[3]) }));
   return { at: receivedAt, stage: S(t && t.stage) || "ok", sms_waiting: n(t && t.sms_waiting), int_min: n(w.int), hb: w.hb === 1 || w.hb === true, sms: w.sms === 1 || w.sms === true,
     checks: n(w.chk), ok: n(w.ok), soft: n(w.soft), hard: n(w.hard), fail: n(w.fail), fails: n(w.fails),
+    cmd: w.cmd === undefined ? null : w.cmd === 1 || w.cmd === true, cmd_fetches: n(w.cmdn), restarts: n(w.rst), deadline_resets: n(w.dlx),
     next_at: n(w.next) != null && w.next >= 0 ? new Date(rt + w.next * 1000).toISOString() : null, events };
 }
 // Expected check-in interval and offline state. Uses what the T-SIM reports it runs (tl.wdi / heartbeat), not just the
@@ -1121,16 +1145,19 @@ async function handleDeviceCommands(request, env, id) {
   const settings = await getSettings(env, id);
   const list = (await kvJson(env, `cmds:${id}`)) || [];
   const now = new Date().toISOString();
-  const sysOnly = new URL(request.url).searchParams.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
+  const sp = new URL(request.url).searchParams;
+  const sysOnly = sp.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
+  const wdWake = sp.get("wd") === "1";    // v1.7.2 watchdog wake: everything, plus a watchdog-only Heltec UPDATE
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
+  const expired = expireWdOnly(list);
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || ""))).reverse().slice(0, cmdsPerWake(lat.fw));
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || "")) && wdOnlyOk(c, wdWake, lat.fw)).reverse().slice(0, cmdsPerWake(lat.fw));
   // never let the reply overflow the T-SIM's fetch buffer (a cut line would run a truncated command)
   let bytes = 0; const fits = []; for (const c of pending) { bytes += `${c.id}\t${c.cmd}\n`.length; if (bytes > (fwAtLeast(lat.fw, BATCH_FW) ? CMD_FETCH_BYTES : 1700)) break; fits.push(c); }
   pending.length = 0; pending.push(...fits);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
-  if (pending.length) await putJson(env, `cmds:${id}`, list);
+  if (pending.length || expired) await putJson(env, `cmds:${id}`, list);
   const nowS = Math.floor(Date.now() / 1000) + 2;
   return new Response(pending.map((c) => `${c.id}\t${c.cmd.replace("{{now}}", String(nowS))}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
 }
@@ -2050,7 +2077,13 @@ async function deviceApi(request, env, dev, action) {
     const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
       st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
     });
-    return json({ ...o, release: rel }, c);
+    // v1.7.2 backup: also queue it for the next watchdog check-in, in case the text never reaches the T-SIM.
+    let wdq = null;
+    if (c !== 429 && c !== 400 && fwAtLeast(tfw, WDCMD_FW)) {
+      const list = (await kvJson(env, `cmds:${id}`)) || [];
+      wdq = queueWdUpdate(list, rel.url); await putJson(env, `cmds:${id}`, list);
+    }
+    return json({ ...o, release: rel, ...(wdq ? { wd_backup: wdq.id } : {}) }, c);
   }
   return json({ error: "not found" }, 404);
 }
@@ -2475,7 +2508,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small mut" style="margin-top:0">Self-recovery (T-SIM firmware 1.7.1+). The T-SIM normally sleeps until a text rings its modem. If the modem drops off the network while it sleeps, texts can't reach it, so the watchdog also wakes it on a timer. It checks the modem (answers AT, SIM ready, registered, data attached). If that fails it resets the modem's radio (<code>AT+CFUN=0/1</code>), then power-cycles the modem, and goes back to sleep with text wake-up re-armed. A healthy check takes a few seconds. A heartbeat to this dashboard adds about 10–20 s of LTE (a few KB). It never sends texts and never fetches queued console commands.</p>
 <div id="wdinfo"></div><div id="wdev" class="small"></div><div id="wddel" class="small"></div>
 <p class="small mut" id="wdnote" hidden>Needs T-SIM firmware 1.7.1 or newer. Update the T-SIM firmware first. Until then the T-SIM has no timer wake and can't recover by itself.</p>
-<form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (no timer wake)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
+<form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (1.7.2+: every 24 h, it can't be turned off)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
 <label class="tog"><input type="checkbox" name="sms"> On watchdog wakes, also run texts already waiting on the modem (off: they run at the next text or wake)</label>
 <button type="submit" class="g">Save (applied at next wake)</button> <button type="button" id="wdsend">Save &amp; send now (1 text)</button> <span id="wdmsg" class="msg"></span></form></div></section>
@@ -2627,6 +2660,7 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
+  ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],
   ["Last recovery",X&&X.last_recovery?(X.last_recovery.stage==="hard"?"power-cycle":"AT+CFUN reset")+" · "+t(X.last_recovery.at)+" ET":"none"],["Texts waiting on the modem",X&&X.sms_waiting!=null&&X.sms_waiting>=0?X.sms_waiting:null]]);
  const EV=(X&&X.events)||[];$("wdev").innerHTML=EV.length?"<b>Recent recovery attempts</b><ul style='margin:4px 0'>"+EV.map(v=>"<li>"+e(v.stage)+": "+e(v.result)+(v.secs!=null?" ("+e(v.secs)+" s)":"")+(v.at?" · "+e(t(v.at))+" ET":"")+"</li>").join("")+"</ul>":"";
  $("wddel").innerHTML=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':W.pending?"⏳ Saved; waiting for the T-SIM's next wake":"";

@@ -5,6 +5,9 @@
 #include <esp_sleep.h>
 #include <sys/time.h>
 #include <driver/gpio.h>
+#include <esp_timer.h>
+#include "hal/wdt_hal.h"
+#include "soc/rtc.h"
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -71,6 +74,37 @@ static esp_sleep_wakeup_cause_t s_wake_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static bool s_pdp_up = false;
 static bool s_busy_update = false;
 static bool s_tcp_busy = false;  // true while TLS/TCP socket owns the modem AT UART
+
+// v1.7.2 awake deadline: no wake may last forever. Two independent layers:
+//  1. an esp_timer one-shot (runs in the high-priority esp_timer task) that restarts the ESP32;
+//  2. the RTC hardware watchdog (RTC domain, independent of both CPUs and FreeRTOS), 60 s later, as a backstop.
+// Both are re-armed with a longer limit while an update runs, and the RTC WDT is stopped right before deep sleep.
+#define AWAKE_MAX_S        1200    // any wake: restart if still awake after 20 min (normal worst case: ~5 min recovery or a 5 min command batch)
+#define AWAKE_MAX_UPD_S    2700    // while a T-SIM or Heltec update runs: 45 min
+// RTC_NOINIT (not RTC_DATA): RTC_DATA is re-initialised on every boot that isn't a deep-sleep wake, so it can't carry a
+// flag across esp_restart. A magic value marks "the deadline fired"; it is counted in NVS at the next boot.
+#define DL_MAGIC 0xD1EAD172UL
+RTC_NOINIT_ATTR static uint32_t s_dl_hit;
+static esp_timer_handle_t s_dl_timer = nullptr;
+static void dlFire(void *) { s_dl_hit = DL_MAGIC; esp_restart(); }
+static void deadlineArm(uint32_t secs) {
+  if (!s_dl_timer) { esp_timer_create_args_t a = {}; a.callback = dlFire; a.name = "awake_dl"; if (esp_timer_create(&a, &s_dl_timer) != ESP_OK) s_dl_timer = nullptr; }
+  if (s_dl_timer) { esp_timer_stop(s_dl_timer); esp_timer_start_once(s_dl_timer, (uint64_t)secs * 1000000ULL); }
+  wdt_hal_context_t r = {}; wdt_hal_init(&r, WDT_RWDT, 0, false);   // RTC watchdog (hardware, RTC domain)
+  uint64_t ticks = (uint64_t)(secs + 60) * rtc_clk_slow_freq_get_hz();
+  if (ticks > 0xFFFFFFFFULL) ticks = 0xFFFFFFFFULL;
+  wdt_hal_write_protect_disable(&r);
+  wdt_hal_disable(&r);
+  wdt_hal_config_stage(&r, WDT_STAGE0, (uint32_t)ticks, WDT_STAGE_ACTION_RESET_SYSTEM);
+  wdt_hal_feed(&r);
+  wdt_hal_enable(&r);
+  wdt_hal_write_protect_enable(&r);
+}
+static void deadlineStopForSleep() {
+  if (s_dl_timer) esp_timer_stop(s_dl_timer);
+  wdt_hal_context_t r = {}; wdt_hal_init(&r, WDT_RWDT, 0, false);
+  wdt_hal_write_protect_disable(&r); wdt_hal_disable(&r); wdt_hal_write_protect_enable(&r);
+}
 
 
 // v1.4.1: dashboard telemetry queue (JSON bodies), flushed by pendingFlush()
@@ -698,6 +732,7 @@ static bool ingestSend(const char *json) {
 #define CMD_FETCH_MAX      6144   // 1.6.9: up to 40 lines of "<id>\t<cmd>\n" (Worker caps the reply at 6000 bytes)
 #define CMD_MAX_RUN        40     // 1.6.9: was 10
 #define CMD_BUDGET_MS      300000 // stop starting new commands after 5 min of a batch
+#define WD_CMD_BUDGET_MS   120000UL  // v1.7.2 watchdog wake: stop starting new console commands after 2 min
 #define CMD_NOREPLY_STOP   3      // consecutive Heltec no-replies before skipping the rest (asleep / power saving)
 static char s_cli_out[CLI_OUT_MAX];
 static char s_mesh_body[4096];
@@ -853,8 +888,12 @@ static void gpsApplyCfg(const char *args, char *out, size_t cap);
 static void csApplyCfg(const char *args, char *out, size_t cap);
 static void wdApplyCfg(const char *args, char *out, size_t cap);
 static void gpsReport(const char *trigger, char *out, size_t cap);
-static void doConsoleCommands(bool sys_only = false) {
-  static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, sys_only ? "?sys=1" : "");
+static bool doUpdate(const char *url, bool flash_too);
+static void doConsoleCommands(bool sys_only = false, bool wd = false) {
+  // wd (v1.7.2): watchdog wake. "?wd=1" also returns a queued Heltec UPDATE (the Worker keeps those for watchdog
+  // wakes only, since a text wake gets the UPDATE text itself); console commands get a shorter time budget.
+  static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, wd ? "?wd=1" : sys_only ? "?sys=1" : "");
+  const uint32_t budget = wd ? WD_CMD_BUDGET_MS : CMD_BUDGET_MS;
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
   if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return; }
   int ran = 0, noreply = 0; uint32_t b0 = millis();
@@ -871,8 +910,8 @@ static void doConsoleCommands(bool sys_only = false) {
     bool ok = false;
     static char ec[960], ei[40];
     // Over budget, or the Heltec stopped answering: report the rest as skipped so the Worker doesn't wait on them.
-    const char *skip = (millis() - b0 > CMD_BUDGET_MS) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
-    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0 && strncasecmp(cmd, "WDCFG ", 6) != 0) {
+    const char *skip = (millis() - b0 > budget) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
+    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0 && strncasecmp(cmd, "WDCFG ", 6) != 0 && strncasecmp(cmd, "UPDATE ", 7) != 0) {
       jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"%s\"}", FW_VERSION, ei, ec, skip);
       ingestSendBig(s_mesh_body); ran++; continue;
@@ -886,6 +925,16 @@ static void doConsoleCommands(bool sys_only = false) {
       doTsimUpdate(a);  // reboots on success
       ran++;
       continue;
+    }
+    if (clean && strncasecmp(cmd, "UPDATE ", 7) == 0) {  // v1.7.2 queued Heltec update (Worker system command, watchdog wakes)
+      const char *u = cmd + 7; while (*u == ' ') u++;
+      bool okurl = (strncmp(u, "https://", 8) == 0 || strncmp(u, "http://", 7) == 0) && !strchr(u, ' ');
+      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"%s}", FW_VERSION, ei, ec,
+               okurl ? "Heltec update starting (from the queue)" : "", okurl ? "" : ",\"error\":\"bad update URL\"");
+      ingestSendBig(s_mesh_body);
+      if (okurl) { heltecCliEnd(); static char uc[URL_MAX]; strncpy(uc, u, sizeof(uc) - 1); uc[sizeof(uc) - 1] = 0; doUpdate(uc, true); }
+      ran++; continue;
     }
     if (clean && strncasecmp(cmd, "PWRCFG ", 7) == 0) {  // power/calibration config (Worker system command)
       static char po[400]; pwrApplyCfg(cmd + 7, po, sizeof(po));
@@ -1449,6 +1498,7 @@ static bool doTsimUpdate(const char *args) {
   if (!next) { tsimReport("TSIM OTA FAIL: no OTA partition (needs the v1.6.0 partition table via USB)"); return false; }
 
   s_busy_update = true;
+  deadlineArm(AWAKE_MAX_UPD_S);   // v1.7.2: updates get a longer awake limit
   tsimReport("TSIM OTA start: %.150s", url);
   if (!modemWaitNetwork(60000) || !modemOpenData()) { tsimReport("TSIM OTA FAIL: no network"); s_busy_update = false; return false; }
   LittleFS.remove(TSIM_FW_PATH);
@@ -2009,6 +2059,11 @@ static uint32_t s_wd_chk = 0, s_wd_ok = 0, s_wd_soft = 0, s_wd_hard = 0, s_wd_fa
 static char s_wd_ev[320] = "";                    // "rtc,stage,result,secs;..." newest first
 RTC_DATA_ATTR static int64_t s_wd_due = 0;        // rtcNow() when the next check is due (RTC time runs in deep sleep)
 RTC_DATA_ATTR static uint8_t s_wd_fails = 0;      // consecutive failed checks (retry backoff)
+// v1.7.2: watchdog wakes also fetch and run queued dashboard commands (WDCFG cmd=0|1, default on), a full T-SIM
+// restart after WD_RESTART_FAILS failed recoveries in a row, and NVS counters for restarts and awake-deadline resets.
+#define WD_RESTART_FAILS   3
+static bool s_wd_cmd = true;
+static uint32_t s_wd_rst = 0, s_wd_dlx = 0, s_wd_cmdn = 0;
 static void telemRefreshSignal() {
   if (s_tcp_busy) return;
   if (modemAT("AT+CSQ", 3000)) { const char *p = strstr(s_at_resp, "+CSQ:"); int v; if (p && sscanf(p, "+CSQ: %d", &v) == 1) s_sig_csq = v; }
@@ -2092,6 +2147,7 @@ static void doStatusReport(void) {
 // -------------------- UPDATE --------------------
 static bool doUpdate(const char *url, bool flash_too) {
   s_busy_update = true;
+  deadlineArm(AWAKE_MAX_UPD_S);   // v1.7.2: updates get a longer awake limit
   logf("UPDATE: begin flash=%d url_len=%u", (int)flash_too, (unsigned)strlen(url));
   progressf("UPDATE", "rocket", 4, "UPDATE start flash=%d\n%.160s", (int)flash_too, url);
   { char m[220]; snprintf(m, sizeof(m), "%s start: %.180s", flash_too ? "UPDATE" : "TESTDL", url); ingestEvent("update", m); }
@@ -2226,6 +2282,7 @@ static void wdSave() {
   Preferences p; p.begin("tsimwd", false);
   p.putUInt("chk", s_wd_chk); p.putUInt("ok", s_wd_ok); p.putUInt("soft", s_wd_soft); p.putUInt("hard", s_wd_hard); p.putUInt("fail", s_wd_fail);
   p.putBool("pend", s_wd_pend); p.putString("ev", s_wd_ev);
+  p.putUInt("rst", s_wd_rst); p.putUInt("dlx", s_wd_dlx); p.putUInt("cmdn", s_wd_cmdn);
   p.end();
 }
 static void wdLoad() {
@@ -2233,9 +2290,17 @@ static void wdLoad() {
   s_wd_int_min = p.getUInt("int", WD_DEFAULT_MIN); s_wd_hb = p.getBool("hb", true); s_wd_sms = p.getBool("sms", false);
   s_wd_chk = p.getUInt("chk", 0); s_wd_ok = p.getUInt("ok", 0); s_wd_soft = p.getUInt("soft", 0); s_wd_hard = p.getUInt("hard", 0); s_wd_fail = p.getUInt("fail", 0);
   s_wd_pend = p.getBool("pend", false);
+  s_wd_cmd = p.getBool("cmd", true); s_wd_rst = p.getUInt("rst", 0); s_wd_dlx = p.getUInt("dlx", 0); s_wd_cmdn = p.getUInt("cmdn", 0);
+  {  // last wake hit the awake deadline (esp_timer) or a hardware/task watchdog reset
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool hit = s_dl_hit == DL_MAGIC || rr == ESP_RST_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT;
+    s_dl_hit = 0;
+    if (hit) { s_wd_dlx++; p.putUInt("dlx", s_wd_dlx); }
+  }
   String ev = p.getString("ev", ""); strncpy(s_wd_ev, ev.c_str(), sizeof(s_wd_ev) - 1); s_wd_ev[sizeof(s_wd_ev) - 1] = 0;
   p.end();
-  if (s_wd_int_min != 0 && (s_wd_int_min < WD_MIN_MIN || s_wd_int_min > WD_MAX_MIN)) s_wd_int_min = WD_DEFAULT_MIN;
+  if (s_wd_int_min == 0) s_wd_int_min = WD_MAX_MIN;   // v1.7.2: the watchdog can no longer be turned off; 0 = every 24 h
+  if (s_wd_int_min < WD_MIN_MIN || s_wd_int_min > WD_MAX_MIN) s_wd_int_min = WD_DEFAULT_MIN;
 }
 // Newest first, at most 6 entries: "<rtc s>,<stage>,<result>,<secs>"
 static void wdAddEvent(const char *stage, const char *result, uint32_t secs) {
@@ -2252,7 +2317,7 @@ static void wdAddEvent(const char *stage, const char *result, uint32_t secs) {
   logf("WD event: %s %s %us", stage, result, (unsigned)secs);
 }
 static void wdSchedule(bool ok) {
-  if (!s_wd_int_min) { s_wd_due = 0; return; }
+  if (!s_wd_int_min) s_wd_int_min = WD_MAX_MIN;   // v1.7.2: never unscheduled
   int64_t secs = (int64_t)s_wd_int_min * 60;
   if (!ok) {  // retry sooner after a failure: 30, 60, 120 min ... capped at the interval
     int64_t b = 1800LL << (s_wd_fails > 1 ? (s_wd_fails - 1 > 4 ? 4 : s_wd_fails - 1) : 0);
@@ -2260,21 +2325,22 @@ static void wdSchedule(bool ok) {
   }
   s_wd_due = rtcNow() + secs;
 }
-// WDCFG int=<0|30..1440 min> hb=<0|1> sms=<0|1>  (system command from the Worker)
+// WDCFG int=<30..1440 min, 0 = 1440> hb=<0|1> sms=<0|1> cmd=<0|1>  (system command from the Worker; cmd since 1.7.2)
 static void wdApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimwd", false);
   char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
   char *save = nullptr; int n = 0; bool rej = false;
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
-    if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m == 0 || (m >= WD_MIN_MIN && m <= WD_MAX_MIN)) { s_wd_int_min = m; p.putUInt("int", m); n++; } else rej = true; }
+    if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m == 0) m = WD_MAX_MIN; if (m >= WD_MIN_MIN && m <= WD_MAX_MIN) { s_wd_int_min = m; p.putUInt("int", m); n++; } else rej = true; }
     else if (!strcmp(k, "hb")) { s_wd_hb = atoi(v) != 0; p.putBool("hb", s_wd_hb); n++; }
     else if (!strcmp(k, "sms")) { s_wd_sms = atoi(v) != 0; p.putBool("sms", s_wd_sms); n++; }
+    else if (!strcmp(k, "cmd")) { s_wd_cmd = atoi(v) != 0; p.putBool("cmd", s_wd_cmd); n++; }
   }
   p.end();
   s_wd_fails = 0; wdSchedule(true);
-  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d", n, rej ? " (interval REJECTED: 0 or 30-1440 min)" : "",
-           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms);
+  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d", n, rej ? " (interval REJECTED: 30-1440 min; 0 = 1440)" : "",
+           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd);
   logf("%s", out);
 }
 static int wdRegStat(const char *tag) {
@@ -2333,9 +2399,9 @@ static int wdSmsStored() {
 }
 static size_t wdJson(char *dst, size_t cap) {
   int64_t now = rtcNow(), nx = s_wd_due > 0 ? s_wd_due - now : -1;
-  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"ev\":[",
+  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"ev\":[",
     (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (unsigned)s_wd_chk, (unsigned)s_wd_ok, (unsigned)s_wd_soft, (unsigned)s_wd_hard,
-    (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx);
+    (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx, (int)s_wd_cmd, (unsigned)s_wd_cmdn, (unsigned)s_wd_rst, (unsigned)s_wd_dlx);
   const char *q = s_wd_ev; bool first = true;
   while (*q && o < cap) {
     long long rtc = 0; char st[12] = "", rs[12] = ""; unsigned secs = 0;
@@ -2405,9 +2471,23 @@ static bool wdRun() {
   if (ok) { if (strcmp(stage, "ok") == 0) s_wd_ok++; s_wd_fails = 0; }
   else if (strcmp(stage, "lowbat") != 0) { s_wd_fail++; if (s_wd_fails < 255) s_wd_fails++; s_wd_pend = true; if (!hard_tried) wdAddEvent("check", "fail", (millis() - t0) / 1000); }
   wdSchedule(ok || strcmp(stage, "lowbat") == 0);
+  // v1.7.2: recovery keeps failing -> restart the whole T-SIM (fresh boot path: full modem power-on, SIM and network
+  // wait). Once every WD_RESTART_FAILS failures in a row, so a dead network can't cause a restart loop.
+  if (!ok && strcmp(stage, "lowbat") != 0 && s_wd_fails >= WD_RESTART_FAILS && s_wd_fails % WD_RESTART_FAILS == 0) {
+    s_wd_rst++; wdAddEvent("restart", "esp", (millis() - t0) / 1000); wdSave();
+    logf("WD: %u failed recoveries in a row -> T-SIM restart (#%u)", (unsigned)s_wd_fails, (unsigned)s_wd_rst);
+    Serial.flush(); delay(200);
+    esp_restart();
+  }
   wdSave();
   logf("WD: done stage=%s ok=%d in %lus, next check in %lld s", stage, (int)ok, (unsigned long)((millis() - t0) / 1000), (long long)(s_wd_due - rtcNow()));
   if (ok && s_wd_sms) processSmsInbox();   // optional (default off): run texts already stored on the modem
+  // v1.7.2: fetch and run queued dashboard commands (console, system commands, TSIMUPDATE, queued Heltec UPDATE), so
+  // they get through even when texts don't. One fetch per wake, no retry; skipped on low battery.
+  if (ok && !lowbat && s_wd_cmd) {
+    s_wd_cmdn++; wdSave();
+    doConsoleCommands(false, true);
+  }
   return ok;
 }
 
@@ -2624,12 +2704,15 @@ static uint64_t sleepTimerSecs() {
   if (s_lb_en) take((int64_t)s_lb_int_min * 60);
   if (s_gnss_on) take(s_gnss_off_at - rtcNow());
   if (s_wd_int_min) { if (s_wd_due <= 0) wdSchedule(true); take(s_wd_due - rtcNow()); }
-  return best < 0 ? 0 : (uint64_t)best;
+  if (best < 0 || best > (int64_t)WD_MAX_MIN * 60) best = (int64_t)WD_MAX_MIN * 60;   // v1.7.2: there is ALWAYS a timer (<= 24 h)
+  return (uint64_t)best;
 }
 static void armWakeups() {
   s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
   uint64_t secs = sleepTimerSecs();
-  if (secs) esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
+  if (!secs) secs = (uint64_t)WD_MAX_MIN * 60;
+  esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
+  deadlineStopForSleep();
   logf("sleep: SMS ring wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed",
        (unsigned long long)secs, s_lb_en ? "on" : "off", s_gnss_on ? "warm" : "off", s_wd_int_min ? "on" : "off");
 }
@@ -2710,7 +2793,7 @@ static void interactiveWindow(uint32_t window_ms) {
       if (c == '\n') {
         s_usb_line[s_usb_len] = 0;
         if (strcasecmp(s_usb_line, "STAY") == 0) {
-          deadline = millis() + window_ms; next_countdown = millis();
+          deadline = millis() + window_ms; next_countdown = millis(); deadlineArm(AWAKE_MAX_S);
           logf("STAY: +%us", (unsigned)(window_ms/1000));
         } else if (strcasecmp(s_usb_line, "SLEEP") == 0) { goToSleep(); return; }
         else handleUsbLine(s_usb_line);
@@ -2731,6 +2814,7 @@ static void interactiveWindow(uint32_t window_ms) {
 }
 
 void setup() {
+  deadlineArm(AWAKE_MAX_S);   // v1.7.2: first thing, so nothing after this can keep the T-SIM awake forever
   Serial.begin(115200);
   delay(800);
   s_wake_cause = esp_sleep_get_wakeup_cause();

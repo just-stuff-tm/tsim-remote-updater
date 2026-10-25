@@ -1293,3 +1293,44 @@ console.log("serial.ondemand tests OK");
   for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
   console.log("v1.7.1 watchdog tests OK");
 }
+
+// ---------- v1.7.2: watchdog-wake command fetch (?wd=1), watchdog-only Heltec UPDATE backup, new heartbeat counters ----------
+{
+  const M = await import("../src/index.js");
+  const K = { "X-Device-Key": created.ingest_key }, holo0 = holo;
+  const fetchCmds = async (q = "") => (await (await call("/api/dev/tsim-1/commands" + q, { headers: K })).text());
+  const setFw = (fw) => { const l = JSON.parse(kv.get("telem:tsim-1:latest") || "{}"); l.fw = fw; kv.set("telem:tsim-1:latest", JSON.stringify(l)); };
+  const L = () => JSON.parse(kv.get("cmds:tsim-1") || "[]");
+  // helpers
+  let list = [{ id: "old1", cmd: "UPDATE https://x/a.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() }];
+  const e1 = M.queueWdUpdate(list, "https://x/b.bin", undefined, () => "new1");
+  assert.equal(list[0], e1); assert.equal(e1.cmd, "UPDATE https://x/b.bin"); assert.equal(list[1].status, "cancelled", "older backup replaced");
+  assert.equal(M.wdOnlyOk(e1, false, "tsim-updater 1.7.2"), false); assert.equal(M.wdOnlyOk(e1, true, "tsim-updater 1.7.1"), false);
+  assert.equal(M.wdOnlyOk(e1, true, "tsim-updater 1.7.2"), true); assert.equal(M.wdOnlyOk({ cmd: "ver" }, false, "x"), true);
+  const stale = [{ id: "s", cmd: "UPDATE u", wdonly: true, status: "queued", queued_at: new Date(Date.now() - 25 * 3600e3).toISOString() }];
+  assert.equal(M.expireWdOnly(stale), 1); assert.equal(stale[0].status, "cancelled");
+  assert.equal(M.isSysCmd("UPDATE https://x"), false, "console history logic unchanged");
+  // served only on watchdog fetches from 1.7.2+
+  setFw("tsim-updater 1.7.2");
+  const keep = L().filter((c) => c.status !== "queued");
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu1", cmd: "UPDATE https://x/c.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() }, ...keep]));
+  assert.equal(await fetchCmds(), "", "normal (text-wake) fetch never gets the backup UPDATE");
+  assert.equal(await fetchCmds("?sys=1"), "");
+  setFw("tsim-updater 1.7.1"); assert.equal(await fetchCmds("?wd=1"), "", "1.7.1 never gets it");
+  setFw("tsim-updater 1.7.2"); assert.equal(await fetchCmds("?wd=1"), "wdu1\tUPDATE https://x/c.bin\n");
+  assert.equal(L().find((c) => c.id === "wdu1").status, "sent");
+  // the text path started the update: the queued backup is cancelled
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu2", cmd: "UPDATE https://x/d.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() }, ...keep]));
+  assert.equal((await ing({ type: "update", fw: "tsim-updater 1.7.2", msg: "UPDATE start: https://x/d.bin" })).status, 200);
+  assert.equal(L().find((c) => c.id === "wdu2").status, "cancelled"); assert.equal(await fetchCmds("?wd=1"), "");
+  // expired backups are dropped on the next fetch
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu3", cmd: "UPDATE https://x/e.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date(Date.now() - 25 * 3600e3).toISOString() }, ...keep]));
+  assert.equal(await fetchCmds("?wd=1"), ""); assert.equal(L().find((c) => c.id === "wdu3").status, "cancelled");
+  // heartbeat counters
+  const hb = M.parseHeartbeat({ stage: "ok", wd: { int: 180, hb: 1, sms: 0, chk: 9, ok: 9, soft: 0, hard: 0, fail: 0, fails: 0, next: 100, cmd: 1, cmdn: 4, rst: 2, dlx: 1, ev: [] } });
+  assert.equal(hb.cmd, true); assert.equal(hb.cmd_fetches, 4); assert.equal(hb.restarts, 2); assert.equal(hb.deadline_resets, 1);
+  const hb0 = M.parseHeartbeat({ stage: "ok", wd: { int: 180 } }); assert.equal(hb0.cmd, null); assert.equal(hb0.restarts, null);
+  assert.equal(M.wdCfgCmd(M.DEFAULT_WD), "WDCFG int=180 hb=1 sms=0", "WDCFG unchanged (device defaults cmd=1)");
+  assert.equal(holo, holo0, "nothing texted");
+  console.log("v1.7.2 watchdog command-fetch tests OK");
+}
