@@ -531,6 +531,11 @@ async function handleIngest(request, env, id) {
     const prev0 = (await kvJson(env, `telem:${id}:latest`)) || {};
     await putJson(env, `telem:${id}:latest`, { ...prev0, ...tlf, tl_at: entry.received_at, received_at: entry.received_at });
   }
+  const hrp = hrpInfo(t.tl, entry.received_at);  // v1.7.4: Heltec reboots the T-SIM couldn't report when they happened
+  if (hrp) {
+    const live = t.type === "heartbeat" && t.reason === "heltec-reboot", late = live ? hrp.n - 1 : hrp.n;
+    if (late > 0) await logActivity(env, id, { type: "event", msg: `Heltec reboot detected earlier, reported late (LTE was down): ${late} reboot${late > 1 ? "s" : ""}${!live && hrp.src ? ", last " + HRP_SRC[hrp.src] : ""}${!live && hrp.at ? " at " + hrp.at.slice(11, 16) + " UTC" : ""}` });
+  }
   if (t.type === "cfgsnap") {
     const items = Array.isArray(t.items) ? t.items.slice(0, 60) : [];
     const cv = (await kvJson(env, `rptcfg:${id}`)) || {}, L = (await kvJson(env, `rptlist:${id}`)) || {};
@@ -583,7 +588,11 @@ async function handleIngest(request, env, id) {
     await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at, ...(t.fw ? { fw: String(t.fw).slice(0, 60) } : {}) });
     if (hb.stage !== "ok" || (prevWd.fails > 0) || hb.reason) {  // routine OK check-ins stay out of the activity log
       const ev = hb.events.filter((e) => e.stage !== "check" || e.result !== "ok").slice(0, 3).map((e) => `${e.stage} ${e.result}${e.at ? " " + e.at.slice(11, 16) + " UTC" : ""}`).join(", ");
-      await logActivity(env, id, { type: "event", msg: `${hb.reason === "heltec-reboot" ? "Heltec reboot detected → " : ""}Watchdog: ${hb.stage === "soft" ? "modem recovered (AT+CFUN reset)" : hb.stage === "hard" ? "modem recovered (power-cycle)" : hb.stage === "lowbat" ? "low battery, recovery skipped" : "check OK after earlier failures"}${ev ? " · recent: " + ev : ""}${hb.sms_waiting > 0 ? ` · ${hb.sms_waiting} text(s) stored on the modem` : ""}` });
+      if (hb.reason === "heltec-reboot" && hb.src === "console") {  // v1.7.4: reboot sent from the dashboard console, no modem recovery
+        await logActivity(env, id, { type: "event", msg: "Heltec reboot detected (console): the repeater restarted after the console reboot command · modem recovery skipped" });
+        return json({ ok: true });
+      }
+      await logActivity(env, id, { type: "event", msg: `${hb.reason === "heltec-reboot" ? `Heltec reboot detected${hb.src === "awake" ? " (while the T-SIM was awake)" : ""} → ` : ""}Watchdog: ${hb.stage === "soft" ? "modem recovered (AT+CFUN reset)" : hb.stage === "hard" ? "modem recovered (power-cycle)" : hb.stage === "lowbat" ? "low battery, recovery skipped" : "check OK after earlier failures"}${ev ? " · recent: " + ev : ""}${hb.sms_waiting > 0 ? ` · ${hb.sms_waiting} text(s) stored on the modem` : ""}` });
     }
     return json({ ok: true });
   }
@@ -1016,7 +1025,7 @@ export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
   return { at: receivedAt, stage: S(t && t.stage) || "ok", sms_waiting: n(t && t.sms_waiting), int_min: n(w.int), hb: w.hb === 1 || w.hb === true, sms: w.sms === 1 || w.sms === true,
     checks: n(w.chk), ok: n(w.ok), soft: n(w.soft), hard: n(w.hard), fail: n(w.fail), fails: n(w.fails),
     cmd: w.cmd === undefined ? null : w.cmd === 1 || w.cmd === true, cmd_fetches: n(w.cmdn), restarts: n(w.rst), deadline_resets: n(w.dlx),
-    hwake: n(w.hwk), hw_wakes: n(w.hwn), hw_ignored: n(w.hwi), hw_skipped: n(w.hws), reason: String((t && t.reason) ?? "").replace(/[^a-z0-9-]/gi, "").slice(0, 24) || null,
+    hwake: n(w.hwk), hw_wakes: n(w.hwn), hw_ignored: n(w.hwi), hw_skipped: n(w.hws), hw_awake: n(w.hwa), src: ["wake", "awake", "console"].includes(t && t.src) ? t.src : null, reason: String((t && t.reason) ?? "").replace(/[^a-z0-9-]/gi, "").slice(0, 24) || null,
     next_at: n(w.next) != null && w.next >= 0 ? new Date(rt + w.next * 1000).toISOString() : null, events };
 }
 // Expected check-in interval and offline state. Uses what the T-SIM reports it runs (tl.wdi / heartbeat), not just the
@@ -1035,6 +1044,14 @@ export function checkinInfo(latest = {}, wd = null, wdcfg = null, scheduleHours 
 }
 export const cacheCmd = (c, now) => `CFGSNAP en=${c.en ? 1 : 0} int=${c.int_h}${now ? " now=1" : ""}`;
 // "tl" telemetry block on every post -> fields of the latest T-SIM report
+const HRP_SRC = { wake: "woke the T-SIM (GPIO6)", awake: "while the T-SIM was awake", console: "after a console reboot" };
+// v1.7.4 "tl" pending reboot report: hrp = count, hrpa = seconds ago (-1 unknown), hrps = source
+export function hrpInfo(tl, receivedAt = new Date().toISOString()) {
+  if (!tl || typeof tl !== "object" || typeof tl.hrp !== "number" || !(tl.hrp > 0)) return null;
+  const a = tl.hrpa, rt = Date.parse(receivedAt);
+  return { n: Math.min(Math.floor(tl.hrp), 999), at: typeof a === "number" && a >= 0 && Number.isFinite(rt) ? new Date(rt - a * 1000).toISOString() : null,
+    src: Object.prototype.hasOwnProperty.call(HRP_SRC, tl.hrps) ? tl.hrps : null };
+}
 export function tlFields(tl) {
   if (!tl || typeof tl !== "object") return {};
   const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined), o = {};
@@ -2516,7 +2533,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (1.7.2+: every 24 h, it can't be turned off)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
 <label class="tog"><input type="checkbox" name="sms"> On watchdog wakes, also run texts already waiting on the modem (off: they run at the next text or wake)</label>
-<label class="tog"><input type="checkbox" name="hwake"> Heltec reboot wake (T-SIM 1.7.3+, needs the optional GPIO6 wire): when the Heltec reboots, wake the T-SIM and reset its modem. Turns itself off after repeated false wakes; tick again to re-enable</label>
+<label class="tog"><input type="checkbox" name="hwake"> Heltec reboot wake (T-SIM 1.7.3+, needs the optional GPIO6 wire): when the Heltec reboots, wake the T-SIM and reset its modem (1.7.4+ also notices a reboot while the T-SIM is awake, over the serial link). Turns itself off after repeated false wakes; tick again to re-enable</label>
 <button type="submit" class="g">Save (applied at next wake)</button> <button type="button" id="wdsend">Save &amp; send now (1 text)</button> <span id="wdmsg" class="msg"></span></form></div></section>
 <section><h2>Location <small class="mut small" id="gpsat"></small></h2><div class="card">
 <div class="acts" style="margin-top:0"><button type="button" id="gpsbtn" data-mode="get">Get location</button></div>
@@ -2666,7 +2683,7 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
-  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+" · ignored "+(X.hw_ignored??"?")+" · not armed "+(X.hw_skipped??"?"):null],
+  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+" · not armed "+(X.hw_skipped??"?"):null],
   ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],
   ["Last recovery",X&&X.last_recovery?(X.last_recovery.stage==="hard"?"power-cycle":"AT+CFUN reset")+" · "+t(X.last_recovery.at)+" ET":"none"],["Texts waiting on the modem",X&&X.sms_waiting!=null&&X.sms_waiting>=0?X.sms_waiting:null]]);
  const EV=(X&&X.events)||[];$("wdev").innerHTML=EV.length?"<b>Recent recovery attempts</b><ul style='margin:4px 0'>"+EV.map(v=>"<li>"+e(v.stage)+": "+e(v.result)+(v.secs!=null?" ("+e(v.secs)+" s)":"")+(v.at?" · "+e(t(v.at))+" ET":"")+"</li>").join("")+"</ul>":"";

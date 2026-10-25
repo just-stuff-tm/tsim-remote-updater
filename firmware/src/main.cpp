@@ -212,6 +212,7 @@ static void heltecPinsRelease() {
 }
 
 static int64_t rtcNow();
+RTC_DATA_ATTR static int64_t s_hw_cons = 0;  // v1.7.4: rtcNow() when the T-SIM last relayed a console "reboot" to the Heltec
 RTC_DATA_ATTR static int64_t s_hw_own = 0;   // v1.7.3: rtcNow() when the T-SIM itself last reset the Heltec (its boot log isn't a "reboot")
 static void heltecReboot() {
   s_hw_own = rtcNow();
@@ -721,9 +722,11 @@ static bool ingestSendRaw(const char *json) {
   logf("ingest: modem HTTPS failed, trying ESP32 TLS");
   return ingestPostTls(json);
 }
+static void hrpAfterPost(bool ok);   // v1.7.4 pending Heltec-reboot report (defined with the watchdog)
 static bool ingestSend(const char *json) {
   bool ok = ingestSendRaw(json);
   if (ok) markOtaValidIfPending("ingest accepted");
+  hrpAfterPost(ok);
   return ok;
 }
 
@@ -743,27 +746,79 @@ static char s_mesh_body[4096];
 static char s_cmd_list[CMD_FETCH_MAX];
 static bool s_heltec_uart_on = false;
 
+// v1.7.4 Heltec reboot detection while the T-SIM is awake. The Heltec UART (115200, the same baud as the ESP32-S3 ROM
+// boot banner) stays open for the whole wake and every received byte goes through a line matcher looking for boot-only
+// output: the ROM banner ("ESP-ROM:esp32...", "rst:0x.. ,boot:0x..") and stock MeshCore's "Repeater ID: <hex key>".
+// Normal CLI replies never contain these; the echo of a command the T-SIM itself typed is skipped. GPIO6 is not used
+// while awake: it pulses on every CLI reply. A hit only sets a flag; hwAwakeService() handles it at a safe point.
+#define HM_RXBUF        4096
+#define HM_SAME_BOOT_MS 20000   // further markers within 20 s belong to the same boot
+static bool s_hm_on = false;                 // monitor mode: keep the UART open between CLI commands
+static const char *s_hm_echo = nullptr;      // command being typed by heltecCli (its echo is not a boot line)
+static char s_hm_line[128]; static size_t s_hm_len = 0;
+static uint32_t s_hm_hit_ms = 0; static bool s_hm_hit_any = false;
+static volatile bool s_hwa_flag = false; static const char *s_hwa_mark = "";
+static uint32_t s_hm_hits = 0;
+static bool hmHex(const char *p, int n) { for (int i = 0; i < n; i++) if (!isxdigit((unsigned char)p[i])) return false; return true; }
+static void heltecMonLine(const char *l) {
+  if (s_hm_echo && s_hm_echo[0] && strstr(l, s_hm_echo)) return;
+  const char *m = nullptr, *q;
+  if (strstr(l, "ESP-ROM:esp32")) m = "rom";
+  else if ((q = strstr(l, "rst:0x")) && strstr(q, ",boot:0x")) m = "rst";
+  else if ((q = strstr(l, "Repeater ID: ")) && strlen(q) >= 13 + 32 && hmHex(q + 13, 32)) m = "id";
+  if (!m) return;
+  s_hm_hits++;
+  if (s_hm_hit_any && millis() - s_hm_hit_ms < HM_SAME_BOOT_MS) { s_hm_hit_ms = millis(); return; }
+  s_hm_hit_any = true; s_hm_hit_ms = millis();
+  s_hwa_mark = m; s_hwa_flag = true;
+  logf("Heltec boot output seen while awake (%s)", m);
+}
+static void heltecMonFeed(int c) {
+  if (c == '\n' || c == '\r') { if (s_hm_len) { s_hm_line[s_hm_len] = 0; heltecMonLine(s_hm_line); } s_hm_len = 0; return; }
+  if (c < 0x20 || c > 0x7e) return;   // line noise / binary
+  if (s_hm_len + 1 >= sizeof(s_hm_line)) { memmove(s_hm_line, s_hm_line + 64, s_hm_len - 64); s_hm_len -= 64; }  // keep the tail
+  s_hm_line[s_hm_len++] = (char)c;
+}
+static void heltecMonPoll() {
+  if (!s_heltec_uart_on || s_busy_update) return;
+  while (HeltecSerial.available()) { int c = HeltecSerial.read(); if (c < 0) break; heltecMonFeed(c); }
+}
+
 static void heltecCliBegin() {
   if (s_heltec_uart_on) return;
   pinMode(HELTEC_BOOT_PIN, INPUT);  // never hold BOOT low here
+  HeltecSerial.setRxBufferSize(HM_RXBUF);   // v1.7.4: a whole boot log fits while the T-SIM is busy elsewhere
   HeltecSerial.begin(115200, SERIAL_8N1, HELTEC_UART_RX_PIN, HELTEC_UART_TX_PIN);
   s_heltec_uart_on = true;
   delay(30);
 }
 static void heltecCliEnd() {
   if (!s_heltec_uart_on) return;
+  if (s_hm_on) { heltecMonPoll(); return; }   // v1.7.4 monitor mode: stay open until sleep
   HeltecSerial.flush();
   HeltecSerial.end();
   s_heltec_uart_on = false;
   heltecPinsRelease();
+}
+static void heltecMonStart() {
+  if (s_busy_update) return;
+  heltecCliBegin(); s_hm_on = true; s_hm_len = 0;
+  while (HeltecSerial.available()) HeltecSerial.read();   // whatever was latched before the UART opened
+}
+static void heltecMonStop() {
+  if (s_hm_on) { heltecMonPoll(); s_hm_on = false; }
+  heltecCliEnd();
 }
 
 // Runs one CLI command; returns true when a "->" reply was seen. out = reply text (prefix kept for the Worker).
 static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_ms = CLI_TIMEOUT_MS) {
   heltecCliBegin();
   // Wake a power-saving Heltec and flush any half-typed line: a bare CR is an empty command.
+  heltecMonPoll();   // v1.7.4: anything unread goes through the boot matcher first
+  if (!strcasecmp(cmd, "reboot")) s_hw_cons = rtcNow();   // v1.7.4: a reboot that follows is the console's own
+  s_hm_echo = cmd;
   HeltecSerial.print("\r"); delay(120); HeltecSerial.print("\r"); delay(150);
-  while (HeltecSerial.available()) HeltecSerial.read();
+  heltecMonPoll();
   HeltecSerial.print(cmd);
   HeltecSerial.print("\r");
   size_t n = 0; out[0] = 0;
@@ -773,6 +828,7 @@ static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_m
     while (HeltecSerial.available()) {
       int c = HeltecSerial.read();
       if (c < 0) break;
+      heltecMonFeed(c);
       if (n + 1 < cap) { out[n++] = (char)c; out[n] = 0; }
       last = millis();
     }
@@ -782,6 +838,8 @@ static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_m
     if (!reply && millis() - last > 700) { const char *nl = strchr(out, '\n'); if (nl && strlen(nl + 1) > 2) break; }
     delay(5);
   }
+  if (s_hm_len) { s_hm_line[s_hm_len] = 0; heltecMonLine(s_hm_line); s_hm_len = 0; }   // last partial line, echo still known
+  s_hm_echo = nullptr;
   // Drop the echoed command line (everything up to the reply marker), keep "  -> ..." onwards.
   char *p = strstr(out, "  -> ");
   if (!p) p = strstr(out, "-> ");
@@ -2079,6 +2137,20 @@ static bool s_hw_en = true, s_hw_auto = false;
 static uint32_t s_hw_n = 0, s_hw_ign = 0, s_hw_skip = 0, s_hw_spur = 0, s_hw_dayn = 0;
 static int64_t s_hw_last = 0, s_hw_day0 = 0;
 static const char *s_wd_reason = nullptr;   // set for a heartbeat that isn't a routine timer check
+// v1.7.4: awake detections (serial boot output), and the pending report: reboots detected but not yet delivered to the
+// dashboard (LTE down / post failed). Kept in NVS (survives deep sleep and power loss); sent in the "tl" block of the
+// next successful post of any kind, then cleared.
+static uint32_t s_hw_aw = 0;
+static uint32_t s_hrp_n = 0, s_hrp_sent = 0; static int64_t s_hrp_t = 0; static char s_hrp_src[8] = "";
+static const char *s_wd_src = nullptr;      // heartbeat "src": wake | awake | console
+static void hrpSave() { Preferences p; p.begin("tsimwd", false); p.putUInt("hrpn", s_hrp_n); p.putLong64("hrpt", s_hrp_t); p.putString("hrps", s_hrp_src); p.end(); }
+static void hrpAdd(const char *src) {
+  s_hrp_n++; s_hrp_t = rtcNow(); strncpy(s_hrp_src, src, sizeof(s_hrp_src) - 1); s_hrp_src[sizeof(s_hrp_src) - 1] = 0; hrpSave();
+}
+static void hrpAfterPost(bool ok) {
+  if (ok && s_hrp_sent) { s_hrp_n = s_hrp_n > s_hrp_sent ? s_hrp_n - s_hrp_sent : 0; hrpSave(); logf("Heltec reboot report delivered (%u pending)", (unsigned)s_hrp_n); }
+  s_hrp_sent = 0;
+}
 static void telemRefreshSignal() {
   if (s_tcp_busy) return;
   if (modemAT("AT+CSQ", 3000)) { const char *p = strstr(s_at_resp, "+CSQ:"); int v; if (p && sscanf(p, "+CSQ: %d", &v) == 1) s_sig_csq = v; }
@@ -2093,7 +2165,14 @@ static size_t telemJson(char *out, size_t cap) {
     (unsigned)s_wd_int_min, (unsigned)s_wd_chk, (unsigned)s_wd_soft, (unsigned)s_wd_hard, (unsigned)s_wd_fail);  // v1.7.1
   if (o < cap && now > 1700000000LL) o += snprintf(out + o, cap - o, ",\"ts\":%lld", (long long)now);
   if (o < cap && s_gc_at > 0) o += snprintf(out + o, cap - o, ",\"glat\":%.6f,\"glon\":%.6f,\"gsats\":%d,\"gat\":%lld", s_gc_lat, s_gc_lon, s_gc_sats, (long long)s_gc_at);
+  s_hrp_sent = 0;
+  if (o < cap && s_hrp_n) {  // v1.7.4 pending Heltec-reboot report: count, seconds ago (-1 = before a cold boot), source
+    long long ago = s_hrp_t > 0 && s_hrp_t <= now ? (long long)(now - s_hrp_t) : -1;
+    o += snprintf(out + o, cap - o, ",\"hrp\":%u,\"hrpa\":%lld,\"hrps\":\"%s\"", (unsigned)s_hrp_n, ago, s_hrp_src);
+    s_hrp_sent = s_hrp_n;
+  }
   if (o < cap) o += snprintf(out + o, cap - o, "}");
+  if (o >= cap) s_hrp_sent = 0;
   return o < cap ? o : 0;
 }
 static void doStatusReport(void) {
@@ -2161,6 +2240,7 @@ static void doStatusReport(void) {
 
 // -------------------- UPDATE --------------------
 static bool doUpdate(const char *url, bool flash_too) {
+  heltecMonStop();   // v1.7.4: the flasher owns the Heltec UART (it resets the Heltec itself)
   s_busy_update = true;
   deadlineArm(AWAKE_MAX_UPD_S);   // v1.7.2: updates get a longer awake limit
   logf("UPDATE: begin flash=%d url_len=%u", (int)flash_too, (unsigned)strlen(url));
@@ -2300,6 +2380,7 @@ static void wdSave() {
   p.putUInt("rst", s_wd_rst); p.putUInt("dlx", s_wd_dlx); p.putUInt("cmdn", s_wd_cmdn);
   p.putBool("hwake", s_hw_en); p.putBool("hwauto", s_hw_auto); p.putUInt("hwn", s_hw_n); p.putUInt("hwi", s_hw_ign); p.putUInt("hws", s_hw_skip);
   p.putUInt("hwsp", s_hw_spur); p.putUInt("hwdn", s_hw_dayn); p.putLong64("hwl", s_hw_last); p.putLong64("hwd0", s_hw_day0);
+  p.putUInt("hwa", s_hw_aw);
   p.end();
 }
 static void wdLoad() {
@@ -2309,6 +2390,8 @@ static void wdLoad() {
   s_wd_pend = p.getBool("pend", false);
   s_hw_en = p.getBool("hwake", true); s_hw_auto = p.getBool("hwauto", false); s_hw_n = p.getUInt("hwn", 0); s_hw_ign = p.getUInt("hwi", 0);
   s_hw_skip = p.getUInt("hws", 0); s_hw_spur = p.getUInt("hwsp", 0); s_hw_dayn = p.getUInt("hwdn", 0); s_hw_last = p.getLong64("hwl", 0); s_hw_day0 = p.getLong64("hwd0", 0);
+  s_hw_aw = p.getUInt("hwa", 0); s_hrp_n = p.getUInt("hrpn", 0); s_hrp_t = p.getLong64("hrpt", 0);
+  { String hs = p.getString("hrps", ""); strncpy(s_hrp_src, hs.c_str(), sizeof(s_hrp_src) - 1); s_hrp_src[sizeof(s_hrp_src) - 1] = 0; }
   s_wd_cmd = p.getBool("cmd", true); s_wd_rst = p.getUInt("rst", 0); s_wd_dlx = p.getUInt("dlx", 0); s_wd_cmdn = p.getUInt("cmdn", 0);
   {  // last wake hit the awake deadline (esp_timer) or a hardware/task watchdog reset
     esp_reset_reason_t rr = esp_reset_reason();
@@ -2419,10 +2502,10 @@ static int wdSmsStored() {
 }
 static size_t wdJson(char *dst, size_t cap) {
   int64_t now = rtcNow(), nx = s_wd_due > 0 ? s_wd_due - now : -1;
-  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"hwk\":%d,\"hwn\":%u,\"hwi\":%u,\"hws\":%u,\"ev\":[",
+  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"hwk\":%d,\"hwn\":%u,\"hwi\":%u,\"hws\":%u,\"hwa\":%u,\"ev\":[",
     (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (unsigned)s_wd_chk, (unsigned)s_wd_ok, (unsigned)s_wd_soft, (unsigned)s_wd_hard,
     (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx, (int)s_wd_cmd, (unsigned)s_wd_cmdn, (unsigned)s_wd_rst, (unsigned)s_wd_dlx,
-    s_hw_auto ? 2 : (int)s_hw_en, (unsigned)s_hw_n, (unsigned)s_hw_ign, (unsigned)s_hw_skip);
+    s_hw_auto ? 2 : (int)s_hw_en, (unsigned)s_hw_n, (unsigned)s_hw_ign, (unsigned)s_hw_skip, (unsigned)s_hw_aw);
   const char *q = s_wd_ev; bool first = true;
   while (*q && o < cap) {
     long long rtc = 0; char st[12] = "", rs[12] = ""; unsigned secs = 0;
@@ -2442,6 +2525,7 @@ static bool wdHeartbeat(const char *stage, int sms) {
   size_t o = snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"fw\":\"%s\",\"stage\":\"%s\",\"sms_waiting\":%d,\"msg\":\"Watchdog check: %s%s\"%s%s%s",
                       FW_VERSION, stage, sms, stage, s_wd_reason ? " (Heltec reboot detected)" : "",
                       s_wd_reason ? ",\"reason\":\"" : "", s_wd_reason ? s_wd_reason : "", s_wd_reason ? "\"" : "");
+  if (s_wd_reason && s_wd_src) o += snprintf(hb + o, sizeof(hb) - o, ",\"src\":\"%s\"", s_wd_src);   // v1.7.4
   o += wdJson(hb + o, sizeof(hb) - o - 2);
   snprintf(hb + o, sizeof(hb) - o, "}");
   return ingestSend(hb);
@@ -2459,6 +2543,7 @@ static bool wdRun(bool force = false) {
   bool at = wdProbe(5);
   if (at) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
   bool ok = at && wdHealthy(5000, 20000);
+  if (s_hrp_n) s_wd_pend = true;   // v1.7.4: an undelivered Heltec-reboot report goes out with this heartbeat
   if (force) { logf("WD: forced recovery (check said healthy=%d)", (int)ok); ok = false; s_wd_pend = true; }
   bool lowbat = s_bat_idle >= 2.5f && s_bat_idle < WD_LOWBAT_V;
   const char *stage = "ok"; bool hard_tried = false;
@@ -2514,6 +2599,58 @@ static bool wdRun(bool force = false) {
     doConsoleCommands(false, true);
   }
   return ok;
+}
+
+// v1.7.4: after a detected Heltec reboot, wait (bounded) for the modem to be registered with data and deliver the
+// heartbeat. If it still can't go out, the report stays pending in NVS and rides on the next successful post.
+#define HRP_RETRY_MS 120000UL
+static void hwReportRetry() {
+  if (!s_hrp_n) return;
+  uint32_t t0 = millis();
+  while (s_hrp_n && millis() - t0 < HRP_RETRY_MS) {
+    if (wdRegistered() && (s_pdp_up || modemOpenData()) && wdHeartbeat("ok", -1)) break;
+    s_pdp_up = false; delay(5000);
+  }
+  logf(s_hrp_n ? "Heltec reboot report still pending (%u), sent with the next check-in" : "Heltec reboot report delivered", (unsigned)s_hrp_n);
+}
+// Accepted Heltec reboot (both paths): count, persist the pending report, then recover or (console) just report.
+static void hwHandleReboot(const char *src, bool console) {
+  s_hw_n++; s_hw_dayn++; s_hw_last = rtcNow(); s_hw_spur = 0;
+  if (strcmp(src, "wake")) s_hw_aw++;
+  wdAddEvent("heltec", console ? "console" : "reboot", 0);
+  hrpAdd(console ? "console" : src); wdSave();
+  gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+  s_wd_reason = "heltec-reboot"; s_wd_src = console ? "console" : src;
+  if (console) {
+    logf("Heltec reboot detected (console) -> reported, modem recovery skipped");
+    pinMode(MODEM_DTR_PIN, OUTPUT); digitalWrite(MODEM_DTR_PIN, LOW);
+  } else {
+    logf("Heltec reboot detected (%s, #%u, %u today) -> modem recovery", src, (unsigned)s_hw_n, (unsigned)s_hw_dayn);
+    wdRun(true);
+  }
+  hwReportRetry();
+  s_wd_reason = nullptr; s_wd_src = nullptr;
+}
+static bool s_hwa_busy = false;
+static void hwAwakeService() {
+  heltecMonPoll();
+  if (!s_hwa_flag || s_hwa_busy || s_busy_update) return;
+  s_hwa_flag = false; s_hwa_busy = true;
+  int64_t now = rtcNow();
+  if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
+  bool own = s_hw_own > 0 && now >= s_hw_own && now - s_hw_own < HW_DEBOUNCE_S;
+  bool console = s_hw_cons > 0 && now >= s_hw_cons && now - s_hw_cons < HW_DEBOUNCE_S;
+  bool cold = s_wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED && millis() < 60000;   // both powered up together
+  const char *why = !s_hw_en ? "off (WDCFG hwake=0)" : cold ? "T-SIM cold start (both booted together)" : own ? "T-SIM reset the Heltec itself" :
+                    (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
+                    s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
+  if (why) {
+    if (s_hw_en) { s_hw_ign++; wdSave(); }
+    logf("Heltec reboot (awake, %s) ignored: %s", s_hwa_mark, why);
+  } else {
+    hwHandleReboot("awake", console);
+  }
+  s_hwa_busy = false;
 }
 
 static bool handleCommand(const char *from, const char *body) {
@@ -2767,6 +2904,7 @@ static void armWakeups() {
 
 // Timer-wake path: the modem was never woken, so skip AT+CSCLK; just re-arm wakeups and sleep.
 static void sleepQuick() {
+  heltecMonStop();
   heltecPinsRelease();
   pinMode(MODEM_RI_PIN, INPUT);
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
@@ -2778,6 +2916,8 @@ static void sleepQuick() {
 
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  hwAwakeService();   // v1.7.4: a Heltec reboot seen during this wake is handled before sleeping
+  heltecMonStop();
   gpsHousekeep();
   rollbackIfPending("no successful ingest before sleep");
   logf("Deep sleep; RI GPIO%d LOW", MODEM_RI_PIN);
@@ -2857,6 +2997,7 @@ static void interactiveWindow(uint32_t window_ms) {
       if (!s_busy_update) processSmsInbox();
       next_sms = millis() + 3000;
     }
+    hwAwakeService();   // v1.7.4
     delay(20);
   }
 }
@@ -2904,14 +3045,8 @@ void setup() {
       logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);
       sleepQuick(); return;
     }
-    s_hw_n++; s_hw_dayn++; s_hw_last = now; s_hw_spur = 0;
-    wdAddEvent("heltec", "reboot", 0); wdSave();
-    logf("Heltec reboot detected (#%u, %u today) -> modem recovery", (unsigned)s_hw_n, (unsigned)s_hw_dayn);
-    gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
     if (!LittleFS.begin(true)) logf("LittleFS mount failed");
-    s_wd_reason = "heltec-reboot";
-    wdRun(true);
-    s_wd_reason = nullptr;
+    hwHandleReboot("wake", false);   // v1.7.4: shared with the awake path (pending report if it can't be delivered)
     goToSleep(); return;
   }
   bool wd_wake = false;
@@ -2924,6 +3059,7 @@ void setup() {
     gpio_deep_sleep_hold_dis();
     gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
     heltecPinsRelease();
+    heltecMonStart();   // v1.7.4 awake reboot detection
     if (!LittleFS.begin(true)) logf("LittleFS mount failed");
     if (s_lb_en) pwrCheck("timer");   // battery check due at the same time: no extra wake
     wdRun();
@@ -2940,6 +3076,7 @@ void setup() {
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
   heltecPinsRelease();
+  heltecMonStart();   // v1.7.4 awake reboot detection
   if (!LittleFS.begin(true)) logf("LittleFS mount failed");
   else {
     logf("LittleFS OK total=%u used=%u", (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
@@ -2960,6 +3097,7 @@ void setup() {
     if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
     if (s_wake_cause != ESP_SLEEP_WAKEUP_TIMER || !s_lb_en) pwrCheck("wake");
     pwrReportPending();
+    if (s_hrp_n) wdHeartbeat("ok", -1);   // v1.7.4: deliver an earlier Heltec-reboot report that couldn't go out
     processSmsInbox();
   }
   if (fast && !s_busy_update) { goToSleep(); return; }

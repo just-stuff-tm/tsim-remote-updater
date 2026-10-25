@@ -1371,3 +1371,31 @@ console.log("serial.ondemand tests OK");
   assert.equal(holo, holo0, "nothing texted");
   console.log("v1.7.3 Heltec reboot wake tests OK");
 }
+
+// ---------- v1.7.4: Heltec reboot seen while awake, console reboots, pending (late) reboot reports ----------
+{
+  const M = await import("../src/index.js");
+  const hb = M.parseHeartbeat({ stage: "hard", reason: "heltec-reboot", src: "awake", wd: { int: 720, hwk: 1, hwn: 4, hwa: 2 } });
+  assert.equal(hb.src, "awake"); assert.equal(hb.hw_awake, 2);
+  assert.equal(M.parseHeartbeat({ stage: "ok", src: "<x>" }).src, null); assert.equal(M.parseHeartbeat({ stage: "ok" }).hw_awake, null);
+  assert.equal(M.hrpInfo({}), null); assert.equal(M.hrpInfo({ hrp: 0 }), null);
+  const hi = M.hrpInfo({ hrp: 2, hrpa: 600, hrps: "wake" }, "2026-10-25T23:00:00.000Z");
+  assert.deepEqual(hi, { n: 2, at: "2026-10-25T22:50:00.000Z", src: "wake" }); assert.equal(M.hrpInfo({ hrp: 1, hrpa: -1, hrps: "zz" }).src, null);
+  const dev = JSON.parse(kv.get("device:tsim-1")), holo0 = holo;
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  const H = () => JSON.parse(kv.get("telem:tsim-1:history") || "[]").map((x) => x.msg || "");
+  const W = { int: 720, hb: 1, sms: 0, chk: 6, ok: 4, soft: 1, hard: 0, fail: 0, fails: 0, next: 43200, hwk: 1, hwn: 2, hwi: 0, hws: 0, hwa: 1, ev: [] };
+  // awake detection: live heartbeat carries its own pending count (1) -> no extra "late" line
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.4", stage: "soft", reason: "heltec-reboot", src: "awake", sms_waiting: 0, wd: W, tl: { fw: "tsim-updater 1.7.4", hrp: 1, hrpa: 20, hrps: "awake" } })).status, 200);
+  assert(H().some((m) => /^Heltec reboot detected \(while the T-SIM was awake\) → Watchdog: modem recovered/.test(m))); assert(!H().some((m) => /reported late/.test(m)));
+  // console reboot: reported, recovery skipped
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.4", stage: "ok", reason: "heltec-reboot", src: "console", sms_waiting: 0, wd: W })).status, 200);
+  assert(H().some((m) => /^Heltec reboot detected \(console\).*modem recovery skipped/.test(m)));
+  // LTE was down: the next ordinary post carries the pending report
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.4", hrp: 2, hrpa: 3600, hrps: "wake" } })).status, 200);
+  assert(H().some((m) => /^Heltec reboot detected earlier, reported late \(LTE was down\): 2 reboots, last woke the T-SIM \(GPIO6\) at \d\d:\d\d UTC/.test(m)));
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: (await login("tsim-1", "device-one-password", "7.7.7.41")).headers.get("Set-Cookie").split(";")[0] } })).text();
+  assert(pg.includes("while awake")); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert.equal(holo, holo0, "nothing texted");
+  console.log("v1.7.4 awake Heltec reboot detection tests OK");
+}
