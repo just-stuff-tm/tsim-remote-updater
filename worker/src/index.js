@@ -581,9 +581,9 @@ async function handleIngest(request, env, id) {
     await putJson(env, `wd:${id}`, { ...hb, last_recovery: hb.stage === "soft" || hb.stage === "hard" ? { at: entry.received_at, stage: hb.stage } : prevWd.last_recovery || null });
     const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
     await putJson(env, `telem:${id}:latest`, { ...prev, received_at: entry.received_at, ...(t.fw ? { fw: String(t.fw).slice(0, 60) } : {}) });
-    if (hb.stage !== "ok" || (prevWd.fails > 0)) {  // routine OK check-ins stay out of the activity log
+    if (hb.stage !== "ok" || (prevWd.fails > 0) || hb.reason) {  // routine OK check-ins stay out of the activity log
       const ev = hb.events.filter((e) => e.stage !== "check" || e.result !== "ok").slice(0, 3).map((e) => `${e.stage} ${e.result}${e.at ? " " + e.at.slice(11, 16) + " UTC" : ""}`).join(", ");
-      await logActivity(env, id, { type: "event", msg: `Watchdog: ${hb.stage === "soft" ? "modem recovered (AT+CFUN reset)" : hb.stage === "hard" ? "modem recovered (power-cycle)" : hb.stage === "lowbat" ? "low battery, recovery skipped" : "check OK after earlier failures"}${ev ? " · recent: " + ev : ""}${hb.sms_waiting > 0 ? ` · ${hb.sms_waiting} text(s) stored on the modem` : ""}` });
+      await logActivity(env, id, { type: "event", msg: `${hb.reason === "heltec-reboot" ? "Heltec reboot detected → " : ""}Watchdog: ${hb.stage === "soft" ? "modem recovered (AT+CFUN reset)" : hb.stage === "hard" ? "modem recovered (power-cycle)" : hb.stage === "lowbat" ? "low battery, recovery skipped" : "check OK after earlier failures"}${ev ? " · recent: " + ev : ""}${hb.sms_waiting > 0 ? ` · ${hb.sms_waiting} text(s) stored on the modem` : ""}` });
     }
     return json({ ok: true });
   }
@@ -994,13 +994,16 @@ export function cancelWdOnlyOnTextStart(list) {
 export const wdOnlyOk = (c, wd, fw) => !c.wdonly || (wd && fwAtLeast(fw, WDCMD_FW));
 export const WD_FW = "1.7.1", DEFAULT_WD = { int_min: 180, hb: true, sms: false };
 export const WD_CHOICES = [0, 30, 60, 120, 180, 360, 720, 1440];
-export const wdCfgCmd = (w) => `WDCFG int=${w.int_min} hb=${w.hb ? 1 : 0} sms=${w.sms ? 1 : 0}`;
+// v1.7.3: hwake (Heltec-reboot wake on GPIO6) is only added once set, so 1.7.1/1.7.2 commands stay byte-identical.
+export const HWAKE_FW = "1.7.3";
+export const wdCfgCmd = (w) => `WDCFG int=${w.int_min} hb=${w.hb ? 1 : 0} sms=${w.sms ? 1 : 0}${w.hwake === undefined ? "" : " hwake=" + (w.hwake ? 1 : 0)}`;
 export function validateWd(cur, b) {
   const w = { ...DEFAULT_WD, ...(cur || {}) };
   if (b.int_min !== undefined) { const m = Number(b.int_min); if (!WD_CHOICES.includes(m)) throw new Error("Pick a watchdog interval (off, or 30 min to 24 h)."); w.int_min = m; }
   if (b.hb !== undefined) w.hb = b.hb === true;
   if (b.sms !== undefined) w.sms = b.sms === true;
-  return { int_min: w.int_min, hb: w.hb, sms: w.sms };
+  if (b.hwake !== undefined) w.hwake = b.hwake === true;
+  return { int_min: w.int_min, hb: w.hb, sms: w.sms, ...(w.hwake !== undefined ? { hwake: w.hwake } : {}) };
 }
 // Heartbeat body {"type":"heartbeat","stage":..,"sms_waiting":n,"wd":{int,hb,sms,chk,ok,soft,hard,fail,fails,next,ev:[[ago_s,stage,result,secs],...]}}
 export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
@@ -1013,6 +1016,7 @@ export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
   return { at: receivedAt, stage: S(t && t.stage) || "ok", sms_waiting: n(t && t.sms_waiting), int_min: n(w.int), hb: w.hb === 1 || w.hb === true, sms: w.sms === 1 || w.sms === true,
     checks: n(w.chk), ok: n(w.ok), soft: n(w.soft), hard: n(w.hard), fail: n(w.fail), fails: n(w.fails),
     cmd: w.cmd === undefined ? null : w.cmd === 1 || w.cmd === true, cmd_fetches: n(w.cmdn), restarts: n(w.rst), deadline_resets: n(w.dlx),
+    hwake: n(w.hwk), hw_wakes: n(w.hwn), hw_ignored: n(w.hwi), hw_skipped: n(w.hws), reason: String((t && t.reason) ?? "").replace(/[^a-z0-9-]/gi, "").slice(0, 24) || null,
     next_at: n(w.next) != null && w.next >= 0 ? new Date(rt + w.next * 1000).toISOString() : null, events };
 }
 // Expected check-in interval and offline state. Uses what the T-SIM reports it runs (tl.wdi / heartbeat), not just the
@@ -1711,7 +1715,7 @@ async function deviceApi(request, env, dev, action) {
       supported: fwAtLeast(latest && latest.fw, GPS_FW), progress: gpsProgress(greq, cmds, gps || {}), location: locProgress(lreq, cmds) };
     const [wdLast, wdCfgS] = await Promise.all([kvJson(env, `wd:${id}`), kvJson(env, `wdcfg:${id}`)]);
     const wdq = (cmds || []).find((c) => /^wdcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
-    const watchdog = { settings: { ...DEFAULT_WD, ...(wdCfgS || {}) }, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW),
+    const watchdog = { settings: { ...DEFAULT_WD, ...(wdCfgS || {}) }, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW),
       checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
     return json({ watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
@@ -2011,6 +2015,7 @@ async function deviceApi(request, env, dev, action) {
     let w; try { w = validateWd(cur, b); } catch (e) { return json({ error: e.message }, 400); }
     const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
     if (!fwAtLeast(lat.fw, WD_FW)) return json({ error: `Needs T-SIM firmware ${WD_FW} or newer. Update the T-SIM firmware first.` }, 409);
+    if (b.hwake !== undefined && !fwAtLeast(lat.fw, HWAKE_FW)) return json({ error: `The Heltec reboot wake needs T-SIM firmware ${HWAKE_FW} or newer.` }, 409);
     const cmd = wdCfgCmd(w);
     if (cur.applied_at && cmd === wdCfgCmd({ ...DEFAULT_WD, ...cur })) return json({ saved: true, unchanged: true, settings: { ...w, applied_at: cur.applied_at }, queued: null, wake: null });
     const list = (await kvJson(env, `cmds:${id}`)) || [];
@@ -2020,7 +2025,7 @@ async function deviceApi(request, env, dev, action) {
     await putJson(env, `wdcfg:${id}`, { ...w, updated_at: entry.queued_at, applied_at: null });
     let wake = null;
     if (b.send === true) { const [o, cc] = await manualSend(env, dev, "STATUS", "Deliver watchdog settings (STATUS)"); wake = { ...o, status: cc }; }
-    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${b.send ? "" : " (applied at next wake)"}` });
+    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${w.hwake !== undefined ? `, Heltec reboot wake ${w.hwake ? "on" : "off"}` : ""}${b.send ? "" : " (applied at next wake)"}` });
     return json({ saved: true, settings: w, queued: entry, wake });
   }
   if (action === "gps-settings") {
@@ -2511,6 +2516,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (1.7.2+: every 24 h, it can't be turned off)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
 <label class="tog"><input type="checkbox" name="sms"> On watchdog wakes, also run texts already waiting on the modem (off: they run at the next text or wake)</label>
+<label class="tog"><input type="checkbox" name="hwake"> Heltec reboot wake (T-SIM 1.7.3+, needs the optional GPIO6 wire): when the Heltec reboots, wake the T-SIM and reset its modem. Turns itself off after repeated false wakes; tick again to re-enable</label>
 <button type="submit" class="g">Save (applied at next wake)</button> <button type="button" id="wdsend">Save &amp; send now (1 text)</button> <span id="wdmsg" class="msg"></span></form></div></section>
 <section><h2>Location <small class="mut small" id="gpsat"></small></h2><div class="card">
 <div class="acts" style="margin-top:0"><button type="button" id="gpsbtn" data-mode="get">Get location</button></div>
@@ -2654,18 +2660,19 @@ function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.ev
 let wdLoaded=false;
 const WDST={ok:"OK",soft:"Recovered (AT+CFUN reset)",hard:"Recovered (modem power-cycle)",lowbat:"Low battery: recovery skipped",fail:"Failed"};
 function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||{};
- $("wdnote").hidden=!!W.supported;["wdsend"].forEach(x=>$(x).disabled=!W.supported);$("wdf").querySelectorAll("select,input,button").forEach(x=>x.disabled=!W.supported);
+ $("wdnote").hidden=!!W.supported;["wdsend"].forEach(x=>$(x).disabled=!W.supported);$("wdf").querySelectorAll("select,input,button").forEach(x=>x.disabled=!W.supported);$("wdf").hwake.disabled=!W.supported||!W.hwake_supported;
  const dev=L.wd_int;
  $("wdsum").textContent=!W.supported?"· needs T-SIM 1.7.1":"· "+(dev==null?"not reported yet":dev?"every "+hrs(dev):"off on the T-SIM")+(X?" · last check "+ago(X.at):"")+(W.pending?" · change waiting for the T-SIM":"");
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
+  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+" · ignored "+(X.hw_ignored??"?")+" · not armed "+(X.hw_skipped??"?"):null],
   ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],
   ["Last recovery",X&&X.last_recovery?(X.last_recovery.stage==="hard"?"power-cycle":"AT+CFUN reset")+" · "+t(X.last_recovery.at)+" ET":"none"],["Texts waiting on the modem",X&&X.sms_waiting!=null&&X.sms_waiting>=0?X.sms_waiting:null]]);
  const EV=(X&&X.events)||[];$("wdev").innerHTML=EV.length?"<b>Recent recovery attempts</b><ul style='margin:4px 0'>"+EV.map(v=>"<li>"+e(v.stage)+": "+e(v.result)+(v.secs!=null?" ("+e(v.secs)+" s)":"")+(v.at?" · "+e(t(v.at))+" ET":"")+"</li>").join("")+"</ul>":"";
  $("wddel").innerHTML=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':W.pending?"⏳ Saved; waiting for the T-SIM's next wake":"";
- if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;wdLoaded=true}}
-async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.checked,sms:f.sms.checked,send};
+ if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;f.hwake.checked=X&&X.hwake!=null?X.hwake===1:S.hwake!==false;wdLoaded=true}}
+async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.checked,sms:f.sms.checked,send};if(!f.hwake.disabled)b.hwake=f.hwake.checked;
  if(send&&!confirm("Save and send ONE text now so the T-SIM wakes and applies the watchdog settings?"))return;
  const r=await post("watchdog-settings",b);const j=await rj(r);
  say("wdmsg",r.ok&&!(j.wake&&!j.wake.sent),!r.ok?(j.error||friendly(j,r.status)):j.unchanged?"No change: the T-SIM already uses these settings.":j.wake?(j.wake.sent?"Saved and sent; waiting for the T-SIM to wake.":"Saved; text not sent: "+friendly(j.wake,j.wake.status)):"Saved. Applied at the T-SIM's next wake (no text sent).");if(r.ok){wdLoaded=false;load()}}

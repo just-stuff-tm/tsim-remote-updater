@@ -66,6 +66,26 @@ flowchart LR
 
 On-board modem: TX11, RX10, PWRKEY18, RESET17, RI3 (wake), DTR9.
 
+### Optional: Heltec reboot wake (T-SIM firmware 1.7.3+)
+With one extra wire, a Heltec reboot (for example a `reboot` sent over the mesh) wakes the T-SIM. The T-SIM then resets its modem (`AT+CFUN`, or a power-cycle if that fails), checks in and fetches queued commands. This gives you a way to wake the T-SIM from the mesh if texts stop working.
+
+| Part | Connection |
+|---|---|
+| Schottky diode (BAT54, 1N5819, …) | **cathode (band) to Heltec GPIO43 (TX)**, anode to T-SIM **GPIO6** (left header) |
+| 100 kΩ | T-SIM GPIO6 to T-SIM **3V3** |
+| 100 nF ceramic | T-SIM GPIO6 to **GND** |
+
+- Heltec TX idles high. Each low bit it sends pulls GPIO6 low through the diode, and the capacitor holds it low for about 10 ms, so even short serial bits wake the T-SIM. The diode means GPIO6 can never drive the Heltec's TX line. The existing GPIO41 serial wire stays as it is.
+- GPIO6 is an RTC GPIO (deep-sleep wake via ext1, "any low"). The modem ring stays on GPIO3 (ext0). No internal pulls are used.
+- Stock MeshCore prints only its boot log on its own, so the line stays quiet while the T-SIM sleeps.
+- Safety: the wake isn't armed for a sleep if GPIO6 isn't steadily high just before sleeping (wire missing, or the Heltec still printing). Accepted wakes are at least 60 s apart, at most 6 per 24 h. 3 spurious wakes in a row (pin stuck low, too soon, over the limit) turn it off until it's ticked again. A Heltec reset the T-SIM did itself doesn't count. Dashboard: T-SIM tab › Modem watchdog › *Heltec reboot wake* (`WDCFG hwake=0|1`, on by default).
+- **Bench test** (USB serial monitor on the T-SIM at 115200):
+  1. With the wire fitted and the Heltec idle, GPIO6 measures about 3.3 V. It dips briefly when the Heltec boots.
+  2. Let the T-SIM sleep. The last log line should say `Heltec wake armed`.
+  3. Press the Heltec RST button, or send `reboot` to the repeater over the mesh. The T-SIM wakes and logs `Heltec reboot detected (#1 …) -> modem recovery`. The dashboard shows "Heltec reboot detected → Watchdog: modem recovered".
+  4. Reboot the Heltec again within 60 s: the wake is logged as ignored ("within 60 s").
+  5. Without the wire (pin floating), check that the T-SIM doesn't keep waking: at most 3 ignored wakes, then the card shows *auto-off*.
+
 
 ## Battery calibration and low-battery protection (T-SIM firmware 1.6.5+)
 
@@ -283,7 +303,7 @@ Each has a Read button and is included in Read all, the T-SIM settings cache, th
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
 | `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
-| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1 [cmd=0\|1]` | Modem watchdog settings (≥ 1.7.1; `cmd` and int 0 = 24 h since 1.7.2). A system command queued by the dashboard and picked up at the next wake; never texted |
+| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1 [cmd=0\|1] [hwake=0\|1]` | Modem watchdog settings (≥ 1.7.1; `cmd` and int 0 = 24 h since 1.7.2; `hwake` = Heltec reboot wake since 1.7.3). A system command queued by the dashboard and picked up at the next wake; never texted |
 | `GPSFIX` / `GPSCFG auto=0\|1 to=<s>` | T-SIM location fix / location settings (≥ 1.6.7). Never texted directly: the dashboard queues them as system commands and wakes the T-SIM with `CMD` (or they ride along with the next `STATUS`) |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 

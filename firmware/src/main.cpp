@@ -5,6 +5,7 @@
 #include <esp_sleep.h>
 #include <sys/time.h>
 #include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <esp_timer.h>
 #include "hal/wdt_hal.h"
 #include "soc/rtc.h"
@@ -210,7 +211,10 @@ static void heltecPinsRelease() {
   pinMode(HELTEC_UART_RX_PIN, INPUT);
 }
 
+static int64_t rtcNow();
+RTC_DATA_ATTR static int64_t s_hw_own = 0;   // v1.7.3: rtcNow() when the T-SIM itself last reset the Heltec (its boot log isn't a "reboot")
 static void heltecReboot() {
+  s_hw_own = rtcNow();
   logf("REBOOT: pulsing Heltec RST");
   pinMode(HELTEC_RST_PIN, OUTPUT);
   digitalWrite(HELTEC_RST_PIN, LOW);
@@ -2064,6 +2068,17 @@ RTC_DATA_ATTR static uint8_t s_wd_fails = 0;      // consecutive failed checks (
 #define WD_RESTART_FAILS   3
 static bool s_wd_cmd = true;
 static uint32_t s_wd_rst = 0, s_wd_dlx = 0, s_wd_cmdn = 0;
+// v1.7.3 Heltec-reboot wake (GPIO6, ext1 any-low). WDCFG hwake=0|1 (default on). Accepted wakes are rate limited (60 s
+// apart, 6 per rolling 24 h); stuck-low / too-soon / over-limit wakes count as spurious and HW_SPUR_MAX in a row turn it
+// off (hwk=2 "auto-off") until WDCFG hwake=1. Arming is skipped for a sleep when GPIO6 is low right before sleeping.
+#define HW_DEBOUNCE_S   60
+#define HW_MAX_DAY      6
+#define HW_SPUR_MAX     3
+#define HW_STUCK_MS     2000
+static bool s_hw_en = true, s_hw_auto = false;
+static uint32_t s_hw_n = 0, s_hw_ign = 0, s_hw_skip = 0, s_hw_spur = 0, s_hw_dayn = 0;
+static int64_t s_hw_last = 0, s_hw_day0 = 0;
+static const char *s_wd_reason = nullptr;   // set for a heartbeat that isn't a routine timer check
 static void telemRefreshSignal() {
   if (s_tcp_busy) return;
   if (modemAT("AT+CSQ", 3000)) { const char *p = strstr(s_at_resp, "+CSQ:"); int v; if (p && sscanf(p, "+CSQ: %d", &v) == 1) s_sig_csq = v; }
@@ -2283,6 +2298,8 @@ static void wdSave() {
   p.putUInt("chk", s_wd_chk); p.putUInt("ok", s_wd_ok); p.putUInt("soft", s_wd_soft); p.putUInt("hard", s_wd_hard); p.putUInt("fail", s_wd_fail);
   p.putBool("pend", s_wd_pend); p.putString("ev", s_wd_ev);
   p.putUInt("rst", s_wd_rst); p.putUInt("dlx", s_wd_dlx); p.putUInt("cmdn", s_wd_cmdn);
+  p.putBool("hwake", s_hw_en); p.putBool("hwauto", s_hw_auto); p.putUInt("hwn", s_hw_n); p.putUInt("hwi", s_hw_ign); p.putUInt("hws", s_hw_skip);
+  p.putUInt("hwsp", s_hw_spur); p.putUInt("hwdn", s_hw_dayn); p.putLong64("hwl", s_hw_last); p.putLong64("hwd0", s_hw_day0);
   p.end();
 }
 static void wdLoad() {
@@ -2290,6 +2307,8 @@ static void wdLoad() {
   s_wd_int_min = p.getUInt("int", WD_DEFAULT_MIN); s_wd_hb = p.getBool("hb", true); s_wd_sms = p.getBool("sms", false);
   s_wd_chk = p.getUInt("chk", 0); s_wd_ok = p.getUInt("ok", 0); s_wd_soft = p.getUInt("soft", 0); s_wd_hard = p.getUInt("hard", 0); s_wd_fail = p.getUInt("fail", 0);
   s_wd_pend = p.getBool("pend", false);
+  s_hw_en = p.getBool("hwake", true); s_hw_auto = p.getBool("hwauto", false); s_hw_n = p.getUInt("hwn", 0); s_hw_ign = p.getUInt("hwi", 0);
+  s_hw_skip = p.getUInt("hws", 0); s_hw_spur = p.getUInt("hwsp", 0); s_hw_dayn = p.getUInt("hwdn", 0); s_hw_last = p.getLong64("hwl", 0); s_hw_day0 = p.getLong64("hwd0", 0);
   s_wd_cmd = p.getBool("cmd", true); s_wd_rst = p.getUInt("rst", 0); s_wd_dlx = p.getUInt("dlx", 0); s_wd_cmdn = p.getUInt("cmdn", 0);
   {  // last wake hit the awake deadline (esp_timer) or a hardware/task watchdog reset
     esp_reset_reason_t rr = esp_reset_reason();
@@ -2336,11 +2355,12 @@ static void wdApplyCfg(const char *args, char *out, size_t cap) {
     else if (!strcmp(k, "hb")) { s_wd_hb = atoi(v) != 0; p.putBool("hb", s_wd_hb); n++; }
     else if (!strcmp(k, "sms")) { s_wd_sms = atoi(v) != 0; p.putBool("sms", s_wd_sms); n++; }
     else if (!strcmp(k, "cmd")) { s_wd_cmd = atoi(v) != 0; p.putBool("cmd", s_wd_cmd); n++; }
+    else if (!strcmp(k, "hwake")) { s_hw_en = atoi(v) != 0; s_hw_auto = false; s_hw_spur = 0; p.putBool("hwake", s_hw_en); p.putBool("hwauto", false); p.putUInt("hwsp", 0); n++; }
   }
   p.end();
   s_wd_fails = 0; wdSchedule(true);
-  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d", n, rej ? " (interval REJECTED: 30-1440 min; 0 = 1440)" : "",
-           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd);
+  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d hwake=%d", n, rej ? " (interval REJECTED: 30-1440 min; 0 = 1440)" : "",
+           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd, (int)s_hw_en);
   logf("%s", out);
 }
 static int wdRegStat(const char *tag) {
@@ -2399,9 +2419,10 @@ static int wdSmsStored() {
 }
 static size_t wdJson(char *dst, size_t cap) {
   int64_t now = rtcNow(), nx = s_wd_due > 0 ? s_wd_due - now : -1;
-  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"ev\":[",
+  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"hwk\":%d,\"hwn\":%u,\"hwi\":%u,\"hws\":%u,\"ev\":[",
     (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (unsigned)s_wd_chk, (unsigned)s_wd_ok, (unsigned)s_wd_soft, (unsigned)s_wd_hard,
-    (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx, (int)s_wd_cmd, (unsigned)s_wd_cmdn, (unsigned)s_wd_rst, (unsigned)s_wd_dlx);
+    (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx, (int)s_wd_cmd, (unsigned)s_wd_cmdn, (unsigned)s_wd_rst, (unsigned)s_wd_dlx,
+    s_hw_auto ? 2 : (int)s_hw_en, (unsigned)s_hw_n, (unsigned)s_hw_ign, (unsigned)s_hw_skip);
   const char *q = s_wd_ev; bool first = true;
   while (*q && o < cap) {
     long long rtc = 0; char st[12] = "", rs[12] = ""; unsigned secs = 0;
@@ -2418,14 +2439,17 @@ static bool wdHeartbeat(const char *stage, int sms) {
   if (!s_pdp_up && !modemOpenData()) return false;
   telemRefreshSignal();
   static char hb[1200];
-  size_t o = snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"fw\":\"%s\",\"stage\":\"%s\",\"sms_waiting\":%d,\"msg\":\"Watchdog check: %s\"",
-                      FW_VERSION, stage, sms, stage);
+  size_t o = snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"fw\":\"%s\",\"stage\":\"%s\",\"sms_waiting\":%d,\"msg\":\"Watchdog check: %s%s\"%s%s%s",
+                      FW_VERSION, stage, sms, stage, s_wd_reason ? " (Heltec reboot detected)" : "",
+                      s_wd_reason ? ",\"reason\":\"" : "", s_wd_reason ? s_wd_reason : "", s_wd_reason ? "\"" : "");
   o += wdJson(hb + o, sizeof(hb) - o - 2);
   snprintf(hb + o, sizeof(hb) - o, "}");
   return ingestSend(hb);
 }
 // Runs on a watchdog timer wake. Returns true when the modem ends up healthy.
-static bool wdRun() {
+// force (v1.7.3, Heltec-reboot wake): recover even when the check passes (CFUN reset, then power-cycle if that fails)
+// and always post a heartbeat.
+static bool wdRun(bool force = false) {
   uint32_t t0 = millis();
   s_wd_chk++;
   pinMode(MODEM_DTR_PIN, OUTPUT); digitalWrite(MODEM_DTR_PIN, LOW);   // DTR low: modem leaves CSCLK sleep (no reset)
@@ -2435,6 +2459,7 @@ static bool wdRun() {
   bool at = wdProbe(5);
   if (at) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
   bool ok = at && wdHealthy(5000, 20000);
+  if (force) { logf("WD: forced recovery (check said healthy=%d)", (int)ok); ok = false; s_wd_pend = true; }
   bool lowbat = s_bat_idle >= 2.5f && s_bat_idle < WD_LOWBAT_V;
   const char *stage = "ok"; bool hard_tried = false;
   logf("WD: check AT=%d healthy=%d bat=%.2fV", (int)at, (int)ok, s_bat_idle);
@@ -2707,13 +2732,32 @@ static uint64_t sleepTimerSecs() {
   if (best < 0 || best > (int64_t)WD_MAX_MIN * 60) best = (int64_t)WD_MAX_MIN * 60;   // v1.7.2: there is ALWAYS a timer (<= 24 h)
   return (uint64_t)best;
 }
+// v1.7.3: arm the optional Heltec-reboot wake (GPIO6, ext1 any-low; ext0 stays on the modem RI pin). Not armed when it's
+// off (WDCFG hwake=0, or auto-off after spurious wakes) or when GPIO6 isn't steadily high right before sleep (wire missing
+// and floating low, or the Heltec still printing): that sleep then has only the SMS + timer wakes, so it can't storm.
+static const char *hwArm() {
+  if (!s_hw_en) return "off";
+  if (s_hw_auto) return "auto-off";
+  pinMode(HELTEC_HWAKE_PIN, INPUT);
+  uint32_t t = millis(); int highs = 0;
+  while (millis() - t < 1500) { if (digitalRead(HELTEC_HWAKE_PIN)) { if (++highs >= 25) break; } else highs = 0; delay(2); }
+  if (highs < 25) {
+    s_hw_skip++; { Preferences p; p.begin("tsimwd", false); p.putUInt("hws", s_hw_skip); p.end(); }
+    return "SKIPPED (GPIO6 low)";
+  }
+  if (esp_sleep_enable_ext1_wakeup(1ULL << HELTEC_HWAKE_PIN, ESP_EXT1_WAKEUP_ANY_LOW) != ESP_OK) return "FAILED";
+  rtc_gpio_pullup_dis((gpio_num_t)HELTEC_HWAKE_PIN);    // external 100k pull-up does the work
+  rtc_gpio_pulldown_dis((gpio_num_t)HELTEC_HWAKE_PIN);
+  return "armed";
+}
 static void armWakeups() {
   s_ext0_failed = esp_sleep_enable_ext0_wakeup((gpio_num_t)MODEM_RI_PIN, 0) != ESP_OK;
+  const char *hw = hwArm();
   uint64_t secs = sleepTimerSecs();
   if (!secs) secs = (uint64_t)WD_MAX_MIN * 60;
   esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
   deadlineStopForSleep();
-  logf("sleep: SMS ring wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed",
+  logf("sleep: SMS ring wake %s, Heltec wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed", hw,
        (unsigned long long)secs, s_lb_en ? "on" : "off", s_gnss_on ? "warm" : "off", s_wd_int_min ? "on" : "off");
 }
 
@@ -2836,6 +2880,36 @@ void setup() {
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.7.1 watchdog timer wake. The RTC clock drifts, so a wake up to 10% early still counts; with battery checks off
   // the watchdog is the only timer left (GNSS warm-window wakes and OTA verification keep the full boot path).
+  // v1.7.3 Heltec-reboot wake (GPIO6 went low: the Heltec printed its boot log).
+  if (s_wake_cause == ESP_SLEEP_WAKEUP_EXT1 && (esp_sleep_get_ext1_wakeup_status() & (1ULL << HELTEC_HWAKE_PIN))) {
+    gpio_deep_sleep_hold_dis();          // DTR keeps its own pad hold until we know the modem gets touched
+    heltecPinsRelease();
+    pinMode(HELTEC_HWAKE_PIN, INPUT);
+    int64_t now = rtcNow();
+    bool stuck = true; uint32_t t = millis();
+    while (millis() - t < HW_STUCK_MS) { if (digitalRead(HELTEC_HWAKE_PIN)) { stuck = false; break; } delay(5); }
+    if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
+    bool own = s_hw_own > 0 && now >= s_hw_own && now - s_hw_own < HW_DEBOUNCE_S;
+    const char *why = stuck ? "GPIO6 stuck low" : own ? "T-SIM reset the Heltec itself" :
+                      (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
+                      s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
+    if (why) {
+      s_hw_ign++;
+      if (!own && ++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
+      wdSave();
+      logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);
+      sleepQuick(); return;
+    }
+    s_hw_n++; s_hw_dayn++; s_hw_last = now; s_hw_spur = 0;
+    wdAddEvent("heltec", "reboot", 0); wdSave();
+    logf("Heltec reboot detected (#%u, %u today) -> modem recovery", (unsigned)s_hw_n, (unsigned)s_hw_dayn);
+    gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+    if (!LittleFS.begin(true)) logf("LittleFS mount failed");
+    s_wd_reason = "heltec-reboot";
+    wdRun(true);
+    s_wd_reason = nullptr;
+    goToSleep(); return;
+  }
   bool wd_wake = false;
   if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_wd_int_min && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
     int64_t tol = (int64_t)s_wd_int_min * 6; if (tol < 60) tol = 60;

@@ -1334,3 +1334,40 @@ console.log("serial.ondemand tests OK");
   assert.equal(holo, holo0, "nothing texted");
   console.log("v1.7.2 watchdog command-fetch tests OK");
 }
+
+// ---------- v1.7.3: Heltec-reboot wake (GPIO6): WDCFG hwake, heartbeat counters and reason ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.wdCfgCmd(M.DEFAULT_WD), "WDCFG int=180 hb=1 sms=0", "unchanged without hwake");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, hwake: true }), "WDCFG int=180 hb=1 sms=0 hwake=1");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, hwake: false }), "WDCFG int=180 hb=1 sms=0 hwake=0");
+  assert.deepEqual(M.validateWd({}, {}), { int_min: 180, hb: true, sms: false }, "no hwake key unless set");
+  assert.equal(M.validateWd({}, { hwake: false }).hwake, false); assert.equal(M.validateWd({ hwake: false }, { int_min: 60 }).hwake, false, "kept");
+  const hb = M.parseHeartbeat({ stage: "soft", reason: "heltec-reboot", wd: { int: 180, hwk: 1, hwn: 3, hwi: 2, hws: 1 } });
+  assert.equal(hb.reason, "heltec-reboot"); assert.equal(hb.hwake, 1); assert.equal(hb.hw_wakes, 3); assert.equal(hb.hw_ignored, 2); assert.equal(hb.hw_skipped, 1);
+  const hb2 = M.parseHeartbeat({ stage: "ok", wd: { int: 180 } }); assert.equal(hb2.reason, null); assert.equal(hb2.hwake, null);
+  assert.equal(M.parseHeartbeat({ stage: "ok", reason: "<b>x" }).reason, "bx", "reason sanitized");
+  // server: hwake refused before 1.7.3, queued from 1.7.3
+  const dev = JSON.parse(kv.get("device:tsim-1")), holo0 = holo;
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.31")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.2" } })).status, 200);
+  let tl = await TEL(); assert.equal(tl.watchdog.hwake_supported, false);
+  assert.equal((await P("watchdog-settings", { int_min: 180, hwake: true })).status, 409);
+  let r = await P("watchdog-settings", { int_min: 180, hb: true, sms: false }); assert.equal(r.status, 200);
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.3" } })).status, 200);
+  tl = await TEL(); assert.equal(tl.watchdog.hwake_supported, true);
+  r = await P("watchdog-settings", { int_min: 180, hb: true, sms: false, hwake: false }); assert.equal(r.status, 200);
+  let j = await r.json(); assert.equal(j.queued.cmd, "WDCFG int=180 hb=1 sms=0 hwake=0");
+  // a Heltec-reboot heartbeat is always logged, with the reason
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.3", stage: "soft", reason: "heltec-reboot", sms_waiting: 0,
+    wd: { int: 180, hb: 1, sms: 0, chk: 5, ok: 4, soft: 1, hard: 0, fail: 0, fails: 0, next: 10800, hwk: 1, hwn: 1, hwi: 0, hws: 0, ev: [[5, "soft", "ok", 30], [40, "heltec", "reboot", 0]] } })).status, 200);
+  tl = await TEL(); assert.equal(tl.watchdog.last.reason, "heltec-reboot"); assert.equal(tl.watchdog.last.hw_wakes, 1);
+  const hist = JSON.parse(kv.get("telem:tsim-1:history") || "[]"); assert(hist.some((x) => /^Heltec reboot detected → Watchdog: modem recovered \(AT\+CFUN reset\)/.test(x.msg || "")));
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes('name="hwake"')); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert.equal(holo, holo0, "nothing texted");
+  console.log("v1.7.3 Heltec reboot wake tests OK");
+}
