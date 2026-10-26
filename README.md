@@ -90,6 +90,9 @@ With one extra wire, a Heltec reboot (for example a `reboot` sent over the mesh)
 ### Heltec reboot detection while awake (T-SIM firmware 1.7.4+)
 No extra wire is needed. While the T-SIM is awake it keeps the Heltec serial link (GPIO41, 115200) open and watches for boot-only output: the ESP32-S3 ROM banner (`ESP-ROM:`, `rst:0x… ,boot:0x…`) and stock MeshCore's `Repeater ID:` line. A match is handled like a GPIO6 wake: modem reset, then a heartbeat with reason `heltec-reboot`, source `awake`. A reboot within 60 s of a console `reboot` the T-SIM relayed is logged as *Heltec reboot detected (console)*, without the modem reset. The same limits and setting apply (60 s apart, 6 per 24 h, own resets ignored, `WDCFG hwake`). It's also ignored during the first 60 s after a T-SIM cold start. If LTE is down, the report is kept in NVS (count, last time, source) and sent with the next successful check-in. Details: [release notes v1.7.4](release-notes/v1.7.4.md).
 
+### Daylight uptime check (T-SIM firmware 1.7.5+)
+No wire needed. Every 60 min (`WDCFG upoll=<0|15-1440>`, 0 = off), the T-SIM wakes on a timer. If the solar input is at or above 2.0 V (`usol=<mV>`, 0 = day and night) and the battery is above the low-battery guard, it asks the Heltec `stats-core` over serial and compares `uptime_secs` with the last reading plus the elapsed time. The modem stays asleep. If the uptime went backwards, the Heltec rebooted: the T-SIM resets its modem and reports `heltec-reboot` with source `uptime` (same limits and pending-report handling as 1.7.4). It costs under 1 mAh a day. The Modem watchdog card also shows a wire self-test: GPIO6 pulses counted during CLI replies (0 while replies arrive = the wake wire isn't reaching GPIO6). Details: [release notes v1.7.5](release-notes/v1.7.5.md).
+
 ## Battery calibration and low-battery protection (T-SIM firmware 1.6.5+)
 
 - **Idle battery reading:** the T-SIM samples its battery at the very start of each wake, before the modem is used, and reports that as the battery voltage. The reading with LTE running is shown separately as "Battery (LTE on)".
@@ -306,7 +309,7 @@ Each has a Read button and is included in Read all, the T-SIM settings cache, th
 | `CMD` | T-SIM fetches queued console commands, runs them on the Heltec, posts outputs and a mesh snapshot |
 | `REBOOT` | pulses Heltec RST |
 | `TSIMUPDATE <url> [sha256:<hex>\|md5:<hex>]` | T-SIM self-update (OTA with rollback, ≥ 1.6.0). The dashboard sends this through the `CMD` queue, because a URL plus checksum doesn't fit in one text |
-| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1 [cmd=0\|1] [hwake=0\|1]` | Modem watchdog settings (≥ 1.7.1; `cmd` and int 0 = 24 h since 1.7.2; `hwake` = Heltec reboot wake since 1.7.3, also gates awake detection since 1.7.4). A system command queued by the dashboard and picked up at the next wake; never texted |
+| `WDCFG int=<0\|30-1440> hb=0\|1 sms=0\|1 [cmd=0\|1] [hwake=0\|1] [upoll=<min> usol=<mV>]` | Modem watchdog settings (≥ 1.7.1; `cmd` and int 0 = 24 h since 1.7.2; `hwake` = Heltec reboot wake since 1.7.3, also gates awake detection since 1.7.4; `upoll=<0\|15-1440> usol=<mV>` = daylight uptime check since 1.7.5). A system command queued by the dashboard and picked up at the next wake; never texted |
 | `GPSFIX` / `GPSCFG auto=0\|1 to=<s>` | T-SIM location fix / location settings (≥ 1.6.7). Never texted directly: the dashboard queues them as system commands and wakes the T-SIM with `CMD` (or they ride along with the next `STATUS`) |
 | `UPDATE <https-url>` | downloads the `.bin` over LTE, flashes the Heltec, verifies MD5, resets it |
 

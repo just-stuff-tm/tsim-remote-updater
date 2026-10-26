@@ -1399,3 +1399,38 @@ console.log("serial.ondemand tests OK");
   assert.equal(holo, holo0, "nothing texted");
   console.log("v1.7.4 awake Heltec reboot detection tests OK");
 }
+
+// ---------- v1.7.5: daylight uptime polling (WDCFG upoll/usol), uptime-found reboots, wire diagnostics ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.wdCfgCmd(M.DEFAULT_WD), "WDCFG int=180 hb=1 sms=0", "unchanged without upoll");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, hwake: true, upoll: 60, usol: 2000 }), "WDCFG int=180 hb=1 sms=0 hwake=1 upoll=60 usol=2000");
+  assert.deepEqual(M.validateWd({}, { upoll: 30 }), { int_min: 180, hb: true, sms: false, upoll: 30, usol: 2000 });
+  assert.deepEqual(M.validateWd({}, { usol: 0 }), { int_min: 180, hb: true, sms: false, upoll: 60, usol: 0 });
+  assert.throws(() => M.validateWd({}, { upoll: 7 })); assert.throws(() => M.validateWd({}, { usol: 30000 }));
+  const hb = M.parseHeartbeat({ stage: "soft", reason: "heltec-reboot", src: "uptime", wd: { int: 720, hwu: 1, hwr: 4, up: 60, usol: 2000, upn: 5, upk: 7, upr: 0, upb: 0, upd: 1, upu: 300, upa: 10 } });
+  assert.equal(hb.src, "uptime"); assert.equal(hb.hw_uptime, 1); assert.equal(hb.hw_arm, 4);
+  assert.deepEqual(hb.upoll, { int_min: 60, usol: 2000, polls: 5, night: 7, noreply: 0, lowbat: 0, found: 1, uptime: 300, age_s: 10 });
+  assert.equal(M.parseHeartbeat({ stage: "ok", wd: { int: 180 } }).upoll, null);
+  assert.deepEqual(M.tlFields({ dg: [120, 0, 0, 0] }).wire_diag, { cli_bytes: 120, g6_cli_edges: 0, unsol_bytes: 0, g6_idle_edges: 0 });
+  const dev = JSON.parse(kv.get("device:tsim-1")), holo0 = holo;
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.51")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.4" } })).status, 200);
+  assert.equal((await TEL()).watchdog.upoll_supported, false);
+  assert.equal((await P("watchdog-settings", { int_min: 720, upoll: 60 })).status, 409);
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.5", dg: [800, 12, 0, 0] } })).status, 200);
+  let tl = await TEL(); assert.equal(tl.watchdog.upoll_supported, true); assert.equal(tl.latest.wire_diag.g6_cli_edges, 12);
+  let r = await P("watchdog-settings", { int_min: 720, hb: true, sms: false, upoll: 60, usol: 2500 }); assert.equal(r.status, 200);
+  assert.equal((await r.json()).queued.cmd, "WDCFG int=720 hb=1 sms=0 hwake=0 upoll=60 usol=2500");
+  assert.equal((await ingest({ type: "heartbeat", fw: "tsim-updater 1.7.5", stage: "soft", reason: "heltec-reboot", src: "uptime", sms_waiting: 0,
+    wd: { int: 720, hb: 1, sms: 0, chk: 7, ok: 5, soft: 2, hard: 0, fail: 0, fails: 0, next: 40000, hwk: 1, hwn: 3, hwi: 0, hws: 0, hwa: 1, hwu: 1, hwr: 4, up: 60, usol: 2500, upn: 3, upk: 0, upr: 0, upb: 0, upd: 1, upu: 200, upa: 30, ev: [] }, tl: { fw: "tsim-updater 1.7.5", hrp: 1, hrpa: 25, hrps: "uptime" } })).status, 200);
+  const H = JSON.parse(kv.get("telem:tsim-1:history") || "[]").map((x) => x.msg || "");
+  assert(H.some((m) => /^Heltec reboot detected \(uptime check: repeater uptime went backwards\) → Watchdog: modem recovered/.test(m)));
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes('name="upoll"') && pg.includes('name="usol"')); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert.equal(holo, holo0, "nothing texted");
+  console.log("v1.7.5 daylight uptime check tests OK");
+}
