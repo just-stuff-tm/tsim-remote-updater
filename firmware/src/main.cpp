@@ -16,6 +16,7 @@
 
 #include <ESP_SSLClient.h>
 #include "board.h"
+#include "hw_guard.h"   // v1.7.6 self-reset guard + SMS merge (host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -224,8 +225,16 @@ RTC_DATA_ATTR static int64_t s_up_due = 0;
 RTC_DATA_ATTR static uint32_t s_dg_clib = 0, s_dg_g6c = 0, s_dg_ub = 0, s_dg_g6i = 0;
 RTC_DATA_ATTR static uint8_t s_hw_armres = 255;
 RTC_DATA_ATTR static int64_t s_hw_own = 0;   // v1.7.3: rtcNow() when the T-SIM itself last reset the Heltec (its boot log isn't a "reboot")
+// v1.7.6: the self-reset guard no longer depends on the RTC clock alone. The awake monitor's state carries a
+// millis()-timed "self reset pending" flag that absorbs the first boot of the Heltec after heltecReboot(); the
+// console "reboot" relay gets the same. s_hw_self counts boots absorbed as the T-SIM's own (NVS "hwo").
+static HmState s_hm = {false, 0, {false, 0}};
+static SelfReset s_cons = {false, 0};
+static uint32_t s_hw_self = 0;
+static void wdSave();
 static void heltecReboot() {
   s_hw_own = rtcNow(); s_up_last_t = 0;
+  selfResetMark(s_hm.self, millis());   // v1.7.6: set before the pulse, so the banner can never beat it
   logf("REBOOT: pulsing Heltec RST");
   pinMode(HELTEC_RST_PIN, OUTPUT);
   digitalWrite(HELTEC_RST_PIN, LOW);
@@ -560,9 +569,9 @@ static void ingestEvent(const char *type, const char *msg) {
   char m[400], lr[170];
   jsonEsc(m, sizeof(m), msg); jsonEsc(lr, sizeof(lr), s_last_result);
   snprintf(s_ingest_body, sizeof(s_ingest_body),
-    "{\"type\":\"%s\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
+    "{\"type\":\"%s\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"rr\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
     "\"solar_v\":%.2f,\"heap\":%u,\"last_update\":\"%s\",\"msg\":\"%s\"}",
-    type, FW_VERSION, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, bat, batPercent(bat),
+    type, FW_VERSION, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, (int)esp_reset_reason(), bat, batPercent(bat),
     sol, (unsigned)ESP.getFreeHeap(), lr, m);
   ingestPostOrQueue(s_ingest_body);
 }
@@ -762,11 +771,9 @@ static bool s_heltec_uart_on = false;
 // Normal CLI replies never contain these; the echo of a command the T-SIM itself typed is skipped. GPIO6 is not used
 // while awake: it pulses on every CLI reply. A hit only sets a flag; hwAwakeService() handles it at a safe point.
 #define HM_RXBUF        4096
-#define HM_SAME_BOOT_MS 20000   // further markers within 20 s belong to the same boot
 static bool s_hm_on = false;                 // monitor mode: keep the UART open between CLI commands
 static const char *s_hm_echo = nullptr;      // command being typed by heltecCli (its echo is not a boot line)
 static char s_hm_line[128]; static size_t s_hm_len = 0;
-static uint32_t s_hm_hit_ms = 0; static bool s_hm_hit_any = false;
 static volatile bool s_hwa_flag = false; static const char *s_hwa_mark = "";
 static uint32_t s_hm_hits = 0;
 static volatile uint32_t s_g6_edges = 0;
@@ -795,8 +802,9 @@ static void heltecMonLine(const char *l) {
   else if ((q = strstr(l, "Repeater ID: ")) && strlen(q) >= 13 + 32 && hmHex(q + 13, 32)) m = "id";
   if (!m) return;
   s_hm_hits++;
-  if (s_hm_hit_any && millis() - s_hm_hit_ms < HM_SAME_BOOT_MS) { s_hm_hit_ms = millis(); return; }
-  s_hm_hit_any = true; s_hm_hit_ms = millis();
+  int v = hmClassify(s_hm, millis());   // v1.7.6
+  if (v == HM_SAME) return;
+  if (v == HM_SELF) { s_hw_self++; wdSave(); logf("Heltec boot output seen while awake (%s): the T-SIM's own reset, ignored", m); return; }
   s_hwa_mark = m; s_hwa_flag = true;
   logf("Heltec boot output seen while awake (%s)", m);
 }
@@ -844,7 +852,7 @@ static bool heltecCli(const char *cmd, char *out, size_t cap, uint32_t timeout_m
   heltecCliBegin();
   // Wake a power-saving Heltec and flush any half-typed line: a bare CR is an empty command.
   heltecMonPoll();   // v1.7.4: anything unread goes through the boot matcher first
-  if (!strcasecmp(cmd, "reboot")) { s_hw_cons = rtcNow(); s_up_last_t = 0; }   // v1.7.4: a reboot that follows is the console's own
+  if (!strcasecmp(cmd, "reboot")) { s_hw_cons = rtcNow(); s_up_last_t = 0; selfResetMark(s_cons, millis()); }   // v1.7.4: a reboot that follows is the console's own
   s_hm_echo = cmd;
   s_in_cli = true; uint32_t e0 = s_g6_edges;
   HeltecSerial.print("\r"); delay(120); HeltecSerial.print("\r"); delay(150);
@@ -2214,7 +2222,9 @@ static bool upParse(const char *out, uint32_t *up) {
 }
 static void upFromCli(const char *out) {   // awake (status mesh snapshot): a reboot found here goes through hwAwakeService
   uint32_t up; if (!s_up_min || !upParse(out, &up)) return;
-  if (upCheck(up) && !s_hwa_flag) { s_hwa_src = "uptime"; s_hwa_mark = "uptime"; s_hwa_flag = true; }
+  bool rb = upCheck(up);
+  if (rb && (selfResetActive(s_hm.self, millis()) || selfResetActive(s_cons, millis()))) { s_hw_self++; wdSave(); logf("uptime: reboot is the T-SIM's own reset, ignored"); return; }   // v1.7.6
+  if (rb && !s_hwa_flag) { s_hwa_src = "uptime"; s_hwa_mark = "uptime"; s_hwa_flag = true; }
 }
 static void telemRefreshSignal() {
   if (s_tcp_busy) return;
@@ -2223,8 +2233,8 @@ static void telemRefreshSignal() {
 static size_t telemJson(char *out, size_t cap) {
   float bl = batCal(readAdcVolts(BOARD_BAT_ADC_PIN, 2.0f)), sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
   int64_t now = rtcNow();
-  size_t o = snprintf(out, cap, ",\"tl\":{\"fw\":\"%s\",\"bv\":%.2f,\"bp\":%d,\"bl\":%.2f,\"sv\":%.2f,\"csq\":%d,\"rsrp\":%d,\"up\":%lu,\"wake\":%d,\"heap\":%u,\"tc\":%.1f,\"lb\":%d",
-    FW_VERSION, s_bat_idle, batPercent(s_bat_idle), bl, sol, s_sig_csq, s_sig_rsrp, (unsigned long)(millis() / 1000UL), (int)s_wake_cause,
+  size_t o = snprintf(out, cap, ",\"tl\":{\"fw\":\"%s\",\"bv\":%.2f,\"bp\":%d,\"bl\":%.2f,\"sv\":%.2f,\"csq\":%d,\"rsrp\":%d,\"up\":%lu,\"wake\":%d,\"rr\":%d,\"heap\":%u,\"tc\":%.1f,\"lb\":%d",
+    FW_VERSION, s_bat_idle, batPercent(s_bat_idle), bl, sol, s_sig_csq, s_sig_rsrp, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, (int)esp_reset_reason(),
     (unsigned)ESP.getFreeHeap(), temperatureRead(), (int)s_lb_state);
   if (o < cap) o += snprintf(out + o, cap - o, ",\"wdi\":%u,\"wdc\":%u,\"wds\":%u,\"wdh\":%u,\"wdf\":%u",
     (unsigned)s_wd_int_min, (unsigned)s_wd_chk, (unsigned)s_wd_soft, (unsigned)s_wd_hard, (unsigned)s_wd_fail);  // v1.7.1
@@ -2292,10 +2302,10 @@ static void doStatusReport(void) {
     char ope[80], ipe[60]; jsonEsc(ope, sizeof(ope), op); jsonEsc(ipe, sizeof(ipe), ipv);
     jsonEsc(lr, sizeof(lr), s_last_result);
     snprintf(s_ingest_body, sizeof(s_ingest_body),
-      "{\"type\":\"status\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
+      "{\"type\":\"status\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"rr\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
       "\"solar_v\":%.2f,\"csq\":%d,\"rsrp\":%d,\"rsrq\":%d,\"operator\":\"%s\",\"reg\":%d,\"ip\":\"%s\","
       "\"modem_fw\":\"%s\",\"heap\":%u,\"fs_free\":%u,\"last_update\":\"%s\",\"battery_load_v\":%.2f",
-      FW_VERSION, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, bat, batPercent(bat), sol,
+      FW_VERSION, (unsigned long)(millis() / 1000UL), (int)s_wake_cause, (int)esp_reset_reason(), bat, batPercent(bat), sol,
       csqv, rsrp, rsrq, ope, reg, ipe, mfw, (unsigned)ESP.getFreeHeap(), (unsigned)(tot - used), lr, bat_load);
     { size_t L = strlen(s_ingest_body); L += pwrJson(s_ingest_body + L, sizeof(s_ingest_body) - L);
       snprintf(s_ingest_body + L, sizeof(s_ingest_body) - L, ",\"msg\":\"STATUS\"}"); }
@@ -2446,7 +2456,7 @@ static void wdSave() {
   p.putUInt("rst", s_wd_rst); p.putUInt("dlx", s_wd_dlx); p.putUInt("cmdn", s_wd_cmdn);
   p.putBool("hwake", s_hw_en); p.putBool("hwauto", s_hw_auto); p.putUInt("hwn", s_hw_n); p.putUInt("hwi", s_hw_ign); p.putUInt("hws", s_hw_skip);
   p.putUInt("hwsp", s_hw_spur); p.putUInt("hwdn", s_hw_dayn); p.putLong64("hwl", s_hw_last); p.putLong64("hwd0", s_hw_day0);
-  p.putUInt("hwa", s_hw_aw); p.putUInt("hwu", s_hw_up);
+  p.putUInt("hwa", s_hw_aw); p.putUInt("hwu", s_hw_up); p.putUInt("hwo", s_hw_self);
   p.putUInt("upn", s_up_n); p.putUInt("upk", s_up_night); p.putUInt("upr", s_up_nr); p.putUInt("upb", s_up_lowb); p.putUInt("upd", s_up_det);
   p.end();
 }
@@ -2459,7 +2469,7 @@ static void wdLoad() {
   s_hw_skip = p.getUInt("hws", 0); s_hw_spur = p.getUInt("hwsp", 0); s_hw_dayn = p.getUInt("hwdn", 0); s_hw_last = p.getLong64("hwl", 0); s_hw_day0 = p.getLong64("hwd0", 0);
   s_up_min = p.getUInt("upm", UP_DEFAULT_MIN); s_up_sol = p.getUInt("usol", UP_DEFAULT_SOL);
   s_up_n = p.getUInt("upn", 0); s_up_night = p.getUInt("upk", 0); s_up_nr = p.getUInt("upr", 0); s_up_lowb = p.getUInt("upb", 0); s_up_det = p.getUInt("upd", 0);
-  s_hw_aw = p.getUInt("hwa", 0); s_hw_up = p.getUInt("hwu", 0); s_hrp_n = p.getUInt("hrpn", 0); s_hrp_t = p.getLong64("hrpt", 0);
+  s_hw_aw = p.getUInt("hwa", 0); s_hw_up = p.getUInt("hwu", 0); s_hw_self = p.getUInt("hwo", 0); s_hrp_n = p.getUInt("hrpn", 0); s_hrp_t = p.getLong64("hrpt", 0);
   { String hs = p.getString("hrps", ""); strncpy(s_hrp_src, hs.c_str(), sizeof(s_hrp_src) - 1); s_hrp_src[sizeof(s_hrp_src) - 1] = 0; }
   s_wd_cmd = p.getBool("cmd", true); s_wd_rst = p.getUInt("rst", 0); s_wd_dlx = p.getUInt("dlx", 0); s_wd_cmdn = p.getUInt("cmdn", 0);
   {  // last wake hit the awake deadline (esp_timer) or a hardware/task watchdog reset
@@ -2573,11 +2583,11 @@ static int wdSmsStored() {
 }
 static size_t wdJson(char *dst, size_t cap) {
   int64_t now = rtcNow(), nx = s_wd_due > 0 ? s_wd_due - now : -1;
-  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"hwk\":%d,\"hwn\":%u,\"hwi\":%u,\"hws\":%u,\"hwa\":%u,\"hwu\":%u,\"hwr\":%d,\"up\":%u,\"usol\":%u,\"upn\":%u,\"upk\":%u,\"upr\":%u,\"upb\":%u,\"upd\":%u,\"upu\":%lld,\"upa\":%lld,\"ev\":[",
+  size_t o = snprintf(dst, cap, ",\"wd\":{\"int\":%u,\"hb\":%d,\"sms\":%d,\"chk\":%u,\"ok\":%u,\"soft\":%u,\"hard\":%u,\"fail\":%u,\"fails\":%u,\"next\":%lld,\"cmd\":%d,\"cmdn\":%u,\"rst\":%u,\"dlx\":%u,\"hwk\":%d,\"hwn\":%u,\"hwi\":%u,\"hws\":%u,\"hwa\":%u,\"hwu\":%u,\"hwo\":%u,\"hwr\":%d,\"up\":%u,\"usol\":%u,\"upn\":%u,\"upk\":%u,\"upr\":%u,\"upb\":%u,\"upd\":%u,\"upu\":%lld,\"upa\":%lld,\"ev\":[",
     (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (unsigned)s_wd_chk, (unsigned)s_wd_ok, (unsigned)s_wd_soft, (unsigned)s_wd_hard,
     (unsigned)s_wd_fail, (unsigned)s_wd_fails, (long long)nx, (int)s_wd_cmd, (unsigned)s_wd_cmdn, (unsigned)s_wd_rst, (unsigned)s_wd_dlx,
     s_hw_auto ? 2 : (int)s_hw_en, (unsigned)s_hw_n, (unsigned)s_hw_ign, (unsigned)s_hw_skip, (unsigned)s_hw_aw,
-    (unsigned)s_hw_up, s_hw_armres == 255 ? -1 : (int)s_hw_armres, (unsigned)s_up_min, (unsigned)s_up_sol, (unsigned)s_up_n, (unsigned)s_up_night, (unsigned)s_up_nr,
+    (unsigned)s_hw_up, (unsigned)s_hw_self, s_hw_armres == 255 ? -1 : (int)s_hw_armres, (unsigned)s_up_min, (unsigned)s_up_sol, (unsigned)s_up_n, (unsigned)s_up_night, (unsigned)s_up_nr,
     (unsigned)s_up_lowb, (unsigned)s_up_det, s_up_last_t > 0 ? (long long)s_up_last : -1LL, s_up_last_t > 0 && now >= s_up_last_t ? (long long)(now - s_up_last_t) : -1LL);
   const char *q = s_wd_ev; bool first = true;
   while (*q && o < cap) {
@@ -2713,15 +2723,17 @@ static void hwAwakeService() {
   s_hwa_flag = false; s_hwa_busy = true;
   int64_t now = rtcNow();
   if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
-  bool own = s_hw_own > 0 && now >= s_hw_own && now - s_hw_own < HW_DEBOUNCE_S;
-  bool console = s_hw_cons > 0 && now >= s_hw_cons && now - s_hw_cons < HW_DEBOUNCE_S;
+  bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S) || selfResetActive(s_hm.self, millis());   // v1.7.6
+  bool console = rtcOwnWindow(s_hw_cons, now, HW_DEBOUNCE_S) || selfResetActive(s_cons, millis());
+  if (console) s_cons.pending = false;
   const char *src = s_hwa_src; s_hwa_src = "awake";
   bool cold = !strcmp(src, "awake") && s_wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED && millis() < 60000;   // both powered up together
   const char *why = (!s_hw_en && strcmp(src, "uptime")) ? "off (WDCFG hwake=0)" : cold ? "T-SIM cold start (both booted together)" : own ? "T-SIM reset the Heltec itself" :
                     (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
                     s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
   if (why) {
-    if (s_hw_en) { s_hw_ign++; wdSave(); }
+    if (own && !cold) { s_hm.self.pending = false; s_hw_self++; wdSave(); }   // v1.7.6
+    else if (s_hw_en) { s_hw_ign++; wdSave(); }
     logf("Heltec reboot (%s, %s) ignored: %s", src, s_hwa_mark, why);
   } else {
     hwHandleReboot(src, console);
@@ -2749,10 +2761,10 @@ static int upPoll(uint32_t *up_out) {
   bool rb = upCheck(up); *up_out = up;
   if (!rb) { wdSave(); return 0; }
   if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
-  bool own = s_hw_own > 0 && now >= s_hw_own && now - s_hw_own < HW_DEBOUNCE_S;
+  bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S) || selfResetActive(s_hm.self, millis()) || selfResetActive(s_cons, millis());   // v1.7.6
   const char *why = own ? "T-SIM reset the Heltec itself" : (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
                     s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
-  if (why) { s_hw_ign++; wdSave(); logf("Heltec reboot (uptime) ignored: %s", why); return 0; }
+  if (why) { if (own) s_hw_self++; else s_hw_ign++; wdSave(); logf("Heltec reboot (uptime) ignored: %s", why); return 0; }
   return 1;
 }
 
@@ -2952,12 +2964,21 @@ static void processSmsInbox() {
     snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGD=%d", msgs[i].idx);
     modemAT(s_cmdbuf, 5000);
   }
-  // Pass 3: execute.
+  // Pass 3: execute. v1.7.6: identical STATUS / CMD texts in one pass run once (all were deleted in pass 2).
+  static char norm[10][16]; const char *seen[10]; int nseen = 0, merged = 0;
   for (int i = 0; i < count; i++) {
     Msg &m = msgs[i];
     if (m.stale) { logf("SMS[%d] ignored: already read (stale)", m.idx); continue; }
+    char *n = norm[nseen]; strncpy(n, m.body, sizeof(norm[0]) - 1); n[sizeof(norm[0]) - 1] = 0;
+    if (strlen(m.body) < sizeof(norm[0])) {
+      normalizeSmsBody(n);
+      size_t l = strlen(n); if (l >= 4 && strcasecmp(n + l - 4, " ACK") == 0) { n[l - 4] = 0; normalizeSmsBody(n); }
+    } else n[0] = 0;   // long bodies (UPDATE ...) are never merged
+    if (smsIsDup(seen, nseen, n)) { merged++; logf("SMS[%d] merged: same %s already ran this pass", m.idx, n); continue; }
+    if (smsMergeable(n)) seen[nseen++] = n;
     handleCommand(m.from, m.body);
   }
+  if (merged) { char em[64]; snprintf(em, sizeof(em), "Merged %d duplicate text(s) (ran once)", merged); ingestEvent("event", em); }
   logf("SMS processed: %d", count);
 }
 
@@ -3146,12 +3167,12 @@ void setup() {
     bool stuck = true; uint32_t t = millis();
     while (millis() - t < HW_STUCK_MS) { if (digitalRead(HELTEC_HWAKE_PIN)) { stuck = false; break; } delay(5); }
     if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
-    bool own = s_hw_own > 0 && now >= s_hw_own && now - s_hw_own < HW_DEBOUNCE_S;
+    bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S);   // v1.7.6: tolerant of a clock that stepped back
     const char *why = stuck ? "GPIO6 stuck low" : own ? "T-SIM reset the Heltec itself" :
                       (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
                       s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
     if (why) {
-      s_hw_ign++;
+      if (own && !stuck) s_hw_self++; else s_hw_ign++;   // v1.7.6
       if (!own && ++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
       wdSave();
       logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);

@@ -322,7 +322,9 @@ export function overlaySent(st, sent) {
 export function mergeSendLog(history, sent) {
   const h = history || [], log = (sent && sent.log) || [];
   const have = new Set(h.map((e) => (e.received_at || "") + "|" + (e.msg || "")));
-  const add = log.filter((e) => !have.has((e.received_at || "") + "|" + (e.msg || "")));
+  // also drop a send-log line that is the same message as a history line within 2 s (older records got two timestamps)
+  const near = (e) => { const t = Date.parse(e.received_at || ""); return Number.isFinite(t) && h.some((x) => x.msg === e.msg && Math.abs(Date.parse(x.received_at || "") - t) <= 2000); };
+  const add = log.filter((e) => !have.has((e.received_at || "") + "|" + (e.msg || "")) && !near(e));
   if (!add.length) return h;
   return [...h, ...add].sort((a, b) => String(b.received_at || "").localeCompare(String(a.received_at || ""))).slice(0, HISTORY_MAX);
 }
@@ -330,12 +332,12 @@ async function loadState(env, id) {
   const [st, sent] = await Promise.all([kvJson(env, `state:${id}`), kvJson(env, `sent:${id}`)]);
   return overlaySent(st, sent);
 }
-async function recordSend(env, id, st, label, ok, err) {
+async function recordSend(env, id, st, label, ok, err, at = new Date().toISOString()) {
   const sent = (await kvJson(env, `sent:${id}`)) || {};
   for (const f of SENT_FIELDS) if (st[f]) sent[f] = st[f];
   sent.last_send_ts = st.last_send_ts;
   const msg = ok ? `${label} text sent` : `${label} text FAILED: ${err}`;
-  sent.log = [{ received_at: new Date().toISOString(), type: "action", msg }, ...(sent.log || [])].slice(0, 30);
+  sent.log = [{ received_at: at, type: "action", msg }, ...(sent.log || [])].slice(0, 30);
   await putJson(env, `sent:${id}`, sent);
 }
 
@@ -355,14 +357,16 @@ async function manualSend(env, dev, body, label, onSuccess) {
     if (onSuccess) await onSuccess(st);
     st.last_action = { at: new Date().toISOString(), label, sent: true };
     await putJson(env, stKey, st);
-    await recordSend(env, dev.id, st, label, true);
-    await logActivity(env, dev.id, { type: "action", msg: `${label} text sent` });
+    const at = new Date().toISOString();   // one timestamp for both logs, so the merged view shows one line
+    await recordSend(env, dev.id, st, label, true, undefined, at);
+    await logActivity(env, dev.id, { received_at: at, type: "action", msg: `${label} text sent` });
     return [{ sent: true, body, hologram_response_summary: { success: true } }, 200];
   } catch (e) {
     st.last_action = { at: new Date().toISOString(), label, sent: false, error: e.message };
     await putJson(env, stKey, st);
-    await recordSend(env, dev.id, st, label, false, e.message);
-    await logActivity(env, dev.id, { type: "action", msg: `${label} text FAILED: ${e.message}` });
+    const at = new Date().toISOString();
+    await recordSend(env, dev.id, st, label, false, e.message, at);
+    await logActivity(env, dev.id, { received_at: at, type: "action", msg: `${label} text FAILED: ${e.message}` });
     return [{ sent: false, body, hologram_response_summary: { success: false, error: e.message } }, 502];
   }
 }
@@ -495,7 +499,7 @@ export async function resolveTarget(env, id) {
 }
 
 // ---------- ingest ----------
-const NUM = ["uptime", "wake", "battery_v", "battery_pct", "solar_v", "battery_load_v", "battery_raw_v", "cal_scale", "cal_off", "lb_state", "lb_lo", "lb_hi", "lb_int", "csq", "rsrp", "rsrq", "reg", "heap", "fs_free"];
+const NUM = ["uptime", "wake", "rr", "battery_v", "battery_pct", "solar_v", "battery_load_v", "battery_raw_v", "cal_scale", "cal_off", "lb_state", "lb_lo", "lb_hi", "lb_int", "csq", "rsrp", "rsrq", "reg", "heap", "fs_free"];
 const STR = ["fw", "operator", "ip", "modem_fw", "last_update", "msg", "ts"];
 const MESH_RAW = ["heltec_cli", "ver", "name", "clock", "stats_core", "stats_radio", "stats_packets", "neighbors", "error"];
 export function sanitizeTelemetry(t) {
@@ -1053,7 +1057,7 @@ export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
   return { at: receivedAt, stage: S(t && t.stage) || "ok", sms_waiting: n(t && t.sms_waiting), int_min: n(w.int), hb: w.hb === 1 || w.hb === true, sms: w.sms === 1 || w.sms === true,
     checks: n(w.chk), ok: n(w.ok), soft: n(w.soft), hard: n(w.hard), fail: n(w.fail), fails: n(w.fails),
     cmd: w.cmd === undefined ? null : w.cmd === 1 || w.cmd === true, cmd_fetches: n(w.cmdn), restarts: n(w.rst), deadline_resets: n(w.dlx),
-    hwake: n(w.hwk), hw_wakes: n(w.hwn), hw_ignored: n(w.hwi), hw_skipped: n(w.hws), hw_awake: n(w.hwa), hw_uptime: n(w.hwu), hw_arm: n(w.hwr), src: ["wake", "awake", "console", "uptime"].includes(t && t.src) ? t.src : null,
+    hwake: n(w.hwk), hw_wakes: n(w.hwn), hw_ignored: n(w.hwi), hw_skipped: n(w.hws), hw_awake: n(w.hwa), hw_uptime: n(w.hwu), hw_self: n(w.hwo), hw_arm: n(w.hwr), src: ["wake", "awake", "console", "uptime"].includes(t && t.src) ? t.src : null,
     upoll: w.up === undefined ? null : { int_min: n(w.up), usol: n(w.usol), polls: n(w.upn), night: n(w.upk), noreply: n(w.upr), lowbat: n(w.upb), found: n(w.upd), uptime: n(w.upu) != null && w.upu >= 0 ? w.upu : null, age_s: n(w.upa) != null && w.upa >= 0 ? w.upa : null }, reason: String((t && t.reason) ?? "").replace(/[^a-z0-9-]/gi, "").slice(0, 24) || null,
     next_at: n(w.next) != null && w.next >= 0 ? new Date(rt + w.next * 1000).toISOString() : null, events };
 }
@@ -1084,7 +1088,7 @@ export function hrpInfo(tl, receivedAt = new Date().toISOString()) {
 export function tlFields(tl) {
   if (!tl || typeof tl !== "object") return {};
   const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined), o = {};
-  const map = { bv: "battery_v", bp: "battery_pct", bl: "battery_load_v", sv: "solar_v", up: "uptime", wake: "wake", heap: "heap", tc: "chip_temp_c", lb: "lb_state",
+  const map = { bv: "battery_v", bp: "battery_pct", bl: "battery_load_v", sv: "solar_v", up: "uptime", wake: "wake", rr: "rr", heap: "heap", tc: "chip_temp_c", lb: "lb_state",
     wdi: "wd_int", wdc: "wd_checks", wds: "wd_soft", wdh: "wd_hard", wdf: "wd_fail" };
   for (const [k, f] of Object.entries(map)) if (n(tl[k]) !== undefined) o[f] = tl[k];
   if (n(tl.csq) !== undefined && tl.csq >= 0 && tl.csq !== 99) o.csq = tl.csq;
@@ -2625,7 +2629,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 </main><div id="toast" hidden></div>
 <script>${COMMON_JS}
 const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
-const WAKE={0:"Power-on / reset",2:"Text message",4:"Timer",7:"USB / other"};
+const WAKE={0:"Power-on / reset",2:"Text message",3:"Heltec reboot (GPIO6)",4:"Timer",7:"USB / other"};
+const RST={1:"Power-on",3:"Software restart",4:"Panic / crash",5:"Watchdog (interrupt)",6:"Watchdog (task)",7:"Watchdog",8:"Deep-sleep wake",9:"Brownout"},RST_BAD={4:1,5:1,6:1,7:1,9:1};
 const up=s=>s==null?null:(s>=86400?Math.floor(s/86400)+"d ":"")+(s>=3600?Math.floor(s%86400/3600)+"h ":"")+Math.floor(s%3600/60)+"m";
 const post=(a,b)=>fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
 const rj=async r=>{try{return await r.json()}catch{return{}}};
@@ -2652,7 +2657,7 @@ async function load(){unitsBtn();
  const CI=(d.watchdog&&d.watchdog.checkin)||{},off=!!CI.offline;
  $("seen").textContent=seen?(off?"Offline · last seen ":stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale||off?" stale":"");
  const ow=$("offwarn");ow.hidden=!off;if(off)ow.textContent="⚠ The T-SIM has missed "+CI.missed+" expected check-ins (expected every "+hrs(CI.expected_s/60)+" by its "+(CI.by==="schedule"?"scheduled check":"watchdog")+"; last seen "+ago(L.received_at)+", "+t(L.received_at)+" ET). Its modem may be off the network: texts won't reach it until it reconnects. The watchdog retries on its own; if it stays silent, power-cycle it on site.";
- $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Uptime",L.uptime==null?null:up(L.uptime)]]);
+ $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Last reset",L.rr==null?null:{h:(RST_BAD[L.rr]?'<span class="err">':"<span>")+e(RST[L.rr]||String(L.rr))+"</span>"}],["Uptime",L.uptime==null?null:up(L.uptime)]]);
  $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Battery protection",L.lb_state==null?null:(L.lb_state?"Repeat OFF (low battery)":"normal")],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
@@ -2726,7 +2731,7 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
-  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+["off","auto-off","not armed (GPIO6 low)","arming failed","armed"][X.hw_arm]:""):null],
+  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+(X.hw_self!=null?" · own resets ignored "+X.hw_self:"")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+["off","auto-off","not armed (GPIO6 low)","arming failed","armed"][X.hw_arm]:""):null],
   ["Daylight uptime check",X&&X.upoll?(X.upoll.int_min?"every "+hrs(X.upoll.int_min)+(X.upoll.usol?" when solar ≥ "+(X.upoll.usol/1000).toFixed(1)+" V":" day and night"):"off")+" · checks "+(X.upoll.polls??"?")+" · night "+(X.upoll.night??"?")+" · low battery "+(X.upoll.lowbat??"?")+" · no reply "+(X.upoll.noreply??"?")+" · reboots found "+(X.upoll.found??"?")+(X.upoll.uptime!=null?" · repeater up "+hrs(Math.round(X.upoll.uptime/60))+(X.upoll.age_s!=null?" ("+ago(new Date(Date.parse(X.at)-X.upoll.age_s*1000).toISOString())+")":""):""):null],
   ["Wire self-test (since T-SIM boot)",L.wire_diag?"serial reply bytes "+L.wire_diag.cli_bytes+" · GPIO6 pulses during replies "+L.wire_diag.g6_cli_edges+(L.wire_diag.cli_bytes>50&&!L.wire_diag.g6_cli_edges?" ⚠ replies arrive but GPIO6 sees nothing: the wake wire isn't reaching GPIO6":"")+" · unprompted bytes "+L.wire_diag.unsol_bytes+" · unprompted pulses "+L.wire_diag.g6_idle_edges:null],
   ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],

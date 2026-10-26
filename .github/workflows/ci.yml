@@ -31,6 +31,9 @@ jobs:
         with:
           path: ~/.platformio
           key: pio-${{ hashFiles('firmware/platformio.ini') }}
+      - name: Host tests (self-reset guard, SMS merge)
+        run: g++ -std=c++17 -Wall -Wextra -I src test/host_test.cpp -o /tmp/host_test && /tmp/host_test
+        working-directory: firmware
       - run: pip install platformio
       # No include/config.h in CI: the build uses config.example.h placeholders. Such a firmware.bin is
       # meant for OTA onto a T-SIM already running >= 1.6.0, which keeps its real config in NVS.

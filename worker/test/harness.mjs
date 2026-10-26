@@ -1502,3 +1502,32 @@ console.log("serial.ondemand tests OK");
   } finally { globalThis.fetch = realFetch; }
   console.log("T-SIM update checksum fix tests OK");
 }
+
+// ---------- v1.7.6: reset reason, GPIO6 wake label, own-reset counter, one "text sent" line per send ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.tlFields({ rr: 8, wake: 2 }).rr, 8); assert.equal(M.tlFields({ rr: "x" }).rr, undefined);
+  const hb = M.parseHeartbeat({ stage: "ok", wd: { int: 720, hwi: 0, hwo: 3 } }); assert.equal(hb.hw_self, 3);
+  assert.equal(M.parseHeartbeat({ stage: "ok", wd: { int: 720 } }).hw_self, null);
+  // the old double line: send log and history 185 ms apart -> merged view shows one; a separate send stays
+  const h = [{ received_at: "2026-10-26T10:02:31.109Z", type: "action", msg: "STATUS text sent" }];
+  const sent = { log: [{ received_at: "2026-10-26T10:02:30.924Z", type: "action", msg: "STATUS text sent" }, { received_at: "2026-10-26T10:00:00.000Z", type: "action", msg: "STATUS text sent" }] };
+  assert.equal(M.mergeSendLog(h, sent).filter((x) => x.msg === "STATUS text sent").length, 2);
+  // a real send writes one timestamp to both logs
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.76")).headers.get("Set-Cookie").split(";")[0];
+  const st = JSON.parse(kv.get("state:tsim-1") || "{}"); st.last_send_ts = 0; kv.set("state:tsim-1", JSON.stringify(st));
+  const holo0 = holo; holoOk = true;
+  const r = await call("/api/d/tsim-1/status", { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: "{}" });
+  assert.equal(r.status, 200, "status send");
+  const hist = JSON.parse(kv.get("telem:tsim-1:history")), sl = JSON.parse(kv.get("sent:tsim-1")).log;
+  assert.equal(hist[0].msg, "STATUS text sent"); assert.equal(hist[0].received_at, sl[0].received_at, "one timestamp for both logs");
+  assert.equal(M.mergeSendLog(hist, { log: sl }).filter((x) => x.received_at === sl[0].received_at && x.msg === "STATUS text sent").length, 1);
+  assert.equal(holo, holo0 + 1, "exactly one text");
+  // ingest carries rr to latest; page shows the new labels and still parses
+  const dev = JSON.parse(kv.get("device:tsim-1"));
+  assert.equal((await call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify({ type: "status", fw: "tsim-updater 1.7.6", uptime: 12, wake: 2, rr: 8, msg: "STATUS", tl: { fw: "tsim-updater 1.7.6", up: 12, wake: 2, rr: 8 } }) })).status, 200);
+  assert.equal(JSON.parse(kv.get("telem:tsim-1:latest")).rr, 8);
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text(); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert(pg.includes('3:"Heltec reboot (GPIO6)"') && pg.includes('"Last reset"') && pg.includes('9:"Brownout"') && pg.includes("own resets ignored"));
+  console.log("v1.7.6 reset reason / wake label / send-log tests OK");
+}
