@@ -83,10 +83,33 @@ export async function resolveTsimTarget(env, id) {
   }
   const rel = await latestRelease(env, { repo: src.repo, asset_pattern: src.asset });
   if (rel.skipped) return { src, rel };
-  let checksum = src.checksum || "";
-  if (!checksum && rel.digest) { try { checksum = normChecksum(rel.digest); } catch {} }
-  return { src, rel: { ...rel, checksum } };
+  if (src.checksum) return { src, rel: { ...rel, checksum: src.checksum, checksum_src: "manual" } };
+  return { src, rel: { ...rel, ...(await resolveChecksum(rel)) } };
 }
+// Checksum for a release asset, freshest source first (fix after the v1.7.5 OTA: a checksum read while the tag build was
+// still replacing the files went stale). 1) the release's "<asset>.sha256" file, downloaded from its public URL (works
+// for the API and the web-page fallback); 2) the GitHub API asset digest. If the two disagree, the release files are
+// still being replaced: no checksum and conflict set, so nothing is sent until they agree.
+export function parseSha256File(text, name) {
+  for (const line of String(text || "").slice(0, 4000).split(/\r?\n/)) {
+    const m = line.trim().match(/^([0-9a-fA-F]{64})(?:\s+\*?(\S+))?$/);
+    if (m && (!m[2] || !name || m[2] === name || m[2].endsWith("/" + name))) return "sha256:" + m[1].toLowerCase();
+  }
+  return null;
+}
+export async function resolveChecksum(rel) {
+  let file = null, dig = null;
+  if (rel.url && rel.sha_asset !== false && /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//.test(rel.url)) {
+    try { const r = await fetch(rel.url + ".sha256", { headers: { "User-Agent": UA } }); if (r.ok) file = parseSha256File(await r.text(), rel.asset_name); } catch {}
+  }
+  if (rel.digest) { try { dig = normChecksum(rel.digest); } catch {} }
+  if (dig && !dig.startsWith("sha256:")) dig = null;
+  if (file && dig && file !== dig) return { checksum: "", checksum_src: "conflict", conflict: { file, digest: dig } };
+  if (file) return { checksum: file, checksum_src: "sha256-file" };
+  if (dig) return { checksum: dig, checksum_src: "api-digest" };
+  return { checksum: "", checksum_src: "none" };
+}
+export const TSIM_CONFLICT_MSG = "The release files are still being replaced (its .sha256 file and GitHub's checksum disagree). Nothing was sent; try again in a few minutes.";
 export const buildTsimCommand = (url, checksum) => `TSIMUPDATE ${url}${checksum ? " " + checksum : ""}`;
 
 const getSource = async (env, id) => {
@@ -227,7 +250,7 @@ async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
   const names = [...page.matchAll(/\/releases\/download\/[^"]+?\/([^"/]+)"/g)].map((m) => decodeURIComponent(m[1]));
   const name = pattern ? pickAsset(names, pattern) : names.find((n) => ASSET_RE.test(n));
   if (!name) return { skipped: `no upgrade asset in ${tag}` };
-  return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html",
+  return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html", sha_asset: names.includes(name + ".sha256"),
     notes: "", html_url: safeRelUrl(null, REPO, tag) };
 }
 
@@ -253,6 +276,7 @@ export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
   const asset = (rel.assets || []).find((a) => a.name === an);
   if (!asset) return { skipped: `no upgrade asset in ${rel.tag_name}` };
   return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null,
+    asset_updated_at: asset.updated_at || null, sha_asset: (rel.assets || []).some((a) => a.name === asset.name + ".sha256"),
     notes: relNotes(rel.body), html_url: safeRelUrl(rel.html_url, REPO, rel.tag_name) };
 }
 // Release notes cached with the release check: plain text, control chars stripped, capped (rendered escaped in the dashboard).
@@ -1969,22 +1993,30 @@ async function deviceApi(request, env, dev, action) {
     const retry = action === "tsim-update" ? await bodyRetry(request) : false;
     if (action === "tsim-update") { const d = await dupeCheck(env, id, "tsim", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409); }
     const prevSent = ((await kvJson(env, `state:${id}`)) || {}).tsim_update_sent;
-    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, checksum: prevSent.checksum, asset_name: prevSent.asset_name, tag: prevSent.tag };
-    else try { ({ rel } = await resolveTsimTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
+    // Retry re-resolves the release like a normal update (fresh file + checksum). Only when GitHub can't be reached does it
+    // fall back to the file and checksum of the last update sent.
+    let stale = false;
+    try { ({ rel } = await resolveTsimTarget(env, id)); }
+    catch (e) {
+      if (!(retry && prevSent && prevSent.url)) return json({ sent: false, error: e.message }, 502);
+      rel = { url: prevSent.url, checksum: prevSent.checksum || "", checksum_src: "previous", asset_name: prevSent.asset_name, tag: prevSent.tag }; stale = true;
+    }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const rec = { ...rel, checked_at: new Date().toISOString() };
-    if (!(retry && prevSent && prevSent.url)) await putJson(env, `tsimrel:${id}`, rec);
+    if (!stale && !rel.draft) await putJson(env, `tsimrel:${id}`, rec);
     if (action === "tsim-check") return json({ sent: false, latest_available: rec });
+    if (rel.checksum_src === "conflict") { await logActivity(env, id, { type: "event", msg: "T-SIM update not sent: " + TSIM_CONFLICT_MSG }); return json({ sent: false, error: TSIM_CONFLICT_MSG, release: rec }, 409); }
     const cmd = buildTsimCommand(rel.url, rel.checksum);
     if (cmd.length > 450) return json({ sent: false, error: "firmware URL too long" }, 400);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     for (const c of list) if (c.status === "queued" && c.sys && isTsimUpd(c)) c.status = "cancelled";  // only one pending self-update
     const entry = { id: randomHex(4), cmd, sys: true, status: "queued", queued_at: new Date().toISOString() };
-    const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware ${retry ? "update retry" : "update"} (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})`, async (st) => {
+    const csNote = rel.checksum ? "" : " · no checksum available: sent UNVERIFIED (the T-SIM can't check the download)";
+    const [o, code] = await manualSend(env, dev, "CMD", `T-SIM firmware ${retry ? "update retry" : "update"} (${rel.asset_name}${rel.tag && rel.tag !== "url" ? " " + rel.tag : ""})${stale ? " · GitHub unreachable, reusing the previous file and checksum" : ""}${csNote}`, async (st) => {
       st.tsim_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, checksum: rel.checksum || null, url: rel.url, retry };
     });
     if (o.sent) { list.unshift(entry); await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY)); }
-    return json({ ...o, release: rec, queued: o.sent ? entry : null }, code);
+    return json({ ...o, release: rec, queued: o.sent ? entry : null, unverified: !rel.checksum, reused_previous: stale }, code);
   }
   if (action === "gps-fix" || action === "gps-cancel") {
     const [cmds, gps, greq, gcfg, lat] = await Promise.all([kvJson(env, `cmds:${id}`), kvJson(env, `gps:${id}`), kvJson(env, `gpsreq:${id}`), kvJson(env, `gpscfg:${id}`), kvJson(env, `telem:${id}:latest`)]);
@@ -2209,7 +2241,7 @@ function statuses(latest, mesh, s, hist, rel, tsimRel) {
   return { tsim: updateStatus(latest && latest.fw, tsimRel), radio: radioStatus(mesh, s, rel, radioFlashed(s, hist)) };
 }
 // Cron: refresh release checks for GitHub sources (server-side GitHub API only; never texts a device).
-const REFRESH_MS = 6 * 3600e3;
+const REFRESH_MS = 6 * 3600e3, TSIM_SETTLE_MS = 15 * 60e3;
 export async function refreshReleases(env, now = Date.now()) {
   const cache = new Map(), out = [];
   const get = async (src) => { const k = src.repo + "|" + src.asset_pattern + "|" + (src.tag_prefix || ""); if (!cache.has(k)) cache.set(k, latestRelease(env, src).catch((e) => ({ skipped: "error: " + e.message }))); return cache.get(k); };
@@ -2221,11 +2253,13 @@ export async function refreshReleases(env, now = Date.now()) {
         if (!rel.skipped) { await putJson(env, `release:${id}`, { ...rel, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":radio"); }
       }
       const ts = await getTsimSource(env, id), tcur = await kvJson(env, `tsimrel:${id}`);
-      if (ts.mode !== "url" && !(tcur && tcur.checked_at && tcur.notes !== undefined && now - Date.parse(tcur.checked_at) < REFRESH_MS)) {
+      // A record read within 15 min of the release being published is provisional: the tag build may still replace the files.
+      const provisional = tcur && tcur.published_at && tcur.checked_at && Date.parse(tcur.checked_at) - Date.parse(tcur.published_at) < TSIM_SETTLE_MS;
+      if (ts.mode !== "url" && (provisional || !(tcur && tcur.checked_at && tcur.notes !== undefined && now - Date.parse(tcur.checked_at) < REFRESH_MS))) {
         const r = await get({ repo: ts.repo, asset_pattern: ts.asset });
-        if (!r.skipped) {
-          let checksum = ts.checksum || ""; if (!checksum && r.digest) { try { checksum = normChecksum(r.digest); } catch {} }
-          await putJson(env, `tsimrel:${id}`, { ...r, checksum, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":tsim");
+        if (!r.skipped && !r.draft) {
+          const cs = ts.checksum ? { checksum: ts.checksum, checksum_src: "manual" } : await resolveChecksum(r);
+          await putJson(env, `tsimrel:${id}`, { ...r, ...cs, checked_at: new Date(now).toISOString(), auto: true }); out.push(id + ":tsim");
         }
       }
     } catch (e) { out.push(id + ":error"); }

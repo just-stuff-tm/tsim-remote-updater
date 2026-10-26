@@ -283,7 +283,7 @@ assert.equal(typeof worker.scheduled, "function");
   assert.equal((await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text().then ? await (await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text() : "", "");
   let t = await tel(); assert.equal(t.progress.tsim.state, "cancelled"); assert(/Nothing will be installed/.test(t.progress.tsim.reason));
   assert.equal((await D("update-cancel", { kind: "tsim" })).status, 409);
-  // retry re-queues the SAME file with one text
+  // retry re-resolves the release (same file here) and queues it with one text
   resetGap(); const url0 = JSON.parse(kv.get("state:dyn-1")).tsim_update_sent.url;
   j = await (await D("tsim-update", { retry: true })).json(); assert(j.sent); assert.equal(holo, h0 + 2);
   const txt = await (await call("/api/dev/dyn-1/commands", { headers: { "X-Device-Key": key } })).text(); assert(txt.includes(url0));
@@ -1433,4 +1433,72 @@ console.log("serial.ondemand tests OK");
   assert(pg.includes('name="upoll"') && pg.includes('name="usol"')); for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
   assert.equal(holo, holo0, "nothing texted");
   console.log("v1.7.5 daylight uptime check tests OK");
+}
+
+// ---------- T-SIM update checksum fix: retry re-resolves, .sha256 file preferred, web-page fallback, conflict, provisional cache ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.parseSha256File("62C54EA42FBCE18C40547762F0258391D02CAC10C04D3AA592255EADAEF7FF84  firmware.bin\n", "firmware.bin"), "sha256:62c54ea42fbce18c40547762f0258391d02cac10c04d3aa592255eadaef7ff84");
+  assert.equal(M.parseSha256File("ab".repeat(32) + "  other.bin", "firmware.bin"), null); assert.equal(M.parseSha256File("garbage", "firmware.bin"), null);
+  assert.equal(M.parseSha256File("cd".repeat(32), "firmware.bin"), "sha256:" + "cd".repeat(32));
+  const R = "acme/tsimfw", D = `https://github.com/${R}/releases/download/v9.0.0/`;
+  const S = { file: "11".repeat(32), digest: "11".repeat(32), shaAsset: true, api: 200, fetched: [] };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    url = String(url);
+    if (url === `https://api.github.com/repos/${R}/releases/latest`) {
+      if (S.api !== 200) return new Response("rate limited", { status: S.api });
+      const assets = [{ id: 1, name: "firmware.bin", digest: S.digest ? "sha256:" + S.digest : undefined, updated_at: "2026-10-26T00:13:15Z", browser_download_url: D + "firmware.bin" }];
+      if (S.shaAsset) assets.push({ id: 2, name: "firmware.bin.sha256", browser_download_url: D + "firmware.bin.sha256" });
+      return new Response(JSON.stringify({ tag_name: "v9.0.0", published_at: "2026-10-26T00:12:06Z", body: "n", html_url: `https://github.com/${R}/releases/tag/v9.0.0`, assets }));
+    }
+    if (url === D + "firmware.bin.sha256") { S.fetched.push(url); return S.file ? new Response(S.file + "  firmware.bin\n") : new Response("nf", { status: 404 }); }
+    if (url === `https://github.com/${R}/releases/latest`) return new Response(null, { status: 302, headers: { Location: `https://github.com/${R}/releases/tag/v9.0.0` } });
+    if (url === `https://github.com/${R}/releases/expanded_assets/v9.0.0`) return new Response(`<a href="/${R}/releases/download/v9.0.0/firmware.bin">x</a>` + (S.shaAsset ? `<a href="/${R}/releases/download/v9.0.0/firmware.bin.sha256">y</a>` : ""));
+    return realFetch(url, init);
+  };
+  try {
+    await admin("/admin/devices", "POST", { id: "cs-1", hologram_device_id: "1234567" });
+    await admin("/admin/devices/cs-1/reset-password", "POST", { password: "cs-device-password" });
+    kv.set("tsimsrc:cs-1", JSON.stringify({ mode: "github", repo: R, asset: "firmware.bin", url: "", checksum: "" }));
+    const ck = (await login("cs-1", "cs-device-password", "6.6.6.61")).headers.get("Set-Cookie").split(";")[0];
+    const Dp = (a, body) => call("/api/d/cs-1/" + a, { method: "POST", headers: { Cookie: ck, "Content-Type": "application/json" }, body: body && JSON.stringify(body) });
+    const key = JSON.parse(kv.get("device:cs-1")).ingest_key;
+    const cmds = async () => await (await call("/api/dev/cs-1/commands", { headers: { "X-Device-Key": key } })).text();
+    const fail = async () => { await call("/ingest/cs-1", { method: "POST", headers: { "X-Device-Key": key }, body: JSON.stringify({ type: "update", msg: "TSIM OTA FAIL: sha256 mismatch" }) });
+      const s = JSON.parse(kv.get("state:cs-1")); s.last_send_ts = 0; kv.set("state:cs-1", JSON.stringify(s)); };
+    const H = () => JSON.parse(kv.get("telem:cs-1:history") || "[]").map((x) => x.msg || "");
+    const h0 = holo;
+    // 1) normal update: checksum from the .sha256 file
+    let j = await (await Dp("tsim-update")).json(); assert(j.sent); assert.equal(j.release.checksum_src, "sha256-file"); assert.equal(j.unverified, false);
+    assert((await cmds()).includes("TSIMUPDATE " + D + "firmware.bin sha256:" + "11".repeat(32)));
+    // 2) the tag build replaced the files: retry must pick up the NEW checksum, not the one stored with the last send
+    await fail(); S.file = S.digest = "22".repeat(32);
+    j = await (await Dp("tsim-update", { retry: true })).json(); assert(j.sent, JSON.stringify(j)); assert.equal(j.reused_previous, false);
+    let c = await cmds(); assert(c.includes("sha256:" + "22".repeat(32)) && !c.includes("11".repeat(32)), "retry re-resolved");
+    assert.equal(JSON.parse(kv.get("state:cs-1")).tsim_update_sent.checksum, "sha256:" + "22".repeat(32));
+    // 3) mid-replacement (.sha256 file and API digest disagree): nothing is sent
+    await fail(); S.file = "33".repeat(32); const h3 = holo;
+    let r = await Dp("tsim-update", { retry: true }); assert.equal(r.status, 409); j = await r.json(); assert(!j.sent && /still being replaced/.test(j.error)); assert.equal(holo, h3, "conflict sends no text");
+    // 4) API rate-limited -> web-page fallback still gets the checksum from the public .sha256 download
+    S.api = 403; S.file = S.digest = "44".repeat(32); const n4 = S.fetched.length;
+    j = await (await Dp("tsim-check")).json(); assert.equal(j.latest_available.via, "html"); assert.equal(j.latest_available.checksum, "sha256:" + "44".repeat(32)); assert.equal(j.latest_available.checksum_src, "sha256-file"); assert(S.fetched.length > n4);
+    // 5) truly nothing available: sent unverified and logged clearly
+    S.api = 200; S.shaAsset = false; S.digest = null;
+    j = await (await Dp("tsim-update", { retry: true })).json(); assert(j.sent); assert.equal(j.unverified, true); assert.equal(j.release.checksum_src, "none");
+    assert(H().some((m) => /no checksum available: sent UNVERIFIED/.test(m)));
+    // 6) GitHub unreachable on retry: falls back to the last update sent, and says so
+    await fail(); S.api = 500;
+    j = await (await Dp("tsim-update", { retry: true })).json(); assert(j.sent); assert.equal(j.reused_previous, true);
+    assert(H().some((m) => /GitHub unreachable, reusing the previous file and checksum/.test(m)));
+    // 7) cron: a record read within 15 min of publishing is provisional and gets refreshed even inside the 6 h window
+    S.api = 200; S.shaAsset = true; S.file = S.digest = "55".repeat(32);
+    kv.set("tsimrel:cs-1", JSON.stringify({ tag: "v9.0.0", url: D + "firmware.bin", checksum: "sha256:" + "11".repeat(32), published_at: "2026-10-26T00:12:06Z", checked_at: "2026-10-26T00:12:38Z", notes: "" }));
+    await M.refreshReleases(env, Date.parse("2026-10-26T01:00:00Z"));
+    let tr = JSON.parse(kv.get("tsimrel:cs-1")); assert.equal(tr.checksum, "sha256:" + "55".repeat(32)); assert.equal(tr.checksum_src, "sha256-file");
+    S.file = S.digest = "66".repeat(32); await M.refreshReleases(env, Date.parse("2026-10-26T02:00:00Z"));
+    assert.equal(JSON.parse(kv.get("tsimrel:cs-1")).checksum, "sha256:" + "55".repeat(32), "settled record stays cached for 6 h");
+    assert.equal(holo - h0, 4, "texts only for the 4 sends that were requested and allowed");
+  } finally { globalThis.fetch = realFetch; }
+  console.log("T-SIM update checksum fix tests OK");
 }
