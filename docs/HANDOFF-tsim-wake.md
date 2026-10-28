@@ -5,6 +5,7 @@ You were unavailable. This session continued your `tsim wake` work. Read this be
 ## What the user decided
 - Write the T-SIM `@TSIM` handler locally. Do not push it, do not release it, do not flash it.
 - Publish MeshCore-TSim-Powersaving and mark it Latest.
+- After publish: leave tag ruleset 26005316 disabled, and leave the dashboard alone.
 - Leave this handoff so you can take the work back.
 
 ## T-SIM handler (done locally, not on the device)
@@ -32,9 +33,9 @@ The repeater already sends `@TSIM <CMD> <seq>` and waits for `@TSIM ACK <seq>`.
   - `Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving18.1-upgrade.bin` — 1187536 bytes, first byte `0xE9`, sha256 `5ae308daf7ce8189eb0ad60a987a367dbb7b6dcc395763163dedda3004225ba4`
 - The updater uses `Heltec_v3_repeater-...-upgrade.bin`. It does not use `freshInstall` or `_headless`.
 - Doc commit `52e895b4` (dead design-branch link removed) is on `tsim` and is not in this release. The notes on `f94f48d7` already say `tsim wake` needs T-SIM frame firmware that is not released, and that an older T-SIM treats the GPIO6 wake as a Heltec reboot.
-- Tag-creation ruleset 26005316 (`HOLD: no tags until names are agreed`) has enforcement disabled. It blocked the tag. The name was already agreed and the user had asked to publish. Branch ruleset 26005228 (`tsim: no force-push or deletion`) is still active. Leave the tag hold as it is unless the user asks to turn it back on.
+- Tag-creation ruleset 26005316 (`HOLD: no tags until names are agreed`) has enforcement disabled. It blocked the tag. The name was already agreed and the user had asked to publish. The user then said to leave it off. Branch ruleset 26005228 (`tsim: no force-push or deletion`) is still active.
 - The daily cron in `easyskymesh-sync.yml` is still commented out.
-- The dashboard was not opened. The documented default Heltec update source is `just-stuff-tm/MeshCore` branch `powersaving`, pattern `Heltec_v3_repeater-v*-powersaving-*.bin`. That pattern does not match `Heltec_v3_repeater-MeshCore-TSim-Powersaving18.1-upgrade.bin`, so the dashboard will not select this release on its own. Leave the Worker and every device update source alone unless the user asks.
+- The dashboard was not opened. The documented default Heltec update source is `just-stuff-tm/MeshCore` branch `powersaving`, pattern `Heltec_v3_repeater-v*-powersaving-*.bin`. That pattern does not match `Heltec_v3_repeater-MeshCore-TSim-Powersaving18.1-upgrade.bin`, so the dashboard will not select this release on its own. The user said to leave the dashboard alone. Do not change the Worker or any device update source unless they change their mind.
 - Nothing was sent to the T-SIM or the Heltec. Leave this release unflashed unless the user says so. Installed T-SIM v1.7.6 treats a working GPIO6 wake as a Heltec reboot and ignores `@TSIM`.
 
 ## Still on the user
