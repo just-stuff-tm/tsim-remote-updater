@@ -13,7 +13,7 @@
 #endif
 #define INGEST_URL          WORKER_URL "/ingest/" DEVICE_ID
 
-#define FW_VERSION          "tsim-updater 1.7.6"
+#define FW_VERSION          "tsim-updater 1.7.7"
 #define FW_BUILD_DATE       __DATE__ " " __TIME__
 
 // LilyGO T-SIM7670G-S3 / T-SIM7672G V1.1 modem pins
@@ -37,7 +37,8 @@
 #define HELTEC_UART_RX_PIN  41
 // v1.7.3 optional Heltec-reboot wake (1.7.4 also detects reboots while awake via the GPIO41 UART boot banner): Heltec TX43 -> Schottky (cathode to Heltec) -> GPIO6, 47-220nF GPIO6 to GND.
 // Internal pull-up (~45k, kept in deep sleep); an external 100k to 3V3 is optional.
-// GPIO6 is an RTC GPIO (ext1 wake), free on the left header. Any low = the Heltec printed (boot log).
+// GPIO6 is an RTC GPIO (ext1 wake), free on the left header. Any low = the Heltec printed (boot log
+// or a tsim-wake pulse). v1.7.7 listens for "@TSIM <CMD> <seq>" before treating the wake as a reboot.
 #define HELTEC_HWAKE_PIN    6
 
 

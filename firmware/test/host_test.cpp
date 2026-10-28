@@ -1,5 +1,6 @@
 // Host test for firmware/src/hw_guard.h (v1.7.6). Run: g++ -std=c++17 -Wall -I../src host_test.cpp -o /tmp/ht && /tmp/ht
 #include "hw_guard.h"
+#include "tsim_frame.h"
 #include <cassert>
 #include <cstdio>
 #define HW_DEBOUNCE_S 60
@@ -50,6 +51,23 @@ int main() {
   }
   assert(merged == 4); assert(ran == 5); assert(reboots == 2);   // REBOOT is never merged
   assert(!smsMergeable("UPDATE https://x")); assert(!smsMergeable("")); assert(!smsMergeable(nullptr));
-  printf("v1.7.6 host tests OK (self-reset guard, RTC step-back, SMS merge)\n");
+  // 9) tsim wake frames
+  TsimFrame fr;
+  assert(tsimParseLine("@TSIM STATUS 4711", &fr) == TF_CMD);
+  assert(fr.seq == 4711 && !strcmp(fr.cmd, "STATUS"));
+  assert(tsimParseLine("  @TSIM status 12", &fr) == TF_CMD);
+  assert(fr.seq == 12 && !strcmp(fr.cmd, "STATUS"));
+  assert(tsimParseLine("@TSIM MODEM_RESET 9", &fr) == TF_CMD);
+  assert(!strcmp(fr.cmd, "MODEM_RESET") && fr.seq == 9);
+  assert(tsimParseLine("@TSIM wake 1", &fr) == TF_CMD && !strcmp(fr.cmd, "WAKE"));
+  assert(tsimParseLine("@TSIM ACK 4711", &fr) == TF_IGNORE);
+  assert(tsimParseLine("@TSIM ACK", &fr) == TF_IGNORE);
+  assert(tsimParseLine("@TSIM NOPE 3", &fr) == TF_REJECT);
+  assert(tsimParseLine("@TSIM WAKE", &fr) == TF_REJECT);
+  assert(tsimParseLine("@TSIM WAKE 0", &fr) == TF_REJECT);
+  assert(tsimParseLine("@TSIM TOOLONGCOMMANDNAME 4", &fr) == TF_REJECT);
+  assert(tsimParseLine("Repeater ID: ab", &fr) == TF_NONE);
+  assert(tsimParseLine(nullptr, &fr) == TF_NONE);
+  printf("v1.7.7 host tests OK (self-reset guard, RTC step-back, SMS merge, tsim wake frames)\n");
   return 0;
 }

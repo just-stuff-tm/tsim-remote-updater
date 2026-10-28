@@ -17,6 +17,7 @@
 #include <ESP_SSLClient.h>
 #include "board.h"
 #include "hw_guard.h"   // v1.7.6 self-reset guard + SMS merge (host-tested)
+#include "tsim_frame.h" // v1.7.7 @TSIM frame parser (host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -794,7 +795,25 @@ static void g6DiagStop() {
   s_g6_on = false;
 }
 static bool hmHex(const char *p, int n) { for (int i = 0; i < n; i++) if (!isxdigit((unsigned char)p[i])) return false; return true; }
+// v1.7.7 tsim-wake frames. The repeater retries the same seq until it sees "@TSIM ACK <seq>".
+// s_tf_pend is set from the UART monitor; tfService() ACKs at a safe point (not inside a CLI read).
+static bool s_tf_pend = false, s_tf_fresh = false, s_tf_status_boot = false;
+static TsimFrame s_tf_fr;
+static uint16_t s_tf_last = 0;
+static char s_tf_cmd[16] = "";
+static bool tfOnLine(const char *l) {
+  if (strstr(l, "@TSIM ACK")) return true;   // our own ACK, echoed by the Heltec: never reply again
+  TsimFrame fr;
+  int k = tsimParseLine(l, &fr);
+  if (k == TF_NONE) return false;
+  if (k == TF_IGNORE) return true;
+  if (k == TF_REJECT) { logf("tsim wake rejected: %.60s", l); return true; }
+  s_tf_fr = fr;
+  s_tf_pend = true;
+  return true;
+}
 static void heltecMonLine(const char *l) {
+  if (tfOnLine(l)) return;
   if (s_hm_echo && s_hm_echo[0] && strstr(l, s_hm_echo)) return;
   const char *m = nullptr, *q;
   if (strstr(l, "ESP-ROM:esp32")) m = "rom";
@@ -845,6 +864,43 @@ static void heltecMonStop() {
   if (s_hm_on) { heltecMonPoll(); s_hm_on = false; }
   heltecCliEnd();
   g6DiagStop();
+}
+// ACK one frame. A repeat of the seq we already accepted is ACK-only (the repeater retries every 1.5 s).
+static void tfAck(unsigned seq) {
+  heltecCliBegin();
+  char line[32];
+  int n = snprintf(line, sizeof(line), "@TSIM ACK %u\r\n", seq);
+  if (n > 0) HeltecSerial.write((const uint8_t *)line, (size_t)n);
+  HeltecSerial.flush();
+  logf("tsim wake ACK seq %u", seq);
+}
+static void tfService() {
+  if (!s_tf_pend) return;
+  s_tf_pend = false;
+  TsimFrame fr = s_tf_fr;
+  bool retry = s_tf_last != 0 && s_tf_last == (uint16_t)fr.seq;
+  tfAck(fr.seq);
+  if (retry) { logf("tsim wake %s seq %u retry (ACK only)", fr.cmd, fr.seq); return; }
+  s_tf_last = (uint16_t)fr.seq;
+  strncpy(s_tf_cmd, fr.cmd, sizeof(s_tf_cmd) - 1);
+  s_tf_cmd[sizeof(s_tf_cmd) - 1] = 0;
+  s_tf_fresh = true;
+  logf("tsim wake %s seq %u", fr.cmd, fr.seq);
+}
+// After a GPIO6 wake, wait out the repeater's retry window (1 s boot + 5 x 1.5 s) before deciding
+// the pulse was a Heltec reboot. Returns true when a new allowlisted command was accepted.
+static bool tfListen(uint32_t ms) {
+  heltecCliBegin();
+  s_hm_on = true;
+  s_hm_len = 0;
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < ms) {
+    heltecMonPoll();
+    tfService();
+    if (s_tf_fresh) return true;
+    delay(20);
+  }
+  return false;
 }
 
 // Runs one CLI command; returns true when a "->" reply was seen. out = reply text (prefix kept for the Worker).
@@ -2719,6 +2775,12 @@ static void hwHandleReboot(const char *src, bool console) {
 static bool s_hwa_busy = false;
 static void hwAwakeService() {
   heltecMonPoll();
+  tfService();   // v1.7.7: @TSIM frames that arrived while awake
+  if (s_tf_fresh && !s_busy_update) {
+    s_tf_fresh = false;
+    if (!strcmp(s_tf_cmd, "STATUS")) doStatusReport();
+    else if (!strcmp(s_tf_cmd, "MODEM_RESET")) { logf("tsim wake MODEM_RESET -> modem recovery"); wdRun(true); }
+  }
   if (!s_hwa_flag || s_hwa_busy || s_busy_update) return;
   s_hwa_flag = false; s_hwa_busy = true;
   int64_t now = rtcNow();
@@ -3166,21 +3228,46 @@ void setup() {
     int64_t now = rtcNow();
     bool stuck = true; uint32_t t = millis();
     while (millis() - t < HW_STUCK_MS) { if (digitalRead(HELTEC_HWAKE_PIN)) { stuck = false; break; } delay(5); }
-    if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
-    bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S);   // v1.7.6: tolerant of a clock that stepped back
-    const char *why = stuck ? "GPIO6 stuck low" : own ? "T-SIM reset the Heltec itself" :
-                      (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
-                      s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
-    if (why) {
-      if (own && !stuck) s_hw_self++; else s_hw_ign++;   // v1.7.6
-      if (!own && ++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
+    if (stuck) {
+      s_hw_ign++;
+      if (++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
       wdSave();
-      logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);
+      logf("Heltec wake ignored: GPIO6 stuck low (ignored %u)", (unsigned)s_hw_ign);
       sleepQuick(); return;
     }
-    if (!LittleFS.begin(true)) logf("LittleFS mount failed");
-    hwHandleReboot("wake", false);   // v1.7.4: shared with the awake path (pending report if it can't be delivered)
-    goToSleep(); return;
+    // v1.7.7: tsim wake pulses this pin too. Listen before calling it a Heltec reboot.
+    logf("GPIO6 wake: listening 9s for @TSIM");
+    if (tfListen(9000)) {
+      s_tf_fresh = false;
+      s_hwa_flag = false;   // UART chatter from the pulses is not a second reboot
+      if (!strcmp(s_tf_cmd, "WAKE")) { logf("tsim wake WAKE: ACK sent, modem left asleep"); sleepQuick(); return; }
+      if (!strcmp(s_tf_cmd, "MODEM_RESET")) {
+        if (!LittleFS.begin(true)) logf("LittleFS mount failed");
+        gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+        logf("tsim wake MODEM_RESET -> modem recovery");
+        wdRun(true);
+        goToSleep(); return;
+      }
+      logf("tsim wake STATUS: booting the modem for a status report");
+      s_tf_status_boot = true;
+    } else {
+      heltecMonStop();
+      if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
+      bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S);   // v1.7.6: tolerant of a clock that stepped back
+      const char *why = own ? "T-SIM reset the Heltec itself" :
+                        (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
+                        s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
+      if (why) {
+        if (own) s_hw_self++; else s_hw_ign++;
+        if (!own && ++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
+        wdSave();
+        logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);
+        sleepQuick(); return;
+      }
+      if (!LittleFS.begin(true)) logf("LittleFS mount failed");
+      hwHandleReboot("wake", false);   // no @TSIM frame: still a Heltec reboot
+      goToSleep(); return;
+    }
   }
   bool wd_wake = false;
   if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_wd_int_min && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
@@ -3236,6 +3323,7 @@ void setup() {
     printLastLog();
   }
   if (!modemPowerOn()) {
+    if (s_tf_status_boot) { logf("tsim wake STATUS: modem did not start"); goToSleep(); return; }
     if (!fast) interactiveWindow(AWAKE_WINDOW_MS);
     goToSleep(); return;
   }
@@ -3251,7 +3339,9 @@ void setup() {
     pwrReportPending();
     if (s_hrp_n) wdHeartbeat("ok", -1);   // v1.7.4: deliver an earlier Heltec-reboot report that couldn't go out
     processSmsInbox();
-  }
+    if (s_tf_status_boot) doStatusReport();
+  } else if (s_tf_status_boot) logf("tsim wake STATUS: no SIM, report skipped");
+  if (s_tf_status_boot) { goToSleep(); return; }
   if (fast && !s_busy_update) { goToSleep(); return; }
   interactiveWindow(AWAKE_WINDOW_MS);
   goToSleep();
