@@ -1,50 +1,55 @@
-# Handoff for the LTE Meshcore bot — tsim wake (2026-10-27)
+# Handoff for the LTE Meshcore bot — tsim wake (2026-10-28)
 
-You were unavailable. This session continued your `tsim wake` work. Read this before doing anything else on it.
+You were unavailable. This session finished the `tsim wake` work the user asked for after the 18.1 release. Read this before doing anything else on it.
 
 ## What the user decided
-- Write the T-SIM `@TSIM` handler locally. Do not push it, do not release it, do not flash it.
-- Publish MeshCore-TSim-Powersaving and mark it Latest.
-- After publish: leave tag ruleset 26005316 disabled, and leave the dashboard alone.
-- Leave this handoff so you can take the work back.
+- Publish T-SIM v1.7.7 so they can install it themselves with the dashboard **Update T-SIM** button.
+- Deploy the dashboard so the Heltec update source matches MeshCore-TSim-Powersaving, and so the GPIO6 labels match the new behavior.
+- Take the GPIO6 reboot-detection wake away.
+- They will press Update T-SIM. Do not text the device. Do not flash the Heltec.
+- Tag ruleset 26005316 stays disabled. The MeshCore-TSim-Powersaving daily cron stays off. Do not clear the queued-command list.
 
-## T-SIM handler (done locally, not on the device)
-- Repo on the box: `/workspace/tsim-v172`, branch `tsim-wake-frames`, commit `826ba57`.
-- Not pushed. `main` / the dashboard are still v1.7.6 (`fa87629`).
-- Firmware version string: `tsim-updater 1.7.7`.
-- Host tests passed (`firmware/test/host_test.cpp`). `pio run -e tsim7672g` succeeded (flash 654645 bytes). Log: `/workspace/tsim-v172-logs/build177.log`.
-- Nothing was texted, queued, or flashed. Do not OTA this until the user says so, and not before the GPIO6 wire is fixed.
+## T-SIM v1.7.7 (published, not installed)
+- Repo: `just-stuff-tm/tsim-remote-updater`. Release: https://github.com/just-stuff-tm/tsim-remote-updater/releases/tag/v1.7.7
+- Tag `v1.7.7` on `31b2aea` (`31b2aea54e9254adbbcc6d44d71176c879cc04da`). Draft false. Not a prerelease. Latest. Published 2026-10-28T22:26:07Z. Release notes are `release-notes/v1.7.7.md`.
+- CI (the tag push): https://github.com/just-stuff-tm/tsim-remote-updater/actions/runs/40779824408. Worker tests and the firmware job succeeded. Host tests passed in that run. The official `firmware.bin` is the CI build. The local PlatformIO bin was not uploaded.
+- `firmware.bin` is 654832 bytes, first byte `0xE9`, sha256 `bed2bb1d58fd63be1ee7b17f3edcfe1669111c233a2ecda284beb428a38fc715`, matching `firmware.bin.sha256`. Also attached: `bootloader.bin`, `partitions.bin`, `boot_app0.bin`.
+- The installed T-SIM is still v1.7.6 until the user presses Update T-SIM. v1.7.6 still treats a working GPIO6 wake as a Heltec reboot.
+- Nothing was sent to the device.
 
 ### What v1.7.7 does
 The repeater already sends `@TSIM <CMD> <seq>` and waits for `@TSIM ACK <seq>`.
-- GPIO6 wake listens 9 seconds. A frame is handled. No frame still means a Heltec reboot (v1.7.3–1.7.6 path).
+- GPIO6 wake listens 9 seconds. A frame is handled.
+- No `@TSIM` frame: log `GPIO6 wake: no @TSIM frame, ignored` and sleep. It does not call `hwHandleReboot("wake")` and it does not count as a spurious wake.
+- GPIO6 stuck low still increments the spurious counter and can turn the wake off. `WDCFG hwake=1` turns it back on. `hwake=0|1` still arms ext1 and still gates the while-awake reboot check.
 - Allowlist: `WAKE` (ACK, modem stays asleep), `STATUS` (ACK, then a status report), `MODEM_RESET` (ACK, then a forced watchdog recovery). Anything else is logged and not ACKed.
 - The same seq is ACKed again and not run twice. An echoed `@TSIM ACK` is ignored.
 - The same handler runs for a frame that arrives while the T-SIM is already awake.
-- Parser: `firmware/src/tsim_frame.h`. Notes: `release-notes/v1.7.7.md`.
+- The while-awake serial reboot check (1.7.4) and the daylight uptime check (1.7.5) are still in the firmware. The dashboard switch text says that same switch still allows the 1.7.4 check.
+- Parser: `firmware/src/tsim_frame.h`. Version string: `tsim-updater 1.7.7`.
 
-## Repeater release (published and marked Latest)
-- Repo: `just-stuff-tm/MeshCore-TSim-Powersaving`, branch `tsim`.
-- Latest: https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/releases/tag/MeshCore-TSim-Powersaving18.1
-- Tag and name: `MeshCore-TSim-Powersaving18.1`. Draft false. Not a prerelease. Published 2026-10-28T02:53:12Z. Target `f94f48d70103183680f75abeaaf417dcbbe7af15`. 499 assets.
-- Build run (it had already started with publish left off, so the workflow wrote a draft): https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/actions/runs/40619447623. Conclusion success. 249 of 264 envs built. No Heltec V3 env was in the not-built list. This token cannot dispatch Actions (HTTP 403). The existing draft was published through the Releases API. It was not rebuilt.
-- Download check after publish, through the API, matched `SHA256SUMS.txt`:
-  - `Heltec_v3_repeater-MeshCore-TSim-Powersaving18.1-upgrade.bin` — 1200896 bytes, first byte `0xE9`, sha256 `86439e523776536de7650badf7a39e3121f177b6bd6936882d5c15b306faf7f4`
-  - `Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving18.1-upgrade.bin` — 1187536 bytes, first byte `0xE9`, sha256 `5ae308daf7ce8189eb0ad60a987a367dbb7b6dcc395763163dedda3004225ba4`
-- The updater uses `Heltec_v3_repeater-...-upgrade.bin`. It does not use `freshInstall` or `_headless`.
-- Doc commit `52e895b4` (dead design-branch link removed) is on `tsim` and is not in this release. The notes on `f94f48d7` already say `tsim wake` needs T-SIM frame firmware that is not released, and that an older T-SIM treats the GPIO6 wake as a Heltec reboot.
-- Tag-creation ruleset 26005316 (`HOLD: no tags until names are agreed`) has enforcement disabled. It blocked the tag. The name was already agreed and the user had asked to publish. The user then said to leave it off. Branch ruleset 26005228 (`tsim: no force-push or deletion`) is still active.
-- The daily cron in `easyskymesh-sync.yml` is still commented out.
-- The dashboard was not opened. The documented default Heltec update source is `just-stuff-tm/MeshCore` branch `powersaving`, pattern `Heltec_v3_repeater-v*-powersaving-*.bin`. That pattern does not match `Heltec_v3_repeater-MeshCore-TSim-Powersaving18.1-upgrade.bin`, so the dashboard will not select this release on its own. The user said to leave the dashboard alone. Do not change the Worker or any device update source unless they change their mind.
-- Nothing was sent to the T-SIM or the Heltec. Leave this release unflashed unless the user says so. Installed T-SIM v1.7.6 treats a working GPIO6 wake as a Heltec reboot and ignores `@TSIM`.
+## Dashboard (deployed)
+- Live Worker script name is `heltec-update-worker` (not the name in `worker/wrangler.toml`). Content was replaced on 2026-10-28T22:27:40Z. Deployment `0033b7fc-959e-4f58-b00d-8ec706f76ffe`, version `d0081e52-a8a5-47e5-9d15-7a5d7c78a8a6`. The uploaded module matches `worker/src/index.js` at `31b2aea` (sha256 `333051f98a5162095ffa45664268e0b5aacd3454e10ab8c6da3176e374ac245a`).
+- Secrets `ADMIN_TOKEN`, `HOLOGRAM_API_KEY`, and `SESSION_SECRET` were left in place. The `STATE` KV binding was left in place. Compatibility date is still `2025-01-01`. Cron is still `0 * * * *`. Do not deploy `worker/wrangler.toml` (placeholder KV id) or the old `/workspace/heltec-update-worker` tree.
+- Login page returned 200. Unauthenticated `/api/fleet` returned 401. The dashboard was not logged into. Do not use the password that was pasted in chat.
+- `SOURCE_VERSION` is 4. An untouched default Heltec source migrates on the next read to `just-stuff-tm/MeshCore-TSim-Powersaving`, pattern `Heltec_v3_repeater-MeshCore-TSim-Powersaving*-upgrade.bin`. Custom sources stay. The previous MeshCore + power saving preset stays in the list and is not the default.
+- A real 18.1 Heltec `UPDATE` URL is longer than 160 characters. The worker stores `ghasset:<id>` and texts `UPDATE <origin>/gh/<id> ` only when an update is actually texted. That short link does not exist until someone presses Update Heltec. The user did not ask to update the Heltec. Nothing was texted.
+- GPIO6 labels now say the pulse is the repeater `tsim wake` command, not a Heltec reboot.
+
+## Repeater release (already Latest, unchanged this session)
+- https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/releases/tag/MeshCore-TSim-Powersaving18.1 at `f94f48d7`. Do not rebuild it.
+- Tag-creation ruleset 26005316 stays disabled. Branch ruleset 26005228 stays active. The daily cron in `easyskymesh-sync.yml` stays commented out.
+- The notes on `f94f48d7` still say the T-SIM frame firmware was not released. That is stale: v1.7.7 is released. Do not retag 18.1 for that sentence.
+- Doc commit `52e895b4` is on `tsim` and is not in the 18.1 tag.
 
 ## Still on the user
-- The installed tree-node wire shows 0 GPIO6 pulses. `tsim wake` cannot reach that T-SIM until the wire is fixed on site (Heltec GPIO43 TX, cathode of a 1N5817 toward the Heltec, anode to T-SIM GPIO6, 100 nF from GPIO6 to GND).
+- Press **Update T-SIM** on the dashboard when they want 1.7.7. Do not press it for them.
+- The installed tree-node wire shows 0 GPIO6 pulses. `tsim wake` cannot reach that T-SIM until the wire is fixed on site (Heltec GPIO43 TX, cathode of a 1N5817 toward the Heltec, anode to T-SIM GPIO6, 100 nF from GPIO6 to GND). Until they install 1.7.7, a working wire would still make v1.7.6 reset the modem.
 - The dashboard password was pasted in chat on Oct 20. Remind them to rotate it. Do not repeat it.
-- Duplicate queued adverts or commands were never listed. Read the queue only. Do not clear it and do not text the device unless they say so.
+- Duplicate queued adverts or commands were never listed. Read the queue only. Do not clear it.
 
 ## Do not
-- Send SMS, UPDATE, CLI, or any other command to the T-SIM or the repeater without an explicit go.
-- Print the dashboard password or API keys.
-- Push `tsim-wake-frames` or deploy the Worker for v1.7.7 unless they ask.
-- Turn ruleset 26005316 back on, enable the daily cron, or point a device at 18.1 unless they ask.
+- Send SMS, `UPDATE`, `TSIMUPDATE`, CLI, or any other command to the T-SIM or the repeater unless they ask.
+- Print the dashboard password, API keys, account ids, KV ids, or the workers.dev host.
+- Turn ruleset 26005316 back on, or enable the daily cron.
+- Flash the Heltec, or retag v1.7.7. A later handoff commit on `main` is not a release.
