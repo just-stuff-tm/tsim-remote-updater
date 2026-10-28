@@ -35,10 +35,10 @@
 #define HELTEC_BOOT_PIN     2
 #define HELTEC_UART_TX_PIN  42
 #define HELTEC_UART_RX_PIN  41
-// v1.7.3 optional Heltec-reboot wake (1.7.4 also detects reboots while awake via the GPIO41 UART boot banner): Heltec TX43 -> Schottky (cathode to Heltec) -> GPIO6, 47-220nF GPIO6 to GND.
+// v1.7.7 GPIO6 tsim wake: Heltec TX43 -> Schottky (cathode to Heltec) -> GPIO6, 47-220nF GPIO6 to GND.
 // Internal pull-up (~45k, kept in deep sleep); an external 100k to 3V3 is optional.
-// GPIO6 is an RTC GPIO (ext1 wake), free on the left header. Any low = the Heltec printed (boot log
-// or a tsim-wake pulse). v1.7.7 listens for "@TSIM <CMD> <seq>" before treating the wake as a reboot.
+// GPIO6 is an RTC GPIO (ext1 wake), free on the left header. A low is the repeater's tsim-wake pulse.
+// The T-SIM listens for "@TSIM <CMD> <seq>". No frame is ignored. It is not a Heltec reboot.
 #define HELTEC_HWAKE_PIN    6
 
 

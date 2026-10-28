@@ -6,29 +6,36 @@
 // Bindings: KV STATE; secrets HOLOGRAM_API_KEY, ADMIN_TOKEN, SESSION_SECRET; optional GITHUB_TOKEN.
 
 // Backward compatibility only: releases before 2026-10-18 were named vX.Y.Z-powersaving-serial (files
-// Heltec_v3_repeater-vX.Y.Z-powersaving-serial-<commit>.bin). The default pattern still matches them and a source saved with that old default pattern is migrated once.
+// Heltec_v3_repeater-vX.Y.Z-powersaving-serial-<commit>.bin). The MeshCore + power saving preset still matches them.
 export const OLD_PS_NAME = "powersaving-serial";
-// Default Heltec update source: MeshCore + power saving, with serial.ondemand and headless builds as features
-// (just-stuff-tm/MeshCore, releases vX.Y.Z-powersaving; the older release names above still match).
-// The app-only Heltec_v3_repeater image keeps the Heltec's identity and settings; "-merged" and "_headless" are skipped.
-const DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-*.bin", tag_prefix: "", direct_url: "" };
-// Saved sources carry v: SOURCE_VERSION. Sources saved before the current version that are exactly an old default
-// (nothing customized) move to the new default once; anything else the user set is kept as it is.
-export const SOURCE_VERSION = 3;
+// Default Heltec update source: the T-SIM repeater line (just-stuff-tm/MeshCore-TSim-Powersaving).
+// The app-only Heltec_v3_repeater upgrade image keeps identity and settings; freshInstall and _headless are skipped.
+const DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore-TSim-Powersaving", asset_pattern: "Heltec_v3_repeater-MeshCore-TSim-Powersaving*-upgrade.bin", tag_prefix: "", direct_url: "" };
+// Saved sources carry v: SOURCE_VERSION. An untouched previous default moves once. A custom repo, pattern, tag prefix, or direct URL stays.
+export const SOURCE_VERSION = 4;
 export const LEGACY_DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
 // v2 default (the older release names, see OLD_PS_NAME)
 export const V2_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: `Heltec_v3_repeater-v*-${OLD_PS_NAME}-*.bin`, tag_prefix: "", direct_url: "" };
+// v3 default. This pattern still matches vX.Y.Z-powersaving and the older powersaving-serial names. It stays available as a preset.
+export const V3_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-*.bin", tag_prefix: "", direct_url: "" };
 const isExactly = (stored, def) => Object.keys(def).every((k) => (stored[k] ?? def[k]) === def[k]);
+const asTsim = (stored, from) => {
+  const { migrated_from, ...rest } = stored;
+  return { src: { ...DEFAULT_SOURCE, ...rest, repo: DEFAULT_SOURCE.repo, asset_pattern: DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: from }, migrated: true, stale: true };
+};
 export function migrateSource(stored) {
   if (!stored || typeof stored !== "object") return { src: { ...DEFAULT_SOURCE }, migrated: false, stale: false };
   if (stored.v >= SOURCE_VERSION) return { src: { ...DEFAULT_SOURCE, ...stored }, migrated: false, stale: false };
-  if (!(stored.v >= 2) && isExactly(stored, LEGACY_DEFAULT_SOURCE))
-    return { src: { ...DEFAULT_SOURCE, v: SOURCE_VERSION, migrated_from: LEGACY_DEFAULT_SOURCE.repo }, migrated: true, stale: true };
-  // the old default pattern (repo + pattern unchanged): only the pattern moves; enabled/prefix/URL choices stay
+  if (!(stored.v >= 2) && isExactly(stored, LEGACY_DEFAULT_SOURCE)) return asTsim(stored, LEGACY_DEFAULT_SOURCE.repo);
   if (stored.repo === V2_DEFAULT_SOURCE.repo && stored.asset_pattern === V2_DEFAULT_SOURCE.asset_pattern) {
-    const { migrated_from, ...rest } = stored;
-    return { src: { ...DEFAULT_SOURCE, ...rest, asset_pattern: DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: V2_DEFAULT_SOURCE.asset_pattern }, migrated: true, stale: true };
+    if (stored.tag_prefix || stored.direct_url) {
+      const { migrated_from, ...rest } = stored;
+      return { src: { ...V3_DEFAULT_SOURCE, ...rest, asset_pattern: V3_DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: V2_DEFAULT_SOURCE.asset_pattern }, migrated: true, stale: true };
+    }
+    return asTsim(stored, V2_DEFAULT_SOURCE.asset_pattern);
   }
+  if (stored.repo === V3_DEFAULT_SOURCE.repo && stored.asset_pattern === V3_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
+    return asTsim(stored, V3_DEFAULT_SOURCE.asset_pattern);
   return { src: { ...DEFAULT_SOURCE, ...stored, v: SOURCE_VERSION }, migrated: false, stale: true };
 }
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
@@ -121,7 +128,9 @@ const getSource = async (env, id) => {
       await env.STATE.delete(`release:${id}`);
       await logActivity(env, id, { type: "action", msg: src.migrated_from === LEGACY_DEFAULT_SOURCE.repo
         ? `Update source moved to the new default: ${src.repo} ${src.asset_pattern} (was the old default ${LEGACY_DEFAULT_SOURCE.repo}; pick EasySkyMesh under Firmware preset to go back)`
-        : `Update source pattern updated for the renamed releases: ${src.asset_pattern} (was ${src.migrated_from}; matches both the new -powersaving- and the older -${OLD_PS_NAME}- files)` });
+        : src.migrated_from === V3_DEFAULT_SOURCE.asset_pattern
+          ? `Update source moved to MeshCore-TSim-Powersaving: ${src.repo} ${src.asset_pattern} (was ${src.migrated_from}; the previous MeshCore + power saving preset is still in the list)`
+          : `Update source pattern updated for the renamed releases: ${src.asset_pattern} (was ${src.migrated_from}; matches both the new -powersaving- and the older -${OLD_PS_NAME}- files)` });
     }
   }
   return src;
@@ -287,6 +296,15 @@ export function safeRelUrl(u, repo, tag) {
   return repo && tag ? `https://github.com/${repo}/releases/tag/${encodeURIComponent(tag)}` : null;
 }
 export const buildUpdateBody = (url) => `UPDATE ${url.replace(/_/g, "%5F")} `;
+// A GitHub release URL for MeshCore-TSim-Powersaving does not fit in one SMS (160). Remember the asset and text a short /gh/<id> link. The T-SIM follows that redirect.
+export async function smsUpdateUrl(env, origin, rel) {
+  const direct = buildUpdateBody(rel.url);
+  if (direct.length <= 160) return direct;
+  const id = String(rel.asset_id ?? "");
+  if (!/^\d+$/.test(id)) return direct;
+  await putJson(env, `ghasset:${id}`, { url: rel.url, name: rel.asset_name || "" });
+  return buildUpdateBody(`${origin}/gh/${id}`);
+}
 
 async function sendHologramSms(env, hologramDeviceId, body) {
   const deviceid = parseInt(hologramDeviceId, 10);
@@ -477,7 +495,8 @@ export async function heltecImageRisk(url, tsimFw) {
   return null;
 }
 export const FW_PRESETS = {
-  meshcore_serial: { label: "MeshCore + power saving (default, just-stuff-tm/MeshCore)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. MeshCore with EasySkyMesh power saving; features: serial.ondemand (the console keeps working while power saving) and headless Heltec V3 builds. Releases vX.Y.Z-powersaving (older release names also match) from the powersaving branch. Uses the Heltec_v3_repeater app-only image (keeps identity and settings), never the -merged or _headless file. Fresh installs default to powersaving on; an update keeps your current setting." },
+  meshcore_tsim: { label: "MeshCore T-SIM power saving (default)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default for this T-SIM. just-stuff-tm/MeshCore-TSim-Powersaving, tag MeshCore-TSim-PowersavingN.B. Uses Heltec_v3_repeater-...-upgrade.bin (keeps identity and settings), never freshInstall or _headless. tsim wake is in this firmware." },
+  meshcore_serial: { label: "MeshCore + power saving (previous, just-stuff-tm/MeshCore)", enabled: true, repo: V3_DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: V3_DEFAULT_SOURCE.asset_pattern, direct_url: "", note: "Previous default. MeshCore with EasySkyMesh power saving on branch powersaving; features: serial.ondemand and headless Heltec V3 builds. Releases vX.Y.Z-powersaving (older release names also match). Uses the Heltec_v3_repeater app-only image, never -merged or _headless." },
   easyskymesh: { label: "EasySkyMesh PowerSaving (upgrade)", enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" },
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
 };
@@ -2074,7 +2093,7 @@ async function deviceApi(request, env, dev, action) {
     let w; try { w = validateWd(cur, b); } catch (e) { return json({ error: e.message }, 400); }
     const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
     if (!fwAtLeast(lat.fw, WD_FW)) return json({ error: `Needs T-SIM firmware ${WD_FW} or newer. Update the T-SIM firmware first.` }, 409);
-    if (b.hwake !== undefined && !fwAtLeast(lat.fw, HWAKE_FW)) return json({ error: `The Heltec reboot wake needs T-SIM firmware ${HWAKE_FW} or newer.` }, 409);
+    if (b.hwake !== undefined && !fwAtLeast(lat.fw, HWAKE_FW)) return json({ error: `GPIO6 wake needs T-SIM firmware ${HWAKE_FW} or newer.` }, 409);
     if ((b.upoll !== undefined || b.usol !== undefined) && !fwAtLeast(lat.fw, UPOLL_FW)) return json({ error: `The daylight uptime check needs T-SIM firmware ${UPOLL_FW} or newer.` }, 409);
     const cmd = wdCfgCmd(w);
     if (cur.applied_at && cmd === wdCfgCmd({ ...DEFAULT_WD, ...cur })) return json({ saved: true, unchanged: true, settings: { ...w, applied_at: cur.applied_at }, queued: null, wake: null });
@@ -2085,7 +2104,7 @@ async function deviceApi(request, env, dev, action) {
     await putJson(env, `wdcfg:${id}`, { ...w, updated_at: entry.queued_at, applied_at: null });
     let wake = null;
     if (b.send === true) { const [o, cc] = await manualSend(env, dev, "STATUS", "Deliver watchdog settings (STATUS)"); wake = { ...o, status: cc }; }
-    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${w.hwake !== undefined ? `, Heltec reboot wake ${w.hwake ? "on" : "off"}` : ""}${w.upoll !== undefined ? `, daylight uptime check ${w.upoll ? "every " + (w.upoll >= 60 ? w.upoll / 60 + " h" : w.upoll + " min") + (w.usol ? ` when solar ≥ ${(w.usol / 1000).toFixed(1)} V` : " day and night") : "off"}` : ""}${b.send ? "" : " (applied at next wake)"}` });
+    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${w.hwake !== undefined ? `, GPIO6 wake ${w.hwake ? "on" : "off"}` : ""}${w.upoll !== undefined ? `, daylight uptime check ${w.upoll ? "every " + (w.upoll >= 60 ? w.upoll / 60 + " h" : w.upoll + " min") + (w.usol ? ` when solar ≥ ${(w.usol / 1000).toFixed(1)} V` : " day and night") : "off"}` : ""}${b.send ? "" : " (applied at next wake)"}` });
     return json({ saved: true, settings: w, queued: entry, wake });
   }
   if (action === "gps-settings") {
@@ -2127,7 +2146,7 @@ async function deviceApi(request, env, dev, action) {
     const retry = await bodyRetry(request);
     const d = await dupeCheck(env, id, "heltec", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409);
     const prevSent = ((await kvJson(env, `state:${id}`)) || {}).last_update_sent;
-    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via };
+    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via, asset_id: prevSent.asset_id };
     else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const merged = rel.merged === true || MERGED_NAME_RE.test(rel.asset_name || "");
@@ -2139,8 +2158,8 @@ async function deviceApi(request, env, dev, action) {
     const risk = rel.via === "upload" ? uploadImageRisk(rel, tfw) : await heltecImageRisk(rel.url, tfw);
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     if (!(retry && prevSent && prevSent.url)) await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
-    const [o, c] = await manualSend(env, dev, buildUpdateBody(rel.url), `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
-      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
+    const [o, c] = await manualSend(env, dev, await smsUpdateUrl(env, new URL(request.url).origin, rel), `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
+      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
     });
     // v1.7.2 backup: also queue it for the next watchdog check-in, in case the text never reaches the T-SIM.
     let wdq = null;
@@ -2180,10 +2199,13 @@ const vstr = (v) => "v" + v.join(".");
 // Firmware identity, so different firmware families are never compared by raw numbers (EasySkyMesh "PowerSaving17.1.6" is
 // MeshCore 1.17.1 + their revision 6, not version 17). family + MeshCore base version + build commit when present.
 // vX.Y.Z-powersaving and the older release names (OLD_PS_NAME) are the same firmware line (serial.ondemand is a feature).
-export const FW_FAMILY_NAMES = { easyskymesh: "EasySkyMesh PowerSaving", "meshcore-serial": "MeshCore + serial", "meshcore-powersaving": "MeshCore + power saving", meshcore: "stock MeshCore" };
+export const FW_FAMILY_NAMES = { easyskymesh: "EasySkyMesh PowerSaving", "meshcore-serial": "MeshCore + serial", "meshcore-powersaving": "MeshCore + power saving", "meshcore-tsim": "MeshCore T-SIM power saving", meshcore: "stock MeshCore" };
 export function fwIdent(x) {
   const s = String(x || ""); if (!s) return null;
   const cm = s.match(/(?:^|[-_ ])((?=[0-9]*[a-f])[0-9a-f]{7,40})(?=$|[-_. (])/i), commit = cm ? cm[1].toLowerCase() : null;
+  const tsim = s.match(/meshcore-tsim-powersaving(\d+)\.(\d+)(?:\.(\d+))?/i);
+  // Checked before the EasySkyMesh "PowerSavingN.N" rule: "Powersaving18.1" would otherwise look like that family.
+  if (tsim) return { family: "meshcore-tsim", base: [1, 18, 0], ver: [+tsim[1], +tsim[2], +(tsim[3] || 0)], commit: null };
   const e = s.match(/powersaving[\s_.-]?(\d+)\.(\d+)(?:\.(\d+))?/i);
   if (e) return { family: "easyskymesh", base: [1, +e[1], +e[2]], ver: [+e[1], +e[2], +(e[3] || 0)], commit };
   const v = verOf(s); if (!v) return null;
@@ -2578,7 +2600,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (1.7.2+: every 24 h, it can't be turned off)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
 <label class="tog"><input type="checkbox" name="sms"> On watchdog wakes, also run texts already waiting on the modem (off: they run at the next text or wake)</label>
-<label class="tog"><input type="checkbox" name="hwake"> Heltec reboot wake (T-SIM 1.7.3+, needs the optional GPIO6 wire): when the Heltec reboots, wake the T-SIM and reset its modem (1.7.4+ also notices a reboot while the T-SIM is awake, over the serial link). Turns itself off after repeated false wakes; tick again to re-enable</label>
+<label class="tog"><input type="checkbox" name="hwake"> GPIO6 wake (on by default): from T-SIM 1.7.7 a pulse is the repeater's tsim wake command, not a Heltec reboot, and it does not reset the modem. The same switch still allows the while-awake reboot check (1.7.4). Turns itself off if GPIO6 stays low; tick again to re-enable</label>
 <label>Daylight uptime check (T-SIM 1.7.5+): ask the repeater its uptime every<select name="upoll"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour (default)</option><option value="120">2 hours</option><option value="180">3 hours</option><option value="360">6 hours</option></select></label>
 <label>…only when the solar input is at least <input name="usol" type="number" min="0" max="20" step="0.1" style="width:5em"> V (0 = day and night). Serial only: the modem stays asleep unless the uptime went backwards (a reboot), which then resets the modem like the reboot wake</label>
 <button type="submit" class="g">Save (applied at next wake)</button> <button type="button" id="wdsend">Save &amp; send now (1 text)</button> <span id="wdmsg" class="msg"></span></form></div></section>
@@ -2629,7 +2651,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 </main><div id="toast" hidden></div>
 <script>${COMMON_JS}
 const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
-const WAKE={0:"Power-on / reset",2:"Text message",3:"Heltec reboot (GPIO6)",4:"Timer",7:"USB / other"};
+const WAKE={0:"Power-on / reset",2:"Text message",3:"GPIO6",4:"Timer",7:"USB / other"};
 const RST={1:"Power-on",3:"Software restart",4:"Panic / crash",5:"Watchdog (interrupt)",6:"Watchdog (task)",7:"Watchdog",8:"Deep-sleep wake",9:"Brownout"},RST_BAD={4:1,5:1,6:1,7:1,9:1};
 const up=s=>s==null?null:(s>=86400?Math.floor(s/86400)+"d ":"")+(s>=3600?Math.floor(s%86400/3600)+"h ":"")+Math.floor(s%3600/60)+"m";
 const post=(a,b)=>fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
@@ -2731,7 +2753,7 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
-  ["Heltec reboot wake",X&&X.hwake!=null?["off","on","auto-off (false wakes; tick the box to re-enable)"][X.hwake]+" · detected "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+(X.hw_self!=null?" · own resets ignored "+X.hw_self:"")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+["off","auto-off","not armed (GPIO6 low)","arming failed","armed"][X.hw_arm]:""):null],
+  ["GPIO6 wake",X&&X.hwake!=null?["off","on","auto-off (GPIO6 stayed low; tick the box to re-enable)"][X.hwake]+" · counted "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+(X.hw_self!=null?" · own resets ignored "+X.hw_self:"")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+["off","auto-off","not armed (GPIO6 low)","arming failed","armed"][X.hw_arm]:""):null],
   ["Daylight uptime check",X&&X.upoll?(X.upoll.int_min?"every "+hrs(X.upoll.int_min)+(X.upoll.usol?" when solar ≥ "+(X.upoll.usol/1000).toFixed(1)+" V":" day and night"):"off")+" · checks "+(X.upoll.polls??"?")+" · night "+(X.upoll.night??"?")+" · low battery "+(X.upoll.lowbat??"?")+" · no reply "+(X.upoll.noreply??"?")+" · reboots found "+(X.upoll.found??"?")+(X.upoll.uptime!=null?" · repeater up "+hrs(Math.round(X.upoll.uptime/60))+(X.upoll.age_s!=null?" ("+ago(new Date(Date.parse(X.at)-X.upoll.age_s*1000).toISOString())+")":""):""):null],
   ["Wire self-test (since T-SIM boot)",L.wire_diag?"serial reply bytes "+L.wire_diag.cli_bytes+" · GPIO6 pulses during replies "+L.wire_diag.g6_cli_edges+(L.wire_diag.cli_bytes>50&&!L.wire_diag.g6_cli_edges?" ⚠ replies arrive but GPIO6 sees nothing: the wake wire isn't reaching GPIO6":"")+" · unprompted bytes "+L.wire_diag.unsol_bytes+" · unprompted pulses "+L.wire_diag.g6_idle_edges:null],
   ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],
@@ -3137,6 +3159,11 @@ export default {
     const m = request.method;
     try {
       if (parts[0] === "fw" && parts.length === 2 && (m === "GET" || m === "HEAD")) return await handleFwDownload(request, env, parts[1]);
+      if (parts[0] === "gh" && parts.length === 2 && /^\d+$/.test(parts[1]) && (m === "GET" || m === "HEAD")) {
+        const rec = await kvJson(env, `ghasset:${parts[1]}`);
+        if (!rec || typeof rec.url !== "string" || !/^https:\/\/github\.com\//.test(rec.url)) return new Response("not found", { status: 404, headers: SEC_HEADERS });
+        return redirect(rec.url);
+      }
       if (parts[0] === "ingest" && parts.length === 2 && m === "POST") return await handleIngest(request, env, parts[1]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "commands" && m === "GET") return await handleDeviceCommands(request, env, parts[2]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "cfglist" && m === "GET") return await handleCfgList(request, env, parts[2]);

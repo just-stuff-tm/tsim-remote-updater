@@ -3091,7 +3091,7 @@ static void armWakeups() {
   if (!secs) secs = (uint64_t)WD_MAX_MIN * 60;
   esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
   deadlineStopForSleep();
-  logf("sleep: SMS ring wake %s, Heltec wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed", hw,
+  logf("sleep: SMS ring wake %s, GPIO6 wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed", hw,
        (unsigned long long)secs, s_lb_en ? "on" : "off", s_gnss_on ? "warm" : "off", s_wd_int_min ? "on" : "off");
 }
 
@@ -3220,22 +3220,21 @@ void setup() {
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.7.1 watchdog timer wake. The RTC clock drifts, so a wake up to 10% early still counts; with battery checks off
   // the watchdog is the only timer left (GNSS warm-window wakes and OTA verification keep the full boot path).
-  // v1.7.3 Heltec-reboot wake (GPIO6 went low: the Heltec printed its boot log).
+  // v1.7.7 GPIO6 wake: the repeater's tsim wake pulse. Not a Heltec-reboot detector.
   if (s_wake_cause == ESP_SLEEP_WAKEUP_EXT1 && (esp_sleep_get_ext1_wakeup_status() & (1ULL << HELTEC_HWAKE_PIN))) {
     gpio_deep_sleep_hold_dis();          // DTR keeps its own pad hold until we know the modem gets touched
     heltecPinsRelease();
     pinMode(HELTEC_HWAKE_PIN, INPUT_PULLUP);   // also releases the RTC pad config from sleep
-    int64_t now = rtcNow();
     bool stuck = true; uint32_t t = millis();
     while (millis() - t < HW_STUCK_MS) { if (digitalRead(HELTEC_HWAKE_PIN)) { stuck = false; break; } delay(5); }
     if (stuck) {
       s_hw_ign++;
-      if (++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
+      if (++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("GPIO6 wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
       wdSave();
-      logf("Heltec wake ignored: GPIO6 stuck low (ignored %u)", (unsigned)s_hw_ign);
+      logf("GPIO6 wake ignored: GPIO6 stuck low (ignored %u)", (unsigned)s_hw_ign);
       sleepQuick(); return;
     }
-    // v1.7.7: tsim wake pulses this pin too. Listen before calling it a Heltec reboot.
+    // v1.7.7: GPIO6 is the tsim-wake line. A pulse is not a Heltec reboot and does not reset the modem.
     logf("GPIO6 wake: listening 9s for @TSIM");
     if (tfListen(9000)) {
       s_tf_fresh = false;
@@ -3252,21 +3251,9 @@ void setup() {
       s_tf_status_boot = true;
     } else {
       heltecMonStop();
-      if (s_hw_day0 <= 0 || now < s_hw_day0 || now - s_hw_day0 >= 86400) { s_hw_day0 = now; s_hw_dayn = 0; }
-      bool own = rtcOwnWindow(s_hw_own, now, HW_DEBOUNCE_S);   // v1.7.6: tolerant of a clock that stepped back
-      const char *why = own ? "T-SIM reset the Heltec itself" :
-                        (s_hw_last > 0 && now >= s_hw_last && now - s_hw_last < HW_DEBOUNCE_S) ? "within 60 s of the last one" :
-                        s_hw_dayn >= HW_MAX_DAY ? "daily limit (6) reached" : nullptr;
-      if (why) {
-        if (own) s_hw_self++; else s_hw_ign++;
-        if (!own && ++s_hw_spur >= HW_SPUR_MAX) { s_hw_auto = true; wdAddEvent("hwake", "auto-off", 0); logf("Heltec wake: %u spurious wakes in a row -> turned off (WDCFG hwake=1 re-enables)", (unsigned)s_hw_spur); }
-        wdSave();
-        logf("Heltec wake ignored: %s (ignored %u)", why, (unsigned)s_hw_ign);
-        sleepQuick(); return;
-      }
-      if (!LittleFS.begin(true)) logf("LittleFS mount failed");
-      hwHandleReboot("wake", false);   // no @TSIM frame: still a Heltec reboot
-      goToSleep(); return;
+      s_hwa_flag = false;
+      logf("GPIO6 wake: no @TSIM frame, ignored");
+      sleepQuick(); return;
     }
   }
   bool wd_wake = false;
