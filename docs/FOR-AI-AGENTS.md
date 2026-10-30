@@ -6,7 +6,7 @@ You are building and deploying this project for a human. Human-oriented steps ar
 1. Cloudflare account access (they run `npx wrangler login`, or give a scoped API token with Workers + KV edit).
 2. Hologram API key and the SIM's numeric Hologram device id.
 3. Names: device id(s) (e.g. `tsim-1`), repeater display names, optional fleet login id.
-4. Repeater firmware update source (default `IoTThinks/EasySkyMesh`, pattern `Heltec_v3_repeater-*-upgrade.bin`).
+4. Repeater firmware update source. Default is `just-stuff-tm/MeshCore-TSim-Powersaving`, pattern `Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving*-upgrade.bin` (headless app-only image, source version 5; keeps identity and settings; never the screen image, a freshInstall file, or a merged file). Untouched older defaults migrate automatically; a custom source stays. Only two presets: that headless build (default) and stock MeshCore (`meshcore-dev/MeshCore`, tags `repeater-*`, file `Heltec_v3_repeater-v*.bin`). The old just-stuff-tm/MeshCore preset and the plain EasySkyMesh preset are past and are not selectable.
 5. Which board (T-SIM7670G-S3 or T-SIM7672G; same pinout) and the USB port for flashing.
 
 ## Order of operations
