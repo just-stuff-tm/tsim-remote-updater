@@ -1802,7 +1802,7 @@ async function deviceApi(request, env, dev, action) {
     const wdSettings = { ...DEFAULT_WD, ...(wdCfgS || {}) };
     const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW),
       upoll_now: upollNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
-    return json({ watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds),
+    return json({ watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -2428,6 +2428,83 @@ export function loginPage(id = "", err = "") {
 <label>Password<input name="password" type="password" autocomplete="current-password" required></label><button style="width:100%">Log in</button></form></main></body></html>`;
 }
 
+// v1.7.8: dashboard telemetry poll. 3s for up to 3 min after a text, or while a command
+// is still "sent" (and that send is inside the same window). Firmware updates stay at 5s.
+// A hidden tab or a request already in flight schedules nothing.
+export const POLL_FAST_MS = 3000, POLL_IDLE_MS = 30000, POLL_UPDATE_MS = 5000, POLL_FAST_FOR_MS = 180000;
+export function pollSchedule(o) {
+  if (!o || o.hidden || o.inflight) return null;
+  if (o.updateBusy) return POLL_UPDATE_MS;
+  if (o.repliesPending && o.fastUntil && o.now < o.fastUntil) return POLL_FAST_MS;
+  return POLL_IDLE_MS;
+}
+export function pollTrackIds(commands, now) {
+  const ids = [];
+  const list = commands || [];
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    if (!c || c.status !== "sent" || !c.sent_at || c.id == null) continue;
+    const t = Date.parse(c.sent_at);
+    if (t !== t) continue;
+    const age = now - t;
+    if (age >= 0 && age < POLL_FAST_FOR_MS) ids.push(c.id);
+  }
+  return ids;
+}
+export function pollArm(o) {
+  const now = (o && o.now) || 0;
+  const commands = (o && o.commands) || [];
+  let fastUntil = (o && o.fastUntil) || 0;
+  for (let i = 0; i < commands.length; i++) {
+    const c = commands[i];
+    if (!c || c.status !== "sent" || !c.sent_at) continue;
+    const t = Date.parse(c.sent_at);
+    if (t !== t) continue;
+    if (now - t >= 0 && now - t < POLL_FAST_FOR_MS && t + POLL_FAST_FOR_MS > fastUntil) fastUntil = t + POLL_FAST_FOR_MS;
+  }
+  if (o && o.texted) {
+    const until = now + POLL_FAST_FOR_MS;
+    if (until > fastUntil) fastUntil = until;
+  }
+  const recent = pollTrackIds(commands, now);
+  let repliesPending = false;
+  if (o && o.texted) repliesPending = true;
+  else if (o && o.waitReport) {
+    if (o.waitIds == null) repliesPending = true;
+    else if (!o.waitIds.length) {
+      const latest = o.latestAt ? Date.parse(o.latestAt) : 0;
+      const reportIn = !!(latest && latest >= o.waitReport);
+      repliesPending = !reportIn || recent.length > 0;
+    } else {
+      const still = {};
+      for (let i = 0; i < commands.length; i++) {
+        const c = commands[i];
+        if (c && c.status === "sent" && c.id != null) still[String(c.id)] = 1;
+      }
+      let waiting = false;
+      for (let i = 0; i < o.waitIds.length; i++) if (still[String(o.waitIds[i])]) waiting = true;
+      let extra = false;
+      for (let i = 0; i < recent.length; i++) {
+        let known = false;
+        for (let k = 0; k < o.waitIds.length; k++) if (String(o.waitIds[k]) === String(recent[i])) known = true;
+        if (!known) extra = true;
+      }
+      repliesPending = waiting || extra;
+    }
+  } else repliesPending = recent.length > 0;
+  return { fastUntil: fastUntil, repliesPending: repliesPending };
+}
+// Every command still status "sent", including system commands the console list hides.
+export function awaitingCmds(list) {
+  const out = [];
+  const src = list || [];
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c && c.status === "sent" && c.sent_at && c.id != null) out.push({ id: c.id, sent_at: c.sent_at });
+  }
+  return out;
+}
+
 export function fleetPage(acc) {
   return `${HEAD("Repeaters")}
 <body><header><div class="t"><b>Repeaters</b> <span class="mut small">${esc(acc.name || acc.id)}</span></div>
@@ -2473,7 +2550,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>LoRa radio</h3><div id="ov-radio"></div><p class="small"><a href="#radio">Open LoRa radio ›</a></p></div>
 <div class="card"><h3>T-SIM</h3><div id="ov-tsim"></div><p class="small"><a href="#tsim">Open T-SIM ›</a></p></div>
 </div>
-<p class="small mut">One text per minute per T-SIM. After a text, the T-SIM wakes and reports here within a few minutes.</p>
+<p class="small mut">One text per minute per T-SIM. After you text it, this page checks for the reply every 3 seconds for up to 3 minutes.</p>
 </div>
 
 <div class="pane" id="t-radio" hidden>
@@ -2669,10 +2746,33 @@ const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
 const WAKE={0:"Power-on / reset",2:"Text message",3:"GPIO6",4:"Timer",7:"USB / other"};
 const RST={1:"Power-on",3:"Software restart",4:"Panic / crash",5:"Watchdog (interrupt)",6:"Watchdog (task)",7:"Watchdog",8:"Deep-sleep wake",9:"Brownout"},RST_BAD={4:1,5:1,6:1,7:1,9:1};
 const up=s=>s==null?null:(s>=86400?Math.floor(s/86400)+"d ":"")+(s>=3600?Math.floor(s%86400/3600)+"h ":"")+Math.floor(s%3600/60)+"m";
-const post=(a,b)=>fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
+const POLL_FAST_MS=${POLL_FAST_MS},POLL_IDLE_MS=${POLL_IDLE_MS},POLL_UPDATE_MS=${POLL_UPDATE_MS},POLL_FAST_FOR_MS=${POLL_FAST_FOR_MS};
+${pollSchedule.toString()}
+${pollTrackIds.toString()}
+${pollArm.toString()}
+function pollCmds(d){
+ const out=[],seen={};
+ function add(c){if(!c||c.id==null||seen[String(c.id)])return;seen[String(c.id)]=1;out.push(c)}
+ const a=(d&&d.awaiting)||[],u=(d&&d.commands)||[];
+ for(let i=0;i<a.length;i++)add(a[i]);
+ for(let i=0;i<u.length;i++)add(u[i]);
+ return out}
+const post=async(a,b)=>{
+ const r=await fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
+ try{const j=await r.clone().json();armText(j)}catch(e){}
+ return r};
+function armText(j){
+ if(!(j&&(j.sent===true||(j.wake&&j.wake.sent===true))))return;
+ const now=Date.now();waitReport=now;waitIds=null;
+ const arm=pollArm({now:now,texted:true,fastUntil:fastUntil,commands:[],waitReport:now});
+ fastUntil=arm.fastUntil;
+ clearTimeout(window._t);
+ const dly=pollSchedule({hidden:document.hidden,inflight:pollBusy,updateBusy:!!(pending.heltec||pending.tsim),now:now,fastUntil:fastUntil,repliesPending:true});
+ if(dly!=null)window._t=setTimeout(load,dly)}
 const rj=async r=>{try{return await r.json()}catch{return{}}};
 const say=(id,ok,msg)=>{const el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=msg};
 let first=true,pending={},PRE={};
+let fastUntil=0,waitReport=0,waitIds=null,pollBusy=false,pollAgain=false;
 function prog(p,label,pend){
  if(pend&&(!p||p.state==="idle"||(p.started_at&&new Date(p.started_at)<pend)))p={state:"running",step:0,pct:0,steps:["Waiting for T-SIM to wake","Downloading","Verifying","Writing / flashing","Rebooting","Done"],times:{0:pend.toISOString()}};
  if(!p||p.state==="idle")return '<p class="small mut">No update in progress.</p>';
@@ -2686,7 +2786,11 @@ function prog(p,label,pend){
   '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+(p.resolved?'<div class="small mut">Confirmed: '+e(p.resolved)+'</div>':'')+finfo(p.flash)+
   (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
 var DS={};
-async function load(){unitsBtn();
+async function load(){
+ if(document.hidden){clearTimeout(window._t);return}
+ if(pollBusy){pollAgain=true;return}
+ pollBusy=true;clearTimeout(window._t);
+ try{unitsBtn();
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
  const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.watchdog)showWd(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
@@ -2727,7 +2831,18 @@ async function load(){unitsBtn();
  showAdc(d);showRpt(d);
  const CM=(d.commands||[]).filter(c=>!c.sys&&!c.unsolicited);const tm=$("cmds"),atB=tm.scrollHeight-tm.scrollTop-tm.clientHeight<30;tm.innerHTML=CM.length?CM.slice().reverse().map(c=>'<div class="tl"><span class="pr">$</span> '+e(c.cmd)+' <span class="ts">'+e(c.status==="done"?t(c.done_at):c.status==="queued"?"queued":c.status==="sent"?"sent, waiting…":c.status)+'</span></div>'+(c.output||c.error?'<div class="'+(c.error?"te":"to")+'">'+e(c.output||c.error)+'</div>':'')).join(""):'<div class="ts">No commands yet. Type one below, or pick from "Insert a command…".</div>';if(atB)tm.scrollTop=tm.scrollHeight;
  $("log").innerHTML=(d.history||[]).map(h=>'<tr><td>'+e(t(h.received_at))+'</td><td>'+e(h.type)+(h.test?' <b class="err">TEST</b>':'')+'</td><td>'+e(h.msg||(h.type==="status"?"Status report":""))+'</td></tr>').join("")||'<tr><td colspan=3 class="mut">No activity yet</td></tr>';
- clearTimeout(window._t);window._t=setTimeout(load,busy?5000:30000);
+ const cmds=pollCmds(d);
+ if(waitReport&&waitIds==null)waitIds=pollTrackIds(cmds,Date.now());
+ const arm=pollArm({now:Date.now(),fastUntil:fastUntil,commands:cmds,waitIds:waitIds,waitReport:waitReport,latestAt:(L&&L.received_at)||null});
+ fastUntil=arm.fastUntil;
+ if(!arm.repliesPending){waitReport=0;waitIds=null}
+ clearTimeout(window._t);
+ const delay=pollSchedule({hidden:document.hidden,inflight:false,updateBusy:busy,now:Date.now(),fastUntil:fastUntil,repliesPending:arm.repliesPending});
+ if(delay!=null)window._t=setTimeout(load,delay);
+ }catch(err){
+  clearTimeout(window._t);
+  if(!document.hidden)window._t=setTimeout(load,POLL_IDLE_MS);
+ }finally{pollBusy=false;if(pollAgain){pollAgain=false;load()}}
 }
 function setPresets(p){PRE=p;const s=$("preset");for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
 $("preset").onchange=ev=>{const v=PRE[ev.target.value],f=$("srcf");if(!v){$("presetnote").textContent="";return}
@@ -3162,6 +3277,7 @@ function tab(){const k=(location.hash||"#ov").slice(1),v=["ov","radio","tsim","a
  document.querySelectorAll(".pane").forEach(p=>p.hidden=p.id!=="t-"+v);if(v==="tsim"&&LMAP)setTimeout(()=>LMAP.invalidateSize(),50);document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===v))}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{history.replaceState(null,"","#"+b.dataset.t);tab();scrollTo(0,0)});
 addEventListener("hashchange",tab);tab();
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){clearTimeout(window._t);load()}});
 load();
 </script></body></html>`;
 }

@@ -18,6 +18,7 @@
 #include "board.h"
 #include "hw_guard.h"   // v1.7.6 self-reset guard + SMS merge (host-tested)
 #include "tsim_frame.h" // v1.7.7 @TSIM frame parser (host-tested)
+#include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras (host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -1048,18 +1049,21 @@ static void csApplyCfg(const char *args, char *out, size_t cap);
 static void wdApplyCfg(const char *args, char *out, size_t cap);
 static void gpsReport(const char *trigger, char *out, size_t cap);
 static bool doUpdate(const char *url, bool flash_too);
-static void doConsoleCommands(bool sys_only = false, bool wd = false) {
+// empty_out: set when the fetch body had no command lines (nothing pending).
+static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty_out = nullptr) {
+  if (empty_out) *empty_out = true;
   // wd (v1.7.2): watchdog wake. "?wd=1" also returns a queued Heltec UPDATE (the Worker keeps those for watchdog
   // wakes only, since a text wake gets the UPDATE text itself); console commands get a shorter time budget.
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, wd ? "?wd=1" : sys_only ? "?sys=1" : "");
   const uint32_t budget = wd ? WD_CMD_BUDGET_MS : CMD_BUDGET_MS;
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
-  if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return; }
+  if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return 0; }
   int ran = 0, noreply = 0; uint32_t b0 = millis();
   char *save = nullptr;
   for (char *line = strtok_r(s_cmd_list, "\n", &save); line && ran < CMD_MAX_RUN; line = strtok_r(nullptr, "\n", &save)) {
     char *tab = strchr(line, '\t');
     if (!tab) continue;
+    if (empty_out) *empty_out = false;   // at least one command was pending
     *tab = 0;
     char id[20]; strncpy(id, line, sizeof(id) - 1); id[sizeof(id) - 1] = 0;
     static char cmd[480]; strncpy(cmd, tab + 1, sizeof(cmd) - 1); cmd[sizeof(cmd) - 1] = 0;
@@ -1135,6 +1139,23 @@ static void doConsoleCommands(bool sys_only = false, bool wd = false) {
   }
   heltecCliEnd();
   logf("CMD: ran %d command(s)", ran);
+  return ran;
+}
+
+// v1.7.8: CMD already posted its replies from the full /commands fetch (console and system
+// commands together). Skip the mesh snapshot and the extra AT diagnostics. A follow-up
+// ?sys=1 runs only when wakeExtras says a system command is still pending. After this
+// fetch nothing is: an empty body had nothing queued, and a non-empty body already ran
+// the system lines, so an empty ?sys=1 is not issued.
+static bool s_did_cmd = false, s_did_status = false;
+static void finishCmdWake(bool queue_empty) {
+  WakeExtras ex = wakeExtras(false, false);
+  if (ex.sys) doConsoleCommands(true);
+  if (ex.mesh) meshSnapshot();
+  s_did_cmd = true;
+  logf("CMD: lighter wake (mesh %s, AT diagnostics %s, ?sys=1 %s, queue %s)",
+       ex.mesh ? "on" : "skipped", ex.diag ? "on" : "skipped", ex.sys ? "on" : "skipped",
+       queue_empty ? "empty" : "ran");
 }
 
 static bool httpDownloadTls(const char *start_url, const char *path) {
@@ -2843,17 +2864,20 @@ static bool handleCommand(const char *from, const char *body) {
   }
   telemRefreshSignal();
   if (strcasecmp(s_cmdbuf, "STATUS") == 0) {
+    WakeExtras ex = wakeExtras(true, true);   // v1.7.8: STATUS keeps snapshot, diagnostics, ?sys=1
     doStatusReport();
-    doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
+    if (ex.sys) doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
     if (s_gps_auto && !s_gps_done) { static char go[300]; gpsReport("auto", go, sizeof(go)); }  // v1.6.7 optional location on check-in
-    meshSnapshot();
+    if (ex.mesh) meshSnapshot();
     cfgSnapshot();   // v1.7.0
+    s_did_status = true;
     return true;
   }
   if (strcasecmp(s_cmdbuf, "CMD") == 0) {
-    doConsoleCommands();
-    meshSnapshot();
-    cfgSnapshot();   // v1.7.0
+    bool empty = true;
+    doConsoleCommands(false, false, &empty);
+    finishCmdWake(empty);   // v1.7.8: no mesh snapshot, no extra AT diagnostics, no empty ?sys=1
+    cfgSnapshot();          // v1.7.0 settings cache, only when it is due
     return true;
   }
   if (strcasecmp(s_cmdbuf, "REBOOT") == 0) {
@@ -3139,7 +3163,9 @@ static void handleUsbLine(char *line) {
   if (strcasecmp(line, "STATUS") == 0) { doStatusReport(); return; }
   if (strcasecmp(line, "MESH") == 0) { meshSnapshot(); return; }
   if (strcasecmp(line, "WDCHECK") == 0) { wdRun(); return; }   // v1.7.1 run one watchdog check now (bench test)
-  if (strcasecmp(line, "CMD") == 0) { doConsoleCommands(); meshSnapshot(); return; }
+  if (strcasecmp(line, "CMD") == 0) {
+    bool empty = true; doConsoleCommands(false, false, &empty); finishCmdWake(empty); return;   // v1.7.8
+  }
   if (strncasecmp(line, "CLI ", 4) == 0) { heltecCli(line + 4, s_cli_out, sizeof(s_cli_out)); heltecCliEnd(); Serial.println(s_cli_out); return; }
   if (strcasecmp(line, "REBOOT") == 0) {
     heltecReboot(); { progressf("REBOOT", "arrows_counterclockwise", 3, "REBOOT done"); ingestEvent("reboot", "REBOOT done"); } return;
@@ -3195,6 +3221,27 @@ static void interactiveWindow(uint32_t window_ms) {
     hwAwakeService();   // v1.7.4
     delay(20);
   }
+}
+
+// v1.7.8 SMS ring (ext0): wake like wdRun (DTR low leaves CSCLK sleep, no RESET / PWRKEY).
+// AT must answer within a few tries and CEREG/CREG must show registered within SMS_LIGHT_REG_MS.
+// Either failure falls back to modemPowerOn. Sleep is still modemEnableSleep (DTR high, AT+CSCLK=1).
+static bool modemSmsLight() {
+  logf("SMS wake: light wake (DTR low, no modem reset)");
+  pinMode(MODEM_DTR_PIN, OUTPUT);
+  digitalWrite(MODEM_DTR_PIN, LOW);
+  ModemSerial.setRxBufferSize(8192);
+  ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+  delay(150);
+  bool at = wdProbe(SMS_LIGHT_AT_TRIES);
+  if (at) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
+  bool reg = at && wdWaitReg(SMS_LIGHT_REG_MS);
+  if (!smsLightOk(at, reg)) {
+    logf("SMS wake: light wake not enough (AT=%d reg=%d)", (int)at, (int)reg);
+    return false;
+  }
+  logf("SMS wake: modem already up and registered");
+  return true;
 }
 
 void setup() {
@@ -3309,7 +3356,14 @@ void setup() {
     loadLastResult();
     printLastLog();
   }
-  if (!modemPowerOn()) {
+  // v1.7.8: an SMS ring (ext0, wake code 2) does not hard-reset the modem. Timer and
+  // power-on paths still call modemPowerOn. GPIO6 STATUS boot is ext1 and stays on that path.
+  bool modem_up;
+  if (smsWakeUsesLight((int)s_wake_cause)) {
+    modem_up = modemSmsLight();
+    if (!modem_up) { logf("SMS wake: falling back to full modem reset"); modem_up = modemPowerOn(); }
+  } else modem_up = modemPowerOn();
+  if (!modem_up) {
     if (s_tf_status_boot) { logf("tsim wake STATUS: modem did not start"); goToSleep(); return; }
     if (!fast) interactiveWindow(AWAKE_WINDOW_MS);
     goToSleep(); return;
@@ -3317,7 +3371,8 @@ void setup() {
   modemAT("ATE0"); modemAT("AT+CMEE=2");
   gpsHousekeep();   // v1.6.8: GNSS warm window / battery protection
   bool sim = modemWaitCpinReady(20000);
-  modemLogDiagnostics();
+  const bool sms_wake = smsWakeUsesLight((int)s_wake_cause);
+  if (!sms_wake) modemLogDiagnostics();   // SMS diags run after the text, so a CMD wake can skip them
   if (sim) {
     if (modemWaitNetwork(fast ? 30000 : 60000)) { s_wd_fails = 0; wdSchedule(true); }  // v1.7.1 a good wake restarts the watchdog interval
     modemConfigureSms();
@@ -3328,6 +3383,12 @@ void setup() {
     processSmsInbox();
     if (s_tf_status_boot) doStatusReport();
   } else if (s_tf_status_boot) logf("tsim wake STATUS: no SIM, report skipped");
+  if (sms_wake) {
+    // CMD only: skip the extra AT diagnostics. STATUS (and any other text) keeps them.
+    WakeExtras ex = wakeExtras(s_did_status || !s_did_cmd, false);
+    if (ex.diag) modemLogDiagnostics();
+    else logf("CMD wake: skip extra AT diagnostics");
+  }
   if (s_tf_status_boot) { goToSleep(); return; }
   if (fast && !s_busy_update) { goToSleep(); return; }
   interactiveWindow(AWAKE_WINDOW_MS);

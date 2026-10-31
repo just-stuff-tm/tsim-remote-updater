@@ -1578,3 +1578,71 @@ console.log("serial.ondemand tests OK");
   assert(pg.includes('3:"GPIO6"') && pg.includes('"Last reset"') && pg.includes('9:"Brownout"') && pg.includes("own resets ignored"));
   console.log("v1.7.6 reset reason / wake label / send-log tests OK");
 }
+
+// ---------- v1.7.8: dashboard poll schedule (3s after a text, 5s during an update, 30s otherwise) ----------
+{
+  const M = await import("../src/index.js");
+  const now = 1700000000000;
+  assert.equal(M.POLL_FAST_MS, 3000);
+  assert.equal(M.POLL_IDLE_MS, 30000);
+  assert.equal(M.POLL_UPDATE_MS, 5000);
+  assert.equal(M.POLL_FAST_FOR_MS, 180000);
+  assert.equal(M.pollSchedule({ hidden: true, now, fastUntil: now + 1000, repliesPending: true }), null);
+  assert.equal(M.pollSchedule({ inflight: true, now, updateBusy: true, repliesPending: true, fastUntil: now + 99999 }), null);
+  assert.equal(M.pollSchedule({ updateBusy: true, now, repliesPending: true, fastUntil: now + 99999 }), 5000);
+  assert.equal(M.pollSchedule({ now, repliesPending: true, fastUntil: now + 1000 }), 3000);
+  assert.equal(M.pollSchedule({ now, repliesPending: true, fastUntil: now }), 30000);
+  assert.equal(M.pollSchedule({ now, repliesPending: false, fastUntil: now + 1000 }), 30000);
+  const sentAt = new Date(now - 10000).toISOString();
+  const oldAt = new Date(now - 180000).toISOString();
+  const sent = [{ id: "a", status: "sent", sent_at: sentAt }];
+  const old = [{ id: "b", status: "sent", sent_at: oldAt }];
+  assert.deepEqual(M.pollTrackIds(sent, now), ["a"]);
+  assert.deepEqual(M.pollTrackIds(old, now), []);
+  assert.deepEqual(M.pollTrackIds([{ id: "q", status: "queued", queued_at: new Date(now).toISOString() }], now), []);
+  assert.deepEqual(M.pollTrackIds([{ id: "d", status: "done", sent_at: sentAt }], now), []);
+  const armed = M.pollArm({ now, texted: true, fastUntil: 0, commands: [], waitReport: now });
+  assert.equal(armed.repliesPending, true);
+  assert.equal(armed.fastUntil, now + 180000);
+  assert.equal(M.pollSchedule({ now, fastUntil: armed.fastUntil, repliesPending: armed.repliesPending }), 3000);
+  // Queue only (no text, nothing "sent") stays on the slow poll.
+  const queued = M.pollArm({ now, texted: false, fastUntil: 0, commands: [{ id: "q", status: "queued" }], waitReport: 0 });
+  assert.equal(queued.repliesPending, false);
+  assert.equal(M.pollSchedule({ now, fastUntil: queued.fastUntil, repliesPending: queued.repliesPending }), 30000);
+  // Opening the page while a command was sent recently starts the fast poll. An old "sent" does not.
+  const open = M.pollArm({ now, fastUntil: 0, commands: sent, waitReport: 0 });
+  assert.equal(open.repliesPending, true);
+  assert.equal(open.fastUntil, Date.parse(sentAt) + 180000);
+  assert.equal(M.pollSchedule({ now, fastUntil: open.fastUntil, repliesPending: open.repliesPending }), 3000);
+  const stale = M.pollArm({ now, fastUntil: 0, commands: old, waitReport: 0 });
+  assert.equal(stale.repliesPending, false);
+  assert.equal(M.pollSchedule({ now, fastUntil: stale.fastUntil, repliesPending: stale.repliesPending }), 30000);
+  // STATUS: no command was "sent" yet, so the wait ends when a newer telemetry report arrives.
+  const waiting = M.pollArm({ now, fastUntil: now + 180000, commands: [], waitReport: now - 1000, waitIds: [], latestAt: new Date(now - 60000).toISOString() });
+  assert.equal(waiting.repliesPending, true);
+  const got = M.pollArm({ now, fastUntil: now + 180000, commands: [], waitReport: now - 1000, waitIds: [], latestAt: new Date(now).toISOString() });
+  assert.equal(got.repliesPending, false);
+  assert.equal(M.pollSchedule({ now, fastUntil: got.fastUntil, repliesPending: got.repliesPending }), 30000);
+  // CMD: tracked ids still "sent" keep the fast poll; once they leave "sent", it stops.
+  const mid = M.pollArm({ now, fastUntil: open.fastUntil, commands: sent, waitReport: now - 5000, waitIds: ["a"], latestAt: new Date(now - 60000).toISOString() });
+  assert.equal(mid.repliesPending, true);
+  const done = M.pollArm({ now, fastUntil: open.fastUntil, commands: [{ id: "a", status: "done", sent_at: sentAt }], waitReport: now - 5000, waitIds: ["a"], latestAt: new Date(now - 60000).toISOString() });
+  assert.equal(done.repliesPending, false);
+  // A system command is hidden from the console list but still counts as awaiting.
+  const both = [{ id: "u1", cmd: "ver", status: "sent", sent_at: sentAt }, { id: "s1", cmd: "PWRCFG scale=1", status: "sent", sent_at: sentAt, sys: true }, { id: "q1", cmd: "board", status: "queued" }];
+  assert.deepEqual(M.awaitingCmds(both).map((c) => c.id), ["u1", "s1"]);
+  assert.equal(M.userCommands(both).filter((c) => c.status === "sent").length, 1);
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.78")).headers.get("Set-Cookie").split(";")[0];
+  kv.set("cmds:tsim-1", JSON.stringify(both));
+  const tel = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+  assert.deepEqual(tel.awaiting.map((x) => x.id).sort(), ["s1", "u1"]);
+  assert.equal(tel.commands.filter((x) => x.status === "sent").length, 1);
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes("visibilitychange") && pg.includes("function pollSchedule") && pg.includes("const POLL_FAST_MS=3000"));
+  assert(pg.includes("every 3 seconds for up to 3 minutes"));
+  assert(!pg.includes("busy?5000:30000"));
+  for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  const fp = M.fleetPage({ id: "acct", name: "Fleet" });
+  assert(fp.includes("busy?5000:30000") && !fp.includes("pollSchedule"));
+  console.log("v1.7.8 poll schedule tests OK");
+}

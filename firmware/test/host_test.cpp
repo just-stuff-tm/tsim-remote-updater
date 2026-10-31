@@ -1,6 +1,7 @@
 // Host test for firmware/src/hw_guard.h (v1.7.6). Run: g++ -std=c++17 -Wall -I../src host_test.cpp -o /tmp/ht && /tmp/ht
 #include "hw_guard.h"
 #include "tsim_frame.h"
+#include "wake_path.h"
 #include <cassert>
 #include <cstdio>
 #define HW_DEBOUNCE_S 60
@@ -68,6 +69,24 @@ int main() {
   assert(tsimParseLine("@TSIM TOOLONGCOMMANDNAME 4", &fr) == TF_REJECT);
   assert(tsimParseLine("Repeater ID: ab", &fr) == TF_NONE);
   assert(tsimParseLine(nullptr, &fr) == TF_NONE);
-  printf("v1.7.7 host tests OK (self-reset guard, RTC step-back, SMS merge, tsim wake frames)\n");
+  // 10) v1.7.8: SMS ring (ext0, cause 2) uses the light wake. Power-on, GPIO6/ext1 and timer do not.
+  assert(smsWakeUsesLight(2));
+  assert(!smsWakeUsesLight(0));
+  assert(!smsWakeUsesLight(3));
+  assert(!smsWakeUsesLight(4));
+  assert(SMS_LIGHT_AT_TRIES >= 3 && SMS_LIGHT_AT_TRIES <= 8);
+  assert(SMS_LIGHT_REG_MS >= 5000u && SMS_LIGHT_REG_MS <= 20000u);
+  // Light wake stands only when AT answered and the modem is still registered. Else full reset.
+  assert(smsLightOk(true, true));
+  assert(!smsLightOk(true, false));
+  assert(!smsLightOk(false, true));
+  assert(!smsLightOk(false, false));
+  // STATUS keeps mesh snapshot, AT diagnostics and ?sys=1. CMD skips the first two.
+  // ?sys=1 only when a system command is still pending.
+  { WakeExtras st = wakeExtras(true, false); assert(st.mesh && st.diag && st.sys); }
+  { WakeExtras st = wakeExtras(true, true); assert(st.mesh && st.diag && st.sys); }
+  { WakeExtras cmd = wakeExtras(false, false); assert(!cmd.mesh && !cmd.diag && !cmd.sys); }
+  { WakeExtras cmd = wakeExtras(false, true); assert(!cmd.mesh && !cmd.diag && cmd.sys); }
+  printf("v1.7.8 host tests OK (self-reset guard, RTC step-back, SMS merge, tsim wake frames, light SMS wake, CMD vs STATUS)\n");
   return 0;
 }
