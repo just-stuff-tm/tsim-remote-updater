@@ -302,14 +302,38 @@ export function safeRelUrl(u, repo, tag) {
   return repo && tag ? `https://github.com/${repo}/releases/tag/${encodeURIComponent(tag)}` : null;
 }
 export const buildUpdateBody = (url) => `UPDATE ${url.replace(/_/g, "%5F")} `;
-// A GitHub release URL for MeshCore-TSim-Powersaving does not fit in one SMS (160). Remember the asset and text a short /gh/<id> link. The T-SIM follows that redirect.
+// https URL the T-SIM may download. Rejects userinfo and control characters so /gh/<id> cannot be an open redirect.
+export function safeDownloadUrl(u) {
+  const s = String(u || "").trim();
+  if (!/^https:\/\/[A-Za-z0-9.-]+(?::\d+)?\/\S+$/.test(s) || /[\u0000-\u0020"'<>\\]/.test(s)) return null;
+  try {
+    const x = new URL(s);
+    if (x.protocol !== "https:" || x.username || x.password) return null;
+    return s;
+  } catch { return null; }
+}
+// GitHub asset id when the API gave us one. The HTML fallback (API 403/429) only has "tag/name",
+// and a direct URL uses the URL itself — neither is all digits. Those still need a stable /gh/<id>.
+async function shortLinkId(rel) {
+  const raw = String(rel && rel.asset_id != null ? rel.asset_id : "");
+  if (/^\d{1,18}$/.test(raw)) return raw;
+  const url = String((rel && rel.url) || "");
+  if (!safeDownloadUrl(url)) return "";
+  const n = parseInt(hex(await crypto.subtle.digest("SHA-256", enc.encode(url))).slice(0, 12), 16);
+  return Number.isFinite(n) && n > 0 ? String(n) : "";
+}
+// Shorten first, whenever the encoded UPDATE text would exceed 160. manualSend then checks that final text.
+// The T-SIM follows the /gh/<id> 303 (modem HTTP does not; the TLS path does), then GitHub's own redirect,
+// and MD5s the file bytes. Heltec UPDATE carries no sha/md5 in the text.
 export async function smsUpdateUrl(env, origin, rel) {
-  const direct = buildUpdateBody(rel.url);
+  const url = String((rel && rel.url) || "");
+  const direct = buildUpdateBody(url);
   if (direct.length <= 160) return direct;
-  const id = String(rel.asset_id ?? "");
-  if (!/^\d+$/.test(id)) return direct;
-  await putJson(env, `ghasset:${id}`, { url: rel.url, name: rel.asset_name || "" });
-  return buildUpdateBody(`${origin}/gh/${id}`);
+  const id = await shortLinkId(rel);
+  if (!id) return direct;
+  const short = buildUpdateBody(`${String(origin || "").replace(/\/+$/, "")}/gh/${id}`);
+  if (short.length <= 160 && safeDownloadUrl(url)) await putJson(env, `ghasset:${id}`, { url, name: String((rel && rel.asset_name) || "") });
+  return short;
 }
 
 async function sendHologramSms(env, hologramDeviceId, body) {
@@ -373,7 +397,7 @@ async function manualSend(env, dev, body, label, onSuccess) {
     const wait = Math.ceil((SEND_GAP_MS - (now - st.last_send_ts)) / 1000);
     return [{ sent: false, body, hologram_response_summary: null, error: `rate limited, try again in ${wait}s` }, 429];
   }
-  if (body.length > 160) return [{ sent: false, body, hologram_response_summary: null, error: `text is ${body.length} chars (max 160)` }, 400];
+  if (body.length > 160) return [{ sent: false, body, hologram_response_summary: null, error: `text is ${body.length} chars (max 160)` }, 400]; // final text, after any /gh/ shorten
   st.last_send_ts = now;
   await putJson(env, stKey, st);
   try {
@@ -2173,14 +2197,16 @@ async function deviceApi(request, env, dev, action) {
     const risk = rel.via === "upload" ? uploadImageRisk(rel, tfw) : await heltecImageRisk(rel.url, tfw);
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     if (!(retry && prevSent && prevSent.url)) await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
-    const [o, c] = await manualSend(env, dev, await smsUpdateUrl(env, new URL(request.url).origin, rel), `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
+    const sms = await smsUpdateUrl(env, new URL(request.url).origin, rel);
+    const [o, c] = await manualSend(env, dev, sms, `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
       st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
     });
-    // v1.7.2 backup: also queue it for the next watchdog check-in, in case the text never reaches the T-SIM.
+    // v1.7.2 backup: same URL the text used (short /gh/<id> when the direct URL does not fit in 160).
     let wdq = null;
     if (c !== 429 && c !== 400 && fwAtLeast(tfw, WDCMD_FW)) {
       const list = (await kvJson(env, `cmds:${id}`)) || [];
-      wdq = queueWdUpdate(list, rel.url); await putJson(env, `cmds:${id}`, list);
+      const smsUrl = (String(sms).match(/^UPDATE (\S+)/) || [])[1];
+      wdq = queueWdUpdate(list, smsUrl ? smsUrl.replace(/%5F/gi, "_") : rel.url); await putJson(env, `cmds:${id}`, list);
     }
     return json({ ...o, release: rel, ...(wdq ? { wd_backup: wdq.id } : {}) }, c);
   }
@@ -2277,6 +2303,10 @@ export function radioStatus(mesh, s, rel, flashedFallback = null) {
   }
   const radioInst = (mesh && mesh.heltec_fw) || (s && s.heltec_fw) || null;
   return updateStatus(radioInst, rel, flashedFallback);
+}
+// Already-current radios stay updatable (reinstall). The button asks before sending.
+export function radioUpdateConfirm(upToDate) {
+  return upToDate ? "already up to date, reinstall?" : "Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.";
 }
 function statuses(latest, mesh, s, hist, rel, tsimRel) {
   return { tsim: updateStatus(latest && latest.fw, tsimRel), radio: radioStatus(mesh, s, rel, radioFlashed(s, hist)) };
@@ -2771,7 +2801,7 @@ function armText(j){
  if(dly!=null)window._t=setTimeout(load,dly)}
 const rj=async r=>{try{return await r.json()}catch{return{}}};
 const say=(id,ok,msg)=>{const el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=msg};
-let first=true,pending={},PRE={};
+let first=true,pending={},PRE={},RADCUR=false;
 let fastUntil=0,waitReport=0,waitIds=null,pollBusy=false,pollAgain=false;
 function prog(p,label,pend){
  if(pend&&(!p||p.state==="idle"||(p.started_at&&new Date(p.started_at)<pend)))p={state:"running",step:0,pct:0,steps:["Waiting for T-SIM to wake","Downloading","Verifying","Writing / flashing","Rebooting","Done"],times:{0:pend.toISOString()}};
@@ -2802,7 +2832,7 @@ async function load(){
  $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Battery protection",L.lb_state==null?null:(L.lb_state?"Repeat OFF (low battery)":"normal")],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
- const US=d.update_status||{};
+ const US=d.update_status||{};RADCUR=!!(US.radio&&US.radio.state==="current");
  $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)],["Last flashed",US.radio&&US.radio.flashed?US.radio.flashed.file+" · "+t(US.radio.flashed.at):null]])+(US.radio&&US.radio.flashed?finfo(US.radio.flashed.flash):"")+relnotes(US.radio);
  $("c-tsimfw").innerHTML=kv([["Status",utext(US.tsim)],["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]])+relnotes(US.tsim);
  for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
@@ -3075,12 +3105,14 @@ $("cancel").onclick=async()=>{const r=await post("commands",{cancel:true});const
 const OKMSG={status:"Text sent. The T-SIM will wake and report within ~2 minutes.",reboot:"Text sent. The Heltec will restart when the T-SIM wakes (~2 minutes).",
  "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it on the LoRa radio tab.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it on the T-SIM tab."};
 const ULBL={"update-latest":"Update radio firmware","tsim-update":"Update T-SIM firmware"},UKIND={"update-latest":"heltec","tsim-update":"tsim"};
-// Dynamic update buttons: Update (idle/done) -> Cancel (queued/running) -> Retry (failed/stalled/cancelled)
+${radioUpdateConfirm.toString()}
+// Dynamic update buttons: Update (idle/done) -> Cancel (queued/running) -> Retry (failed/stalled/cancelled). Up to date does not disable Update.
 function setUpd(a,kind,p,pend){const s=pend&&(!p||p.state==="idle"||p.state==="done")?"running":(p&&p.state)||"idle";
  const mode=s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"update";
  document.querySelectorAll('button[data-a="'+a+'"]').forEach(b=>{if(b.dataset.busy)return;b.dataset.mode=mode;
   b.textContent=mode==="cancel"?"Cancel "+(kind==="tsim"?"T-SIM":"radio")+" update":mode==="retry"?"Retry "+(kind==="tsim"?"T-SIM":"radio")+" update":ULBL[a];
-  b.className=mode==="cancel"?"g":"w"})}
+  b.className=mode==="cancel"?"g":"w";
+  if(a==="update-latest"&&mode==="update")b.dataset.c=radioUpdateConfirm(RADCUR)})}
 async function updClick(b,a){const kind=UKIND[a],mode=b.dataset.mode||"update";
  if(mode==="cancel"){if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return null;
   const r=await post("update-cancel",{kind});const j=await rj(r);if(r.ok){delete pending[kind];toast(j.note,"ok")}else toast(friendly(j,r.status),"bad");return true}
@@ -3290,10 +3322,11 @@ export default {
     const m = request.method;
     try {
       if (parts[0] === "fw" && parts.length === 2 && (m === "GET" || m === "HEAD")) return await handleFwDownload(request, env, parts[1]);
-      if (parts[0] === "gh" && parts.length === 2 && /^\d+$/.test(parts[1]) && (m === "GET" || m === "HEAD")) {
+      if (parts[0] === "gh" && parts.length === 2 && /^\d{1,18}$/.test(parts[1]) && (m === "GET" || m === "HEAD")) {
         const rec = await kvJson(env, `ghasset:${parts[1]}`);
-        if (!rec || typeof rec.url !== "string" || !/^https:\/\/github\.com\//.test(rec.url)) return new Response("not found", { status: 404, headers: SEC_HEADERS });
-        return redirect(rec.url);
+        const loc = rec && safeDownloadUrl(rec.url);
+        if (!loc) return new Response("not found", { status: 404, headers: SEC_HEADERS });
+        return redirect(loc); // 303. T-SIM TLS download follows it and MD5s the unchanged file bytes.
       }
       if (parts[0] === "ingest" && parts.length === 2 && m === "POST") return await handleIngest(request, env, parts[1]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "commands" && m === "GET") return await handleDeviceCommands(request, env, parts[2]);

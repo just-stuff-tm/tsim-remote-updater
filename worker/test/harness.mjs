@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { pickAsset, globToRegex as globToRegexT, OLD_PS_NAME as OLDPS, FW_PRESETS, V3_DEFAULT_SOURCE, psBlocks, tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { pickAsset, globToRegex as globToRegexT, OLD_PS_NAME as OLDPS, FW_PRESETS, V3_DEFAULT_SOURCE, psBlocks, tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, smsUpdateUrl, radioUpdateConfirm, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -308,7 +308,71 @@ assert.equal(typeof worker.scheduled, "function");
   j = await (await D("update-cancel", { kind: "heltec" })).json(); assert(j.cancelled && /already delivered/.test(j.note)); assert.equal(holo, h0 + 1);
   resetGap(); j = await (await D("update-latest", { retry: true })).json(); assert(j.sent && j.body.startsWith("UPDATE ")); assert.equal(holo, h0 + 2);
   const page = await (await call("/d/dyn-1", { headers: { Cookie: dc } })).text(); assert(page.includes("setUpd(") && page.includes("update-cancel"));
+  assert(page.includes("already up to date, reinstall?"));
+  assert.equal(radioUpdateConfirm(true), "already up to date, reinstall?");
+  assert.match(radioUpdateConfirm(false), /reflashed and restart/);
+  assert.doesNotMatch(page, /data-a="update-latest"[^>]*disabled/);
   console.log("dynamic update button tests ok");
+}
+// 18.1 headless asset: long GitHub URL (and the HTML fallback, which has no numeric asset id) must text /gh/<id>
+{
+  const NAME = "Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving18.1-upgrade.bin";
+  const TAG = "MeshCore-TSim-Powersaving18.1";
+  const URL = `https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/releases/download/${TAG}/${NAME}`;
+  const direct = buildUpdateBody(URL);
+  assert.equal(direct.length, 190, "encoded 18.1 headless UPDATE is the 190-char text");
+  const bodyApi = await smsUpdateUrl(env, "https://w", { url: URL, asset_id: 683592608, asset_name: NAME });
+  assert.equal(bodyApi, "UPDATE https://w/gh/683592608 ");
+  assert(bodyApi.length <= 160);
+  const ghApi = await call("/gh/683592608");
+  assert.equal(ghApi.status, 303);
+  assert.equal(ghApi.headers.get("Location"), URL);
+  const bodyHtml = await smsUpdateUrl(env, "https://w", { url: URL, asset_id: `${TAG}/${NAME}`, asset_name: NAME, via: "html" });
+  assert(bodyHtml.length <= 160, bodyHtml);
+  assert.match(bodyHtml, /^UPDATE https:\/\/w\/gh\/\d+ $/);
+  assert.doesNotMatch(bodyHtml, /github\.com/);
+  const hid = bodyHtml.match(/\/gh\/(\d+)/)[1];
+  const ghHtml = await call("/gh/" + hid);
+  assert.equal(ghHtml.status, 303);
+  assert.equal(ghHtml.headers.get("Location"), URL);
+  // short URLs stay direct (underscore encoding unchanged)
+  assert.equal(await smsUpdateUrl(env, "https://w", { url: "https://example.com/fw/My_fw-1.bin", asset_id: "https://example.com/fw/My_fw-1.bin", asset_name: "My_fw-1.bin" }), "UPDATE https://example.com/fw/My%5Ffw-1.bin ");
+  // button path: GitHub API 403 uses the HTML fallback, which used to emit the 190-char text
+  await admin("/admin/devices", "POST", { id: "sl-1", hologram_device_id: "1234567" });
+  const made = await (await admin("/admin/devices/sl-1/reset-password", "POST", { password: "shortlink-device-password" })).json();
+  const sc = (await login("sl-1", made.password, "6.6.6.6")).headers.get("Set-Cookie").split(";")[0];
+  const key = JSON.parse(kv.get("device:sl-1")).ingest_key;
+  await call("/ingest/sl-1", { method: "POST", headers: { "X-Device-Key": key }, body: JSON.stringify({ type: "status", fw: "tsim-updater 1.7.8" }) });
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (u, init) => {
+    u = String(u);
+    if (u.includes("api.github.com/repos/just-stuff-tm/MeshCore-TSim-Powersaving")) return new Response("rate", { status: 403 });
+    if (u === "https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/releases/latest")
+      return new Response(null, { status: 302, headers: { Location: `https://github.com/just-stuff-tm/MeshCore-TSim-Powersaving/releases/tag/${TAG}` } });
+    if (u.includes("/releases/expanded_assets/")) {
+      const href = (n) => `<a href="/just-stuff-tm/MeshCore-TSim-Powersaving/releases/download/${TAG}/${n}">`;
+      return new Response(href("Heltec_v3_repeater-" + TAG + "-upgrade.bin") + href("Heltec_v3_repeater_headless-" + TAG + "-freshInstall-merged.bin") + href(NAME), { status: 200 });
+    }
+    return prevFetch(u, init);
+  };
+  let j;
+  try {
+    const r = await call("/api/d/sl-1/update-latest", { method: "POST", headers: { Cookie: sc, "Content-Type": "application/json" }, body: "{}" });
+    j = await r.json();
+    assert.equal(r.status, 200, JSON.stringify(j));
+  } finally { globalThis.fetch = prevFetch; }
+  assert(j.sent, JSON.stringify(j));
+  assert(j.body.length <= 160, j.body.length + " " + j.body);
+  assert.match(j.body, /^UPDATE https:\/\/w\/gh\/\d+ $/);
+  assert.doesNotMatch(j.body, /github\.com|_/);
+  const id = j.body.match(/\/gh\/(\d+)/)[1];
+  const gh = await call("/gh/" + id);
+  assert.equal(gh.status, 303);
+  assert.equal(gh.headers.get("Location"), URL);
+  const wd = JSON.parse(kv.get("cmds:sl-1")).find((c) => c.wdonly);
+  assert.equal(wd.cmd, j.body.trim());
+  assert(wd.cmd.length <= 160);
+  console.log("short link 18.1", j.body.length);
 }
 console.log("ALL TESTS PASSED");
 // origin handling
