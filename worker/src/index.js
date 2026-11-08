@@ -145,7 +145,7 @@ const UA = "tsim-remote-updater (+cloudflare-workers)";
 const HOLOGRAM_SMS_URL = "https://dashboard.hologram.io/api/1/sms/incoming";
 const PBKDF2_ITER = 100000; // Workers WebCrypto maximum
 const SESSION_TTL = 7 * 24 * 3600;
-const SEND_GAP_MS = 60_000;
+const SEND_GAP_MS = 20_000;
 const LOGIN_MAX_FAILS = 5;
 const LOGIN_WINDOW = 15 * 60;
 const HISTORY_MAX = 50;
@@ -2441,7 +2441,7 @@ function pbadge(p,label){if(!p||p.state==="idle")return"";if(p.state==="done"&&p
 let toastT;function toast(msg,kind){let el=$("toast");if(!el){el=document.createElement("div");el.id="toast";document.body.appendChild(el)}el.className=kind||"";el.textContent=msg;el.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>el.hidden=true,kind==="bad"?9000:6000)}
 function friendly(j,status){const x=String((j&&(j.error||(j.hologram_response_summary||{}).error))||"");
  if(status===401)return"Your login has expired. Please log in again.";
- if(/rate limited/.test(x))return"Please wait a minute between texts to the same T-SIM ("+(x.match(/\\d+s/)||["a few s"])[0]+" left).";
+ if(/rate limited/.test(x))return"Please wait 20 seconds between texts to the same T-SIM ("+(x.match(/\\d+s/)||["a few s"])[0]+" left).";
  if(/^Blocked for safety/.test(x))return x;
  if(/Hologram|HOLOGRAM/.test(x))return"The text couldn't be sent: the SMS service (Hologram) rejected it. Check the Hologram API key and the SIM's status.";
  if(/hologram_device_id/.test(x))return"This T-SIM has no SIM device id set up, so it can't be texted.";
@@ -2580,7 +2580,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>LoRa radio</h3><div id="ov-radio"></div><p class="small"><a href="#radio">Open LoRa radio ›</a></p></div>
 <div class="card"><h3>T-SIM</h3><div id="ov-tsim"></div><p class="small"><a href="#tsim">Open T-SIM ›</a></p></div>
 </div>
-<p class="small mut">One text per minute per T-SIM. After you text it, this page checks for the reply every 3 seconds for up to 3 minutes.</p>
+<p class="small mut">One text every 20 seconds per T-SIM. After you text it, this page checks for the reply every 3 seconds for up to 3 minutes.</p>
 </div>
 
 <div class="pane" id="t-radio" hidden>
