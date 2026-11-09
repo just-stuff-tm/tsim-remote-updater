@@ -1,5 +1,5 @@
 // Local test harness: mocks KV and fetch (GitHub, Hologram). Run: node test/harness.mjs
-import worker, { pickAsset, globToRegex as globToRegexT, OLD_PS_NAME as OLDPS, FW_PRESETS, V3_DEFAULT_SOURCE, psBlocks, tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, smsUpdateUrl, radioUpdateConfirm, parseMesh, runSchedules, updateStatus, refreshReleases } from "../src/index.js";
+import worker, { pickAsset, globToRegex as globToRegexT, OLD_PS_NAME as OLDPS, FW_PRESETS, V3_DEFAULT_SOURCE, psBlocks, tlFields, cfgListCmds, depOk, buildRptOp, rptReadAllKeys, cmdsPerWake, parseSettingReply, buildSettingCmd, RPT_READ_KEYS, RADIO_PRESETS, CMDS_PER_WAKE, parseAdcReply, calcAdcMultiplier, clampAdc, computeProgress, friendlyFail, heltecImageRisk, fwAtLeast, normChecksum, buildTsimCommand, hashPassword, verifyPassword, buildUpdateBody, smsUpdateUrl, radioUpdateConfirm, parseMesh, runSchedules, updateStatus, refreshReleases, radioDebugTimeline, radioDebugVerdict, radioDebugReport, dashboardPage } from "../src/index.js";
 import assert from "node:assert";
 
 const kv = new Map();
@@ -1709,4 +1709,70 @@ console.log("serial.ondemand tests OK");
   const fp = M.fleetPage({ id: "acct", name: "Fleet" });
   assert(fp.includes("busy?5000:30000") && !fp.includes("pollSchedule"));
   console.log("v1.7.8 poll schedule tests OK");
+}
+
+// ---------- radio debugger: read-only verdicts from stored samples ----------
+{
+  const iso = (ms) => new Date(ms).toISOString();
+  const t0 = Date.parse("2026-11-08T03:00:00Z");
+  const silentHist = [
+    { received_at: iso(t0), type: "mesh", msg: "Mesh snapshot: 0 neighbors", battery_v: 3.92, solar_v: 5.1 },
+    { received_at: iso(t0 + 2 * 3600000), type: "status", msg: "Status report", rr: 3, uptime: 90000 },
+    { received_at: iso(t0 + 2 * 3600000), type: "mesh", msg: "Mesh snapshot: 0 neighbors" },
+  ];
+  const silentEv = radioDebugTimeline({ history: silentHist, latest: { received_at: iso(t0 + 2 * 3600000), battery_v: 3.92, solar_v: 5.1, rr: 3, uptime: 90000 } });
+  const silentV = radioDebugVerdict(silentEv);
+  assert.equal(silentV.kind, "silent");
+  assert.equal(silentV.verdict, "LoRa silent while LTE up for 2 h");
+  assert.match(silentV.verdict, /LoRa silent while LTE up for/);
+  const silentRep = radioDebugReport({ history: silentHist, latest: { received_at: iso(t0 + 2 * 3600000), battery_v: 3.92, solar_v: 5.1, rr: 3 } });
+  assert.equal(silentRep.summary.neighbor_last, 0);
+  assert.equal(silentRep.summary.reboots, 0);
+  assert.equal(silentRep.events[0].lte, true);
+
+  const t1 = Date.parse("2026-11-09T15:40:00Z");
+  const restoredHist = [
+    { received_at: iso(t1), type: "mesh", msg: "Mesh snapshot: 0 neighbors" },
+    { received_at: iso(t1 + 30 * 60000), type: "event", msg: "Heltec reboot detected (while the T-SIM was awake) → Watchdog: check OK after earlier failures" },
+    { received_at: iso(t1 + 40 * 60000), type: "mesh", msg: "Mesh snapshot: 3 neighbors" },
+  ];
+  const restoredMesh = { received_at: iso(t1 + 40 * 60000), neighbors: [{ id: "AA" }, { id: "BB" }, { id: "CC" }], core: { uptime_secs: 120 }, packets: { recv: 4 }, radio: { rx: 4, rxage: 30, rh1: 1, rh2: 0, rh3: 0 } };
+  const restoredV = radioDebugVerdict(radioDebugTimeline({ history: restoredHist, mesh: restoredMesh }));
+  assert.equal(restoredV.verdict, "Heltec reboot restored mesh");
+  assert.equal(restoredV.kind, "restored");
+  const restoredRep = radioDebugReport({ history: restoredHist, mesh: restoredMesh });
+  assert.equal(restoredRep.summary.neighbor_last, 3);
+  assert.equal(restoredRep.summary.rx, 4);
+  assert.equal(restoredRep.summary.rh1, 1);
+  assert.equal(restoredRep.summary.reboots, 1);
+
+  const t2 = Date.parse("2026-11-09T12:00:00Z");
+  const thin = [
+    { received_at: iso(t2), type: "mesh", msg: "Mesh snapshot: 4 neighbors" },
+    { received_at: iso(t2 + 60000), type: "status", msg: "Status report" },
+  ];
+  assert.equal(radioDebugVerdict(radioDebugTimeline({ history: thin })).verdict, "Insufficient samples");
+  assert.equal(radioDebugVerdict([]).verdict, "Insufficient samples");
+  assert.equal(radioDebugVerdict(radioDebugTimeline({})).kind, "insufficient");
+  assert.equal(radioDebugReport({ history: thin }).kind, "insufficient");
+
+  const page = dashboardPage({ id: "tsim-1", name: "White Mtn" });
+  assert(page.includes("Radio debugger"));
+  assert(page.includes("does not text the repeater"));
+  assert(page.includes('id="rdverdict"'));
+  assert(page.includes("function showRd"));
+  assert(!page.includes("data-a=\"radio-health\""));
+  for (const mm of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+
+  kv.delete("mesh:tsim-1");
+  kv.set("telem:tsim-1:history", JSON.stringify(silentHist));
+  kv.set("telem:tsim-1:latest", JSON.stringify({ received_at: iso(t0 + 2 * 3600000), fw: "1.7.8", battery_v: 3.92, solar_v: 5.1, rr: 3, uptime: 90000 }));
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.79")).headers.get("Set-Cookie").split(";")[0];
+  const tel = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+  assert.equal(tel.radio_debug.kind, "silent");
+  assert.match(tel.radio_debug.verdict, /LoRa silent while LTE up for/);
+  assert.equal(tel.radio_debug.summary.rr, 3);
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes("Radio debugger") && pg.includes("function showRd"));
+  console.log("radio debugger tests OK");
 }

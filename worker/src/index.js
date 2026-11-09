@@ -591,6 +591,134 @@ export function parseMesh(t, receivedAt = Date.now()) {
     error: raw.error || null,
   };
 }
+
+// Read-only radio debugger. Built only from samples already stored (activity
+// log, the latest mesh snapshot, the latest T-SIM report). No texts, no CLI.
+const RADIO_DEBUG_LONG_MS = 30 * 60 * 1000;
+function radioDebugHours(ms) {
+  const rounded = Math.round((ms / 3600000) * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+export function radioDebugTimeline({ history, mesh, latest } = {}) {
+  const events = [];
+  const push = (ev) => {
+    const at = Date.parse(ev.at || "");
+    if (!Number.isFinite(at)) return;
+    events.push({ ...ev, at, iso: new Date(at).toISOString() });
+  };
+  for (const h of history || []) {
+    if (!h) continue;
+    const msg = String(h.msg || "");
+    const ev = { at: h.received_at || "", lte: true, type: h.type || "", msg: msg.slice(0, 180) };
+    if (h.rr != null && Number.isFinite(+h.rr)) ev.rr = +h.rr;
+    if (h.battery_v != null && Number.isFinite(+h.battery_v)) ev.battery_v = +h.battery_v;
+    if (h.solar_v != null && Number.isFinite(+h.solar_v)) ev.solar_v = +h.solar_v;
+    if (h.uptime != null && Number.isFinite(+h.uptime)) ev.tsim_uptime_s = +h.uptime;
+    const nm = msg.match(/Mesh snapshot:\s*(\d+)\s+neighbors/i);
+    if (nm) ev.neighbors = +nm[1];
+    if (/no reply from repeater CLI/i.test(msg)) ev.lora_cli = false;
+    if (/Heltec reboot/i.test(msg)) ev.reboot = true;
+    push(ev);
+  }
+  if (mesh && mesh.received_at) {
+    push({
+      at: mesh.received_at, lte: true, type: "mesh",
+      neighbors: Array.isArray(mesh.neighbors) ? mesh.neighbors.length : null,
+      heltec_uptime_s: mesh.core && Number.isFinite(+mesh.core.uptime_secs) ? +mesh.core.uptime_secs : null,
+      rx: mesh.packets && Number.isFinite(+mesh.packets.recv) ? +mesh.packets.recv : null,
+      msg: "Latest mesh snapshot",
+    });
+  }
+  if (latest && latest.received_at) {
+    push({
+      at: latest.received_at, lte: true, type: "latest",
+      rr: latest.rr != null && Number.isFinite(+latest.rr) ? +latest.rr : null,
+      battery_v: latest.battery_v != null && Number.isFinite(+latest.battery_v) ? +latest.battery_v : null,
+      solar_v: latest.solar_v != null && Number.isFinite(+latest.solar_v) ? +latest.solar_v : null,
+      tsim_uptime_s: latest.uptime != null && Number.isFinite(+latest.uptime) ? +latest.uptime : null,
+      msg: "Latest T-SIM report",
+    });
+  }
+  events.sort((a, b) => a.at - b.at);
+  return events;
+}
+function radioDebugLabel(ev) {
+  const bits = [];
+  if (ev.reboot) bits.push("Heltec reboot");
+  if (ev.neighbors != null) bits.push(ev.neighbors + " neighbors");
+  if (ev.lora_cli === false) bits.push("LoRa CLI silent");
+  if (ev.heltec_uptime_s != null) bits.push("Heltec up " + ev.heltec_uptime_s + "s");
+  if (ev.rr != null) bits.push("rr " + ev.rr);
+  if (ev.battery_v != null) bits.push(ev.battery_v.toFixed(2) + " V");
+  if (ev.solar_v != null) bits.push("solar " + ev.solar_v.toFixed(2) + " V");
+  if (ev.lte) bits.push("LTE up");
+  if (!bits.length && ev.msg) bits.push(String(ev.msg).slice(0, 80));
+  return bits.join(" · ") || ev.type || "sample";
+}
+export function radioDebugVerdict(events) {
+  const list = (events || []).filter((e) => e && Number.isFinite(e.at)).slice().sort((a, b) => a.at - b.at);
+  const insufficient = { verdict: "Insufficient samples", kind: "insufficient", gap_h: null };
+  if (list.length < 2) return insufficient;
+  const neigh = list.filter((e) => e.neighbors != null);
+  const lte = list.filter((e) => e.lte);
+  if (!neigh.length && lte.length < 2) return insufficient;
+  const lastPos = [...neigh].reverse().find((e) => e.neighbors > 0);
+  const zeros = neigh.filter((e) => e.neighbors === 0 && (!lastPos || e.at > lastPos.at));
+  let silent = null;
+  if (zeros.length >= 2) {
+    const start = zeros[0].at;
+    const lteAfter = lte.filter((e) => e.at >= start);
+    const end = Math.max(zeros[zeros.length - 1].at, lteAfter.length ? lteAfter[lteAfter.length - 1].at : start);
+    if (end - start >= RADIO_DEBUG_LONG_MS && lteAfter.length >= 1) silent = end - start;
+  }
+  let restored = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!list[i].reboot) continue;
+    const t = list[i].at;
+    const before = neigh.filter((e) => e.at < t);
+    const beforeN = before.length ? before[before.length - 1].neighbors : null;
+    const afterPos = neigh.find((e) => e.at > t && e.neighbors > 0);
+    const latestN = neigh.length ? neigh[neigh.length - 1].neighbors : null;
+    if (afterPos && beforeN === 0 && latestN > 0) { restored = true; break; }
+  }
+  if (restored) return { verdict: "Heltec reboot restored mesh", kind: "restored", gap_h: silent == null ? null : Math.round((silent / 3600000) * 10) / 10 };
+  if (silent != null) return { verdict: "LoRa silent while LTE up for " + radioDebugHours(silent) + " h", kind: "silent", gap_h: Math.round((silent / 3600000) * 10) / 10 };
+  return insufficient;
+}
+export function radioDebugReport(input) {
+  const src = input || {};
+  const events = radioDebugTimeline(src);
+  const v = radioDebugVerdict(events);
+  const mesh = src.mesh || {};
+  const latest = src.latest || {};
+  const neighEvents = events.filter((e) => e.neighbors != null);
+  const lteEvents = events.filter((e) => e.lte);
+  const summary = {
+    neighbor_last: neighEvents.length ? neighEvents[neighEvents.length - 1].neighbors : (Array.isArray(mesh.neighbors) ? mesh.neighbors.length : null),
+    last_mesh_at: mesh.received_at || null,
+    lte_last_at: lteEvents.length ? lteEvents[lteEvents.length - 1].iso : (latest.received_at || null),
+    heltec_uptime_s: mesh.core && mesh.core.uptime_secs != null ? mesh.core.uptime_secs : null,
+    battery_v: latest.battery_v != null ? latest.battery_v : null,
+    solar_v: latest.solar_v != null ? latest.solar_v : null,
+    rr: latest.rr != null ? latest.rr : null,
+    reboots: events.filter((e) => e.reboot).length,
+    gap_h: v.gap_h,
+    rx: mesh.packets && mesh.packets.recv != null ? mesh.packets.recv : (mesh.radio && mesh.radio.rx != null ? mesh.radio.rx : null),
+    rxage: mesh.radio && mesh.radio.rxage != null ? mesh.radio.rxage : null,
+    rh1: mesh.radio && mesh.radio.rh1 != null ? mesh.radio.rh1 : null,
+    rh2: mesh.radio && mesh.radio.rh2 != null ? mesh.radio.rh2 : null,
+    rh3: mesh.radio && mesh.radio.rh3 != null ? mesh.radio.rh3 : null,
+  };
+  return {
+    verdict: v.verdict, kind: v.kind, gap_h: v.gap_h, summary,
+    events: events.slice(-40).map((e) => ({
+      at: e.at, iso: e.iso, label: radioDebugLabel(e), type: e.type || "",
+      neighbors: e.neighbors != null ? e.neighbors : null, lte: !!e.lte, reboot: !!e.reboot,
+      rr: e.rr != null ? e.rr : null, battery_v: e.battery_v != null ? e.battery_v : null,
+      solar_v: e.solar_v != null ? e.solar_v : null, heltec_uptime_s: e.heltec_uptime_s != null ? e.heltec_uptime_s : null,
+    })),
+  };
+}
 async function handleIngest(request, env, id) {
   const dev = await getDevice(env, id);
   const key = request.headers.get("X-Device-Key") || "";
@@ -1826,7 +1954,8 @@ async function deviceApi(request, env, dev, action) {
     const wdSettings = { ...DEFAULT_WD, ...(wdCfgS || {}) };
     const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW),
       upoll_now: upollNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
-    return json({ watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
+    const radio_debug = radioDebugReport({ history: history || [], mesh, latest });
+    return json({ radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -2577,7 +2706,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 </div>
 <div class="mini" id="ov-prog"></div>
 <div class="grid" style="margin-top:12px">
-<div class="card"><h3>LoRa radio</h3><div id="ov-radio"></div><p class="small"><a href="#radio">Open LoRa radio ›</a></p></div>
+<div class="card"><h3>LoRa radio</h3><div id="ov-radio"></div><p class="small" id="ov-rd"></p><p class="small"><a href="#radio">Open LoRa radio ›</a></p></div>
 <div class="card"><h3>T-SIM</h3><div id="ov-tsim"></div><p class="small"><a href="#tsim">Open T-SIM ›</a></p></div>
 </div>
 <p class="small mut">One text every 20 seconds per T-SIM. After you text it, this page checks for the reply every 3 seconds for up to 3 minutes.</p>
@@ -2607,6 +2736,12 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Packets</h3><div id="m-pkt"></div></div>
 </div>
 <div class="card tw" style="margin-top:12px"><h3>Neighbors</h3><p class="small mut" style="margin:0 0 6px">The repeater only reports short node IDs. Press ✎ to give a node a name (saved on this dashboard).</p><table id="nbt"><thead><tr><th>Node</th><th>SNR</th><th>Last heard</th></tr></thead><tbody id="nb"></tbody></table></div></section>
+<section><h2>Radio debugger <small class="mut small" id="rdsum"></small></h2><div class="card">
+<p class="small mut" style="margin-top:0">Read-only. Built from reports already stored here (activity log, mesh snapshots, heartbeats, telemetry). It does not text the repeater and does not send commands.</p>
+<p id="rdverdict" class="small"></p>
+<div id="rdmeta"></div>
+<table><thead><tr><th>When (ET)</th><th>What the stored samples show</th></tr></thead><tbody id="rdrows"></tbody></table>
+</div></section>
 <section><h2>Repeater settings</h2><div class="card">
 <p class="small mut" style="margin-top:0">View and change the repeater's MeshCore settings. Values are read and changed through the repeater console (one text wakes the T-SIM; it runs up to 10 commands per wake, or 40 with T-SIM firmware 1.6.9+). Changed fields are highlighted; only changed values are sent. Prefer typing commands? Use Repeater console below.</p>
 <p class="psnote" id="rsps" hidden>Not available while the repeater is in power saving: its command line isn't answering. ${PS_HTML}</p>
@@ -2854,6 +2989,7 @@ async function load(){
  const PSON=!!(d.powersaving&&d.powersaving.on),PS=PSON&&!d.powersaving.ondemand;
  $("ov-prog").innerHTML=pbadge(PG.heltec,"Radio update")+pbadge(PG.tsim,"T-SIM update")+ubadge(US.radio,"Radio fw")+ubadge(US.tsim,"T-SIM fw")+(PSON?'<span class="badge mut">Power saving'+(PS?'':' · serial on demand')+'</span>':(d.powersaving&&d.powersaving.unknown?'<span class="badge mut" title="'+e(d.powersaving.source||"")+'">Power saving: unknown</span>':''));
  $("ov-radio").innerHTML=kv([["Node",M.node_name],["Firmware",M.heltec_fw||U.heltec_fw],["Updates",utext(US.radio)],["Neighbors",M.neighbors==null?null:M.neighbors.length],["Mesh snapshot",M.received_at?ago(M.received_at):"none yet"]]);
+ showRd(d);
  $("ov-tsim").innerHTML=kv([["Firmware",TS.fw||L.fw],["Updates",utext(US.tsim)],["Last report",ago(L.received_at)],["Battery",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Signal",sig(L.csq)]]);
  $("meshps").hidden=!PS;$("meshgrid").classList.toggle("dim",PS);$("nbt").classList.toggle("dim",PS);
  $("conps").hidden=!(PS&&S.console_enabled);$("conui").hidden=!S.console_enabled||PS;
@@ -2904,6 +3040,17 @@ function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.ev
  $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",L.lb_lo==null?null:"OFF<"+L.lb_lo.toFixed(2)+" / ON≥"+L.lb_hi.toFixed(2)+" V · checks battery every "+hrs(L.lb_int)]]);
  if(!pwrLoaded){const f=$("lbf");f.en.checked=!!S.lb_en;f.lo.value=S.lb_lo.toFixed(2);f.hi.value=S.lb_hi.toFixed(2);f.inth.value=+(S.lb_int/60).toFixed(2);f.imm.checked=!!S.lb_imm;
   const m=$("calm");m.scale.value=S.cal_scale;m.off.value=S.cal_off;lbPct();pwrLoaded=true}}
+function showRd(d){
+ const R=d.radio_debug||{},S=R.summary||{},kind=R.kind||"insufficient",v=R.verdict||"Insufficient samples";
+ const el=$("rdverdict");if(el){el.className="small"+(kind==="silent"?" err":kind==="restored"?" ok":" mut");el.textContent=v;}
+ const sum=$("rdsum");if(sum)sum.textContent=kind==="silent"?"· LoRa quiet":kind==="restored"?"· reboot restored mesh":"· read-only";
+ const meta=$("rdmeta");
+ if(meta)meta.innerHTML=kv([["Neighbors now",S.neighbor_last],["Last mesh heard",S.last_mesh_at?ago(S.last_mesh_at):null],["LTE last seen",S.lte_last_at?ago(S.lte_last_at):null],["Heltec uptime",S.heltec_uptime_s==null?null:up(S.heltec_uptime_s)],["Battery",S.battery_v==null?null:(+S.battery_v).toFixed(2)+" V"],["Solar",S.solar_v==null?null:(+S.solar_v).toFixed(2)+" V"],["Reset reason",S.rr==null?null:(RST[S.rr]||String(S.rr))],["Heltec reboots in this log",S.reboots],["Radio RX count",S.rx],["Last RX age",S.rxage==null?null:up(S.rxage)],["Recoveries (rearm / radio reset / restart)",S.rh1==null&&S.rh2==null&&S.rh3==null?null:(S.rh1||0)+" / "+(S.rh2||0)+" / "+(S.rh3||0)]]);
+ const tb=$("rdrows");
+ if(tb){const ev=(R.events||[]).slice().reverse().slice(0,16);
+  tb.innerHTML=ev.length?ev.map(function(x){return "<tr><td>"+e(t(x.iso))+"</td><td>"+e(x.label)+"</td></tr>";}).join(""):'<tr><td colspan="2" class="mut">No samples yet</td></tr>';}
+ const ov=$("ov-rd");if(ov){ov.className="small"+(kind==="silent"?" err":kind==="restored"?" ok":" mut");ov.textContent="Radio debugger: "+v;}
+}
 let wdLoaded=false;
 const WDST={ok:"OK",soft:"Recovered (AT+CFUN reset)",hard:"Recovered (modem power-cycle)",lowbat:"Low battery: recovery skipped",fail:"Failed"};
 function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||{};
