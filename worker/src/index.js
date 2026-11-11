@@ -8,38 +8,46 @@
 // Backward compatibility only: releases before 2026-10-18 were named vX.Y.Z-powersaving-serial (files
 // Heltec_v3_repeater-vX.Y.Z-powersaving-serial-<commit>.bin). Migration still recognizes that pattern.
 export const OLD_PS_NAME = "powersaving-serial";
-// Default Heltec update source: the headless app-only image from just-stuff-tm/MeshCore-TSim-Powersaving.
-// Heltec_v3_repeater_headless-...-upgrade.bin keeps identity and settings. The screen image, freshInstall, and merged files are not selected.
-const DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore-TSim-Powersaving", asset_pattern: "Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving*-upgrade.bin", tag_prefix: "", direct_url: "" };
-// Saved sources carry v: SOURCE_VERSION. An untouched previous default moves once. A custom repo, pattern, tag prefix, or direct URL stays.
-export const SOURCE_VERSION = 5;
+// Default Heltec update source: stock MeshCore repeater, app-only image from meshcore-dev/MeshCore.
+// Newest release whose tag starts with repeater-. Heltec_v3_repeater-v*.bin keeps identity and settings.
+const DEFAULT_SOURCE = { enabled: true, repo: "meshcore-dev/MeshCore", asset_pattern: "Heltec_v3_repeater-v*.bin", tag_prefix: "repeater-", direct_url: "" };
+// Saved sources carry v: SOURCE_VERSION. An untouched previous default moves once to stock. A custom repo, pattern, tag prefix, or direct URL stays. A selected upload stays selected.
+export const SOURCE_VERSION = 6;
 export const LEGACY_DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
 // v2 default (the older release names, see OLD_PS_NAME)
 export const V2_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: `Heltec_v3_repeater-v*-${OLD_PS_NAME}-*.bin`, tag_prefix: "", direct_url: "" };
 // v3 default. This pattern still matches vX.Y.Z-powersaving and the older powersaving-serial names.
 export const V3_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore", asset_pattern: "Heltec_v3_repeater-v*-powersaving-*.bin", tag_prefix: "", direct_url: "" };
-// v4 default: the screen (non-headless) app-only image. An untouched copy moves to the headless image.
+// v4 default: the screen (non-headless) app-only image. An untouched copy moves to stock MeshCore.
 export const V4_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore-TSim-Powersaving", asset_pattern: "Heltec_v3_repeater-MeshCore-TSim-Powersaving*-upgrade.bin", tag_prefix: "", direct_url: "" };
+// v5 default: the headless MeshCore-TSim-Powersaving app-only image. An untouched copy (no custom tag prefix or direct URL, v < 6) moves to stock MeshCore.
+export const V5_DEFAULT_SOURCE = { enabled: true, repo: "just-stuff-tm/MeshCore-TSim-Powersaving", asset_pattern: "Heltec_v3_repeater_headless-MeshCore-TSim-Powersaving*-upgrade.bin", tag_prefix: "", direct_url: "" };
 const isExactly = (stored, def) => Object.keys(def).every((k) => (stored[k] ?? def[k]) === def[k]);
-const asTsim = (stored, from) => {
+// Full move onto stock. Forces repo, pattern, tag prefix and direct URL. Keeps enabled, a selected upload, and any other saved fields.
+const asStock = (stored, from) => {
   const { migrated_from, ...rest } = stored;
-  return { src: { ...DEFAULT_SOURCE, ...rest, repo: DEFAULT_SOURCE.repo, asset_pattern: DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: from }, migrated: true, stale: true };
+  return { src: { ...DEFAULT_SOURCE, ...rest, repo: DEFAULT_SOURCE.repo, asset_pattern: DEFAULT_SOURCE.asset_pattern, tag_prefix: DEFAULT_SOURCE.tag_prefix, direct_url: DEFAULT_SOURCE.direct_url, v: SOURCE_VERSION, migrated_from: from }, migrated: true, stale: true };
 };
 export function migrateSource(stored) {
   if (!stored || typeof stored !== "object") return { src: { ...DEFAULT_SOURCE }, migrated: false, stale: false };
   if (stored.v >= SOURCE_VERSION) return { src: { ...DEFAULT_SOURCE, ...stored }, migrated: false, stale: false };
-  if (!(stored.v >= 2) && isExactly(stored, LEGACY_DEFAULT_SOURCE)) return asTsim(stored, LEGACY_DEFAULT_SOURCE.repo);
+  // Untouched v5 headless default, including a copy stamped at v5. A custom tag prefix or direct URL stays.
+  if (stored.repo === V5_DEFAULT_SOURCE.repo && stored.asset_pattern === V5_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
+    return asStock(stored, V5_DEFAULT_SOURCE.asset_pattern);
+  // Stamped at v5 and not that default: an explicit choice (custom repo/pattern/tag/URL, stock, or a selected upload). Keep it.
+  if (stored.v >= 5) return { src: { ...DEFAULT_SOURCE, ...stored, v: SOURCE_VERSION }, migrated: false, stale: true };
+  if (!(stored.v >= 2) && isExactly(stored, LEGACY_DEFAULT_SOURCE)) return asStock(stored, LEGACY_DEFAULT_SOURCE.repo);
   if (stored.repo === V2_DEFAULT_SOURCE.repo && stored.asset_pattern === V2_DEFAULT_SOURCE.asset_pattern) {
     if (stored.tag_prefix || stored.direct_url) {
       const { migrated_from, ...rest } = stored;
       return { src: { ...V3_DEFAULT_SOURCE, ...rest, asset_pattern: V3_DEFAULT_SOURCE.asset_pattern, v: SOURCE_VERSION, migrated_from: V2_DEFAULT_SOURCE.asset_pattern }, migrated: true, stale: true };
     }
-    return asTsim(stored, V2_DEFAULT_SOURCE.asset_pattern);
+    return asStock(stored, V2_DEFAULT_SOURCE.asset_pattern);
   }
   if (stored.repo === V3_DEFAULT_SOURCE.repo && stored.asset_pattern === V3_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
-    return asTsim(stored, V3_DEFAULT_SOURCE.asset_pattern);
+    return asStock(stored, V3_DEFAULT_SOURCE.asset_pattern);
   if (stored.repo === V4_DEFAULT_SOURCE.repo && stored.asset_pattern === V4_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
-    return asTsim(stored, V4_DEFAULT_SOURCE.asset_pattern);
+    return asStock(stored, V4_DEFAULT_SOURCE.asset_pattern);
   return { src: { ...DEFAULT_SOURCE, ...stored, v: SOURCE_VERSION }, migrated: false, stale: true };
 }
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
@@ -130,13 +138,11 @@ const getSource = async (env, id) => {
     await putJson(env, `source:${id}`, src);
     if (migrated) {
       await env.STATE.delete(`release:${id}`);
-      await logActivity(env, id, { type: "action", msg: src.migrated_from === LEGACY_DEFAULT_SOURCE.repo
-        ? `Update source moved to the new default: ${src.repo} ${src.asset_pattern} (was the old default ${LEGACY_DEFAULT_SOURCE.repo})`
-        : src.migrated_from === V4_DEFAULT_SOURCE.asset_pattern
-          ? `Update source moved to the headless Heltec image: ${src.repo} ${src.asset_pattern} (was ${src.migrated_from})`
-          : src.migrated_from === V3_DEFAULT_SOURCE.asset_pattern
-            ? `Update source moved to MeshCore-TSim-Powersaving: ${src.repo} ${src.asset_pattern} (was ${src.migrated_from})`
-            : `Update source pattern updated for the renamed releases: ${src.asset_pattern} (was ${src.migrated_from}; matches both the new -powersaving- and the older -${OLD_PS_NAME}- files)` });
+      const from = src.migrated_from === LEGACY_DEFAULT_SOURCE.repo ? `the old default ${LEGACY_DEFAULT_SOURCE.repo}` : src.migrated_from;
+      const stockMove = src.repo === DEFAULT_SOURCE.repo && src.asset_pattern === DEFAULT_SOURCE.asset_pattern;
+      await logActivity(env, id, { type: "action", msg: stockMove
+        ? `Update source moved to stock MeshCore: ${src.repo} ${src.asset_pattern} (was ${from})`
+        : `Update source pattern updated for the renamed releases: ${src.asset_pattern} (was ${src.migrated_from}; matches both the new -powersaving- and the older -${OLD_PS_NAME}- files)` });
     }
   }
   return src;
@@ -525,8 +531,7 @@ export async function heltecImageRisk(url, tsimFw) {
   return null;
 }
 export const FW_PRESETS = {
-  meshcore_tsim: { label: "MeshCore T-SIM power saving, headless (default)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default for this T-SIM. just-stuff-tm/MeshCore-TSim-Powersaving, tag MeshCore-TSim-PowersavingN.B. Uses the headless app-only image Heltec_v3_repeater_headless-...-upgrade.bin (keeps identity and settings). It does not use the screen image, a freshInstall file, or a merged file. tsim wake is in this firmware." },
-  meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: "meshcore-dev/MeshCore", tag_prefix: "repeater-", asset_pattern: "Heltec_v3_repeater-v*.bin", direct_url: "" },
+  meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: DEFAULT_SOURCE.tag_prefix, asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. meshcore-dev/MeshCore, newest release whose tag starts with repeater-. Uses the app-only Heltec V3 repeater image Heltec_v3_repeater-v*.bin (keeps identity and settings)." },
 };
 
 // Resolve what "latest" means for this device's update source.
@@ -2723,8 +2728,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small"><b>Take a backup first:</b> <a href="#" data-bk="1">Create &amp; download a backup now ›</a> (read the private key in Backup &amp; restore first if you want to keep the identity).</p>
 <label class="tog"><input type="checkbox" id="mwack"> I understand this erases the identity, name, settings, ACL and regions</label>
 <label>Type ERASE to allow the update<input id="mwtyped" autocomplete="off" autocapitalize="characters" spellcheck="false"></label></div><div class="card"><div id="c-upd"></div><div id="p-heltec"></div></div>
-<details class="card" id="upbox"><summary><b>Upload firmware file</b> <small id="upsum" class="mut"></small></summary><div class="in">
-<p class="small mut">Pick a Heltec V3 <code>.bin</code> on this computer or phone and upload it. The T-SIM downloads it over LTE when you press <b>Update radio firmware</b>; nothing is sent before that. Use the app-only file (keeps identity and settings). Merged / fresh-install files are accepted with extra warnings. Limits: 3 files, app code up to 3.19 MB (the Heltec app partition).</p>
+<details class="card" id="upbox"><summary><b>Upload a firmware .bin</b> <small id="upsum" class="mut"></small></summary><div class="in">
+<p class="small mut">The other Heltec choice, beside Stock MeshCore. Pick a Heltec V3 <code>.bin</code> on this computer or phone and upload it. The T-SIM downloads it over LTE when you press <b>Update radio firmware</b>; nothing is sent before that. Use the app-only file (keeps identity and settings). Merged / fresh-install files are accepted with extra warnings. Limits: 3 files, app code up to 3.19 MB (the Heltec app partition).</p>
 <input type="file" id="upfile" accept=".bin,application/octet-stream"><div id="upcheck" class="small"></div>
 <div class="acts"><button type="button" id="upbtn">Upload</button><span id="upmsg" class="msg"></span></div>
 <div class="bar" id="upbar" hidden><i style="width:0%"></i></div><div id="uplist"></div></div></details></section>
@@ -2792,15 +2797,19 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div id="bklist"></div>
 <h3>Restore</h3><p class="small mut">Pick a backup file to compare it with the current values, then choose what to restore.</p>
 <input type="file" id="bkfile" accept=".json,application/json"><div id="bkprev"></div><div id="bkjob"></div></div></details>
-<details class="card" id="srcbox"><summary><b>Firmware update source</b><small id="srcsum" class="mut"></small></summary><div class="in">
-<label>Firmware preset<select id="preset"><option value="">Custom…</option></select></label>
-<p class="small mut" id="presetnote"></p>
+<details class="card" id="srcbox"><summary><b>Firmware update source</b> <small id="srcsum" class="mut"></small></summary><div class="in">
+<p class="small mut">Two choices for the Heltec: <b>Stock MeshCore</b> (below), or <b>upload a firmware .bin</b> (Firmware, above on this tab). Nothing is sent until you press <b>Update radio firmware</b>.</p>
+<label>GitHub source<select id="preset"></select></label>
+<p class="small mut" id="presetnote">Stock MeshCore from meshcore-dev/MeshCore. App-only Heltec V3 repeater image (keeps identity and settings). Newest release tagged repeater-*.</p>
 <form id="srcf">
+<div id="srccustom" hidden>
+<p class="small mut">This repeater has a saved custom GitHub source. Edit it here, or pick Stock MeshCore and press Save.</p>
 <label class="tog"><input type="checkbox" name="enabled"> Use the latest GitHub release</label>
-<label>GitHub repo (owner/name)<input name="repo" placeholder="IoTThinks/EasySkyMesh"></label>
+<label>GitHub repo (owner/name)<input name="repo" placeholder="meshcore-dev/MeshCore"></label>
 <label>Release tag starts with (optional, e.g. repeater-)<input name="tag_prefix" placeholder="repeater-"></label>
-<label>File name pattern (* = anything; -merged files skipped unless named)<input name="asset_pattern" placeholder="Heltec_v3_repeater-*-upgrade.bin"></label>
+<label>File name pattern (* = anything; -merged files skipped unless named)<input name="asset_pattern" placeholder="Heltec_v3_repeater-v*.bin"></label>
 <label>Direct link (optional override, used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
+</div>
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
 <details class="card" id="lbbox"><summary><b>Low-battery protection</b><small id="lbsum" class="mut"></small></summary><div class="in">
 <p class="small mut">The T-SIM checks its (calibrated, idle) battery on a timer without starting LTE. Below the OFF level it sends <code>set repeat off</code> to the repeater; when the battery recovers to the ON level it sends <code>set repeat on</code>. The ON level must be at least 10% higher than OFF. Settings reach the T-SIM at its next wake and are kept on the T-SIM, so it works offline. Needs T-SIM firmware 1.6.5+ and repeater firmware with the MeshCore CLI (no power saving).</p>
@@ -2958,7 +2967,7 @@ async function load(){
  try{unitsBtn();
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.watchdog)showWd(d);if(d.gps)showGps(d);if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.watchdog)showWd(d);if(d.gps)showGps(d);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  const CI=(d.watchdog&&d.watchdog.checkin)||{},off=!!CI.offline;
  $("seen").textContent=seen?(off?"Offline · last seen ":stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale||off?" stale":"");
@@ -3010,10 +3019,15 @@ async function load(){
   if(!document.hidden)window._t=setTimeout(load,POLL_IDLE_MS);
  }finally{pollBusy=false;if(pollAgain){pollAgain=false;load()}}
 }
-function setPresets(p){PRE=p;const s=$("preset");for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
-$("preset").onchange=ev=>{const v=PRE[ev.target.value],f=$("srcf");if(!v){$("presetnote").textContent="";return}
- f.enabled.checked=v.enabled;f.repo.value=v.repo;f.asset_pattern.value=v.asset_pattern;f.tag_prefix.value=v.tag_prefix||"";f.direct_url.value=v.direct_url;
- $("presetnote").textContent=v.note?v.note+" Press Save to use it.":ev.target.value==="meshcore"?"Stock MeshCore from meshcore-dev/MeshCore (app-only image, keeps identity and settings). It follows the newest release tagged repeater-* (MeshCore also publishes companion and room-server releases). Press Save to use it.":"Press Save to use it."};
+function setPresets(p){PRE=p;const s=$("preset");s.innerHTML="";for(const[k,v]of Object.entries(p)){const o=document.createElement("option");o.value=k;o.textContent=v.label;s.appendChild(o)}}
+function presetMatch(s){for(const[k,v]of Object.entries(PRE)){if(s.repo===v.repo&&s.asset_pattern===v.asset_pattern&&(s.tag_prefix||"")===(v.tag_prefix||"")&&!(s.direct_url)&&s.enabled!==false&&v.enabled!==false)return k}return""}
+let srcSaved=null;
+function writeSrc(f,s){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.tag_prefix.value=s.tag_prefix||"";f.direct_url.value=s.direct_url||""}
+function applyPresetChoice(key){const v=PRE[key],f=$("srcf"),box=$("srccustom");
+ if(!v){box.hidden=false;if(srcSaved)writeSrc(f,srcSaved);$("presetnote").textContent="Saved custom GitHub source. Edit it below, or choose Stock MeshCore and press Save.";return}
+ writeSrc(f,{enabled:v.enabled,repo:v.repo,asset_pattern:v.asset_pattern,tag_prefix:v.tag_prefix||"",direct_url:v.direct_url||""});
+ box.hidden=true;$("presetnote").textContent=(v.note?v.note+" ":"")+"Press Save to use it."}
+$("preset").onchange=ev=>applyPresetChoice(ev.target.value);
 let tsimLoaded=false;
 function showTsim(s){const f=$("tsimf");$("tsimsum").textContent=s.mode==="url"?"direct link":s.repo+" · "+s.asset;
  if(!tsimLoaded){f.mode.value=s.mode;f.repo.value=s.repo||"";f.asset.value=s.asset||"";f.url.value=s.url||"";f.checksum.value=s.checksum||"";tsimLoaded=true}}
@@ -3023,7 +3037,11 @@ $("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
 let srcLoaded=false;
 function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+(s.tag_prefix?s.tag_prefix+"* · ":"")+s.asset_pattern:(s.direct_url?"direct link":"not set");
  const off=!s.enabled&&!s.direct_url&&!s.upload;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
- if(!srcLoaded){f.enabled.checked=!!s.enabled;f.repo.value=s.repo||"";f.asset_pattern.value=s.asset_pattern||"";f.tag_prefix.value=s.tag_prefix||"";f.direct_url.value=s.direct_url||"";srcLoaded=true;}}
+ if(!srcLoaded){srcSaved={enabled:!!s.enabled,repo:s.repo||"",asset_pattern:s.asset_pattern||"",tag_prefix:s.tag_prefix||"",direct_url:s.direct_url||""};writeSrc(f,s);
+  const key=presetMatch(s),sel=$("preset");let c=sel.querySelector('option[value="custom"]');
+  if(!key){if(!c){c=document.createElement("option");c.value="custom";c.textContent="Custom GitHub source (saved)";sel.appendChild(c)}sel.value="custom";$("srccustom").hidden=false;$("presetnote").textContent="Saved custom GitHub source. Edit it below, or choose Stock MeshCore and press Save."}
+  else{if(c)c.remove();if(key)sel.value=key;$("srccustom").hidden=true;const v=PRE[key];$("presetnote").textContent=v&&v.note?v.note+" Press Save to use it.":"Press Save to use it."}
+  srcLoaded=true}}
 $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const r=await post("source",{upload:"",enabled:f.enabled.checked,repo:f.repo.value,asset_pattern:f.asset_pattern.value,tag_prefix:f.tag_prefix.value,direct_url:f.direct_url.value});
  const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
