@@ -834,7 +834,7 @@ async function handleIngest(request, env, id) {
     }
     if (/^wdcfg /.test(ran) && c) {
       const w = (await kvJson(env, `wdcfg:${id}`)) || {};
-      if (c.cmd === wdCfgCmd({ ...DEFAULT_WD, ...w })) { w.applied_at = entry.received_at; w.applied_output = out.slice(0, 200); await putJson(env, `wdcfg:${id}`, w); }
+      if (c.cmd === wdCfgCmd({ ...DEFAULT_WD, ...w })) { w.applied_at = entry.received_at; w.applied_output = out.slice(0, 400); await putJson(env, `wdcfg:${id}`, w); }  // v1.7.9: applied line also carries edrx=/psm=
     }
     const adc = c ? parseAdcReply(c.cmd, out) : null;
     if (adc) {
@@ -1210,7 +1210,10 @@ export const WD_CHOICES = [0, 30, 60, 120, 180, 360, 720, 1440];
 export const HWAKE_FW = "1.7.3";
 // v1.7.5: daylight uptime polling (upoll minutes, 0 = off; usol = solar threshold in mV, 0 = day and night), also only added once set.
 export const UPOLL_FW = "1.7.5", UP_CHOICES = [0, 15, 30, 60, 120, 180, 360], DEFAULT_UP = { upoll: 60, usol: 2000 };
-export const wdCfgCmd = (w) => `WDCFG int=${w.int_min} hb=${w.hb ? 1 : 0} sms=${w.sms ? 1 : 0}${w.hwake === undefined ? "" : " hwake=" + (w.hwake ? 1 : 0)}${w.upoll === undefined ? "" : ` upoll=${w.upoll} usol=${w.usol ?? DEFAULT_UP.usol}`}`;
+// v1.7.9: eDRX/PSM are optional tokens, same as hwake. Omitted keys keep older WDCFG strings byte-identical.
+export const LP_FW = "1.7.9";
+const EDRX_CYCLE = /^(0000|0001|0010|0011|0100|0101)$/;
+export const wdCfgCmd = (w) => `WDCFG int=${w.int_min} hb=${w.hb ? 1 : 0} sms=${w.sms ? 1 : 0}${w.hwake === undefined ? "" : " hwake=" + (w.hwake ? 1 : 0)}${w.upoll === undefined ? "" : ` upoll=${w.upoll} usol=${w.usol ?? DEFAULT_UP.usol}`}${w.edrx === undefined ? "" : " edrx=" + (w.edrx ? 1 : 0)}${w.edrxv ? " edrxv=" + w.edrxv : ""}${w.psm === undefined ? "" : " psm=" + (w.psm ? 1 : 0)}${w.smesh === undefined ? "" : " smesh=" + (w.smesh ? 1 : 0)}`;   // v1.7.9: smesh only when set, so older strings stay identical
 export function validateWd(cur, b) {
   const w = { ...DEFAULT_WD, ...(cur || {}) };
   if (b.int_min !== undefined) { const m = Number(b.int_min); if (!WD_CHOICES.includes(m)) throw new Error("Pick a watchdog interval (off, or 30 min to 24 h)."); w.int_min = m; }
@@ -1219,7 +1222,13 @@ export function validateWd(cur, b) {
   if (b.hwake !== undefined) w.hwake = b.hwake === true;
   if (b.upoll !== undefined) { const m = Number(b.upoll); if (!UP_CHOICES.includes(m)) throw new Error("Pick an uptime check interval (off, or 15 min to 6 h)."); w.upoll = m; if (w.usol === undefined) w.usol = DEFAULT_UP.usol; }
   if (b.usol !== undefined) { const v = Number(b.usol); if (!Number.isInteger(v) || v < 0 || v > 20000) throw new Error("Solar threshold: 0 to 20 V."); w.usol = v; if (w.upoll === undefined) w.upoll = DEFAULT_UP.upoll; }
-  return { int_min: w.int_min, hb: w.hb, sms: w.sms, ...(w.hwake !== undefined ? { hwake: w.hwake } : {}), ...(w.upoll !== undefined ? { upoll: w.upoll, usol: w.usol } : {}) };
+  if (b.edrx !== undefined) w.edrx = b.edrx === true;   // v1.7.9: do not turn eDRX on just because a cycle was sent
+  if (b.psm !== undefined) w.psm = b.psm === true;
+  if (b.edrxv !== undefined) { const v = String(b.edrxv); if (!EDRX_CYCLE.test(v)) throw new Error("eDRX cycle must be 0000 to 0101 (5.12 s to 81.92 s)."); w.edrxv = v; }
+  if (b.smesh !== undefined) w.smesh = b.smesh === true;   // v1.7.9: omitted keeps the previous WDCFG line unchanged
+  return { int_min: w.int_min, hb: w.hb, sms: w.sms, ...(w.hwake !== undefined ? { hwake: w.hwake } : {}), ...(w.upoll !== undefined ? { upoll: w.upoll, usol: w.usol } : {}),
+    ...(w.edrx !== undefined ? { edrx: w.edrx } : {}), ...(w.edrxv !== undefined ? { edrxv: w.edrxv } : {}), ...(w.psm !== undefined ? { psm: w.psm } : {}),
+    ...(w.smesh !== undefined ? { smesh: w.smesh } : {}) };
 }
 // What the daylight row and its two fields show. A WDCFG the T-SIM has applied is the setting until a
 // newer heartbeat reports something else. A save that is still waiting shows that save, not the old report.
@@ -1282,6 +1291,15 @@ export function tlFields(tl) {
   if (typeof tl.fw === "string") o.fw = tl.fw.slice(0, 60);
   if (Array.isArray(tl.dg) && tl.dg.length >= 4 && tl.dg.slice(0, 4).every((v) => n(v) !== undefined)) o.wire_diag = { cli_bytes: tl.dg[0], g6_cli_edges: tl.dg[1], unsol_bytes: tl.dg[2], g6_idle_edges: tl.dg[3] };   // v1.7.5
   if (n(tl.glat) !== undefined && n(tl.glon) !== undefined) o.gps_cached = { lat: tl.glat, lon: tl.glon, sats: n(tl.gsats) ?? null, at: n(tl.gat) > 1e9 ? new Date(tl.gat * 1000).toISOString() : null };
+  // v1.7.9: only when the post actually carries them, so older tl objects stay unchanged.
+  const tok = (v, re) => { if (typeof v !== "string") return undefined; const s = v.replace(/[^a-z0-9]/gi, "").slice(0, 8); return re.test(s) ? s : undefined; };
+  if (tl.edrx === 0 || tl.edrx === 1) o.edrx = tl.edrx;
+  const erq = tok(tl.edrx_req, /^[01]{4}$/); if (erq) o.edrx_req = erq;
+  const enw = tok(tl.edrx_nw, /^(rej|none|[01]{4})$/); if (enw) o.edrx_nw = enw;
+  if (tl.psm === 0 || tl.psm === 1) o.psm = tl.psm;
+  const pt = tok(tl.psm_tau, /^(rej|none|[01]{8})$/); if (pt) o.psm_tau = pt;
+  const pa = tok(tl.psm_act, /^(rej|none|[01]{8})$/); if (pa) o.psm_act = pa;
+  if (n(tl.awake_ms) !== undefined && tl.awake_ms >= 0 && tl.awake_ms <= 3600000) o.awake_ms = tl.awake_ms;
   return o;
 }
 export const DEFAULT_GPS = { auto: false, timeout_s: 180 };
@@ -1952,7 +1970,7 @@ async function deviceApi(request, env, dev, action) {
     const [wdLast, wdCfgS] = await Promise.all([kvJson(env, `wd:${id}`), kvJson(env, `wdcfg:${id}`)]);
     const wdq = (cmds || []).find((c) => /^wdcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const wdSettings = { ...DEFAULT_WD, ...(wdCfgS || {}) };
-    const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW),
+    const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW), lp_supported: fwAtLeast(latest && latest.fw, LP_FW),
       upoll_now: upollNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
     const radio_debug = radioDebugReport({ history: history || [], mesh, latest });
     return json({ radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
@@ -2263,6 +2281,8 @@ async function deviceApi(request, env, dev, action) {
     if (!fwAtLeast(lat.fw, WD_FW)) return json({ error: `Needs T-SIM firmware ${WD_FW} or newer. Update the T-SIM firmware first.` }, 409);
     if (b.hwake !== undefined && !fwAtLeast(lat.fw, HWAKE_FW)) return json({ error: `GPIO6 wake needs T-SIM firmware ${HWAKE_FW} or newer.` }, 409);
     if ((b.upoll !== undefined || b.usol !== undefined) && !fwAtLeast(lat.fw, UPOLL_FW)) return json({ error: `The daylight uptime check needs T-SIM firmware ${UPOLL_FW} or newer.` }, 409);
+    if ((b.edrx !== undefined || b.psm !== undefined || b.edrxv !== undefined) && !fwAtLeast(lat.fw, LP_FW)) return json({ error: `eDRX and PSM need T-SIM firmware ${LP_FW} or newer.` }, 409);
+    if (b.smesh !== undefined && !fwAtLeast(lat.fw, LP_FW)) return json({ error: `Scheduled mesh needs T-SIM firmware ${LP_FW} or newer.` }, 409);   // v1.7.9
     const cmd = wdCfgCmd(w);
     if (cur.applied_at && cmd === wdCfgCmd({ ...DEFAULT_WD, ...cur })) return json({ saved: true, unchanged: true, settings: { ...w, applied_at: cur.applied_at }, queued: null, wake: null });
     const list = (await kvJson(env, `cmds:${id}`)) || [];
@@ -2272,7 +2292,7 @@ async function deviceApi(request, env, dev, action) {
     await putJson(env, `wdcfg:${id}`, { ...w, updated_at: entry.queued_at, applied_at: null });
     let wake = null;
     if (b.send === true) { const [o, cc] = await manualSend(env, dev, "STATUS", "Deliver watchdog settings (STATUS)"); wake = { ...o, status: cc }; }
-    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${w.hwake !== undefined ? `, GPIO6 wake ${w.hwake ? "on" : "off"}` : ""}${w.upoll !== undefined ? `, daylight uptime check ${w.upoll ? "every " + (w.upoll >= 60 ? w.upoll / 60 + " h" : w.upoll + " min") + (w.usol ? ` when solar ≥ ${(w.usol / 1000).toFixed(1)} V` : " day and night") : "off"}` : ""}${b.send ? "" : " (applied at next wake)"}` });
+    await logActivity(env, id, { type: "action", msg: `Watchdog: ${w.int_min ? "check every " + (w.int_min >= 60 ? w.int_min / 60 + " h" : w.int_min + " min") : "off"}, heartbeat ${w.hb ? "every check" : "after recoveries only"}, stored texts on timer wakes ${w.sms ? "run" : "left for the next text"}${w.hwake !== undefined ? `, GPIO6 wake ${w.hwake ? "on" : "off"}` : ""}${w.upoll !== undefined ? `, daylight uptime check ${w.upoll ? "every " + (w.upoll >= 60 ? w.upoll / 60 + " h" : w.upoll + " min") + (w.usol ? ` when solar ≥ ${(w.usol / 1000).toFixed(1)} V` : " day and night") : "off"}` : ""}${w.edrx !== undefined ? `, eDRX ${w.edrx ? "on" : "off"}${w.edrxv ? " " + w.edrxv : ""}` : ""}${w.psm !== undefined ? `, PSM ${w.psm ? "on (texts wait for the active window)" : "off"}` : ""}${w.smesh !== undefined ? `, scheduled mesh ${w.smesh ? "on" : "off"}` : ""}${b.send ? "" : " (applied at next wake)"}` });   // v1.7.9 smesh
     return json({ saved: true, settings: w, queued: entry, wake });
   }
   if (action === "gps-settings") {
@@ -2476,6 +2496,10 @@ export function scheduleInfo(hours, st = {}, now = Date.now()) {
   const next = Math.max(Math.ceil(due / 3600e3), Math.ceil((now + 1) / 3600e3)) * 3600e3;
   return { hours, last_run: lr, next_run: new Date(next).toISOString() };
 }
+// v1.7.9: "STATUS AUTO" only when the device already runs 1.7.9+. Older firmware ignores any other body.
+export function scheduledStatusText(fw) {
+  return fwAtLeast(fw, LP_FW) ? "STATUS AUTO" : "STATUS";
+}
 // Cron (hourly): text STATUS only to devices whose optional scheduled check is due.
 export async function runSchedules(env, now = Date.now()) {
   const sent = [];
@@ -2488,7 +2512,8 @@ export async function runSchedules(env, now = Date.now()) {
     const dev = await getDevice(env, id);
     if (!dev) continue;
     st.last_sched_ts = now; await putJson(env, `state:${id}`, st);
-    const [o] = await manualSend(env, dev, "STATUS", `Scheduled STATUS (${h}h)`);
+    const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
+    const [o] = await manualSend(env, dev, scheduledStatusText(lat.fw), `Scheduled STATUS (${h}h)`);   // v1.7.9
     { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_sched_run = { at: new Date(now).toISOString(), sent: !!o.sent, error: o.error || null }; await putJson(env, `state:${id}`, s2); }
     sent.push({ id, sent: o.sent, error: o.error || null });
   }
@@ -2860,6 +2885,10 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" name="hwake"> GPIO6 wake (on by default): from T-SIM 1.7.7 a pulse is the repeater's tsim wake command, not a Heltec reboot, and it does not reset the modem. The same switch still allows the while-awake reboot check (1.7.4). Turns itself off if GPIO6 stays low; tick again to re-enable</label>
 <label>Daylight uptime check (T-SIM 1.7.5+): ask the repeater its uptime every<select name="upoll"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour (default)</option><option value="120">2 hours</option><option value="180">3 hours</option><option value="360">6 hours</option></select></label>
 <label>…only when the solar input is at least <input name="usol" type="number" min="0" max="20" step="0.1" style="width:5em"> V (0 = day and night). Serial only: the modem stays asleep unless the uptime went backwards (a reboot), which then resets the modem like the reboot wake</label>
+<label class="tog"><input type="checkbox" name="edrx"> eDRX (T-SIM 1.7.9+, off by default, not released until you install that firmware). Asks the network for a longer idle cycle so the modem uses less power between texts. A text can take up to that cycle to ring the T-SIM. If the network rejects it, the modem stays on normal idle.</label>
+<label>eDRX cycle <select name="edrxv"><option value="0000">5.12 s</option><option value="0001">10.24 s</option><option value="0010" selected>20.48 s (default)</option><option value="0011">40.96 s</option><option value="0100">61.44 s</option><option value="0101">81.92 s</option></select></label>
+<label class="tog"><input type="checkbox" name="psm"> PSM (off by default). While PSM is on the modem cannot receive a text until its next active window, so a text can wait up to about an hour. Leave this off when the T-SIM should answer texts promptly.</label>
+<label class="tog"><input type="checkbox" name="smesh" checked> Mesh snapshot on the scheduled check (T-SIM 1.7.9+, on by default). Off skips the Heltec mesh read on the automatic check only. Request status still fetches it.</label>
 <button type="submit" class="g">Save (applied at next wake)</button> <button type="button" id="wdsend">Save &amp; send now (1 text)</button> <span id="wdmsg" class="msg"></span></form></div></section>
 <section><h2>Location <small class="mut small" id="gpsat"></small></h2><div class="card">
 <div class="acts" style="margin-top:0"><button type="button" id="gpsbtn" data-mode="get">Get location</button></div>
@@ -2963,7 +2992,7 @@ async function load(){
  const CI=(d.watchdog&&d.watchdog.checkin)||{},off=!!CI.offline;
  $("seen").textContent=seen?(off?"Offline · last seen ":stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale||off?" stale":"");
  const ow=$("offwarn");ow.hidden=!off;if(off)ow.textContent="⚠ The T-SIM has missed "+CI.missed+" expected check-ins (expected every "+hrs(CI.expected_s/60)+" by its "+(CI.by==="schedule"?"scheduled check":"watchdog")+"; last seen "+ago(L.received_at)+", "+t(L.received_at)+" ET). Its modem may be off the network: texts won't reach it until it reconnects. The watchdog retries on its own; if it stays silent, power-cycle it on site.";
- $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Last reset",L.rr==null?null:{h:(RST_BAD[L.rr]?'<span class="err">':"<span>")+e(RST[L.rr]||String(L.rr))+"</span>"}],["Uptime",L.uptime==null?null:up(L.uptime)]]);
+ $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Last reset",L.rr==null?null:{h:(RST_BAD[L.rr]?'<span class="err">':"<span>")+e(RST[L.rr]||String(L.rr))+"</span>"}],["Uptime",L.uptime==null?null:up(L.uptime)],...(L.edrx==null?[]:[["eDRX",L.edrx?"on, asked "+(L.edrx_req||"?")+", network "+(L.edrx_nw==="rej"?"rejected":L.edrx_nw&&L.edrx_nw!=="none"?L.edrx_nw:"not granted"):"off"]]),...(L.psm==null?[]:[["PSM",L.psm?"on, requested TAU "+(L.psm_tau||"?")+" / active "+(L.psm_act||"?")+" (grant unknown)":"off"]]),...(L.awake_ms>0?[["Previous wake",L.awake_ms>=1000?(L.awake_ms/1000).toFixed(1)+" s":L.awake_ms+" ms"]]:[])]);
  $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Battery protection",L.lb_state==null?null:(L.lb_state?"Repeat OFF (low battery)":"normal")],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
@@ -3054,7 +3083,7 @@ function showRd(d){
 let wdLoaded=false;
 const WDST={ok:"OK",soft:"Recovered (AT+CFUN reset)",hard:"Recovered (modem power-cycle)",lowbat:"Low battery: recovery skipped",fail:"Failed"};
 function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||{};
- $("wdnote").hidden=!!W.supported;["wdsend"].forEach(x=>$(x).disabled=!W.supported);$("wdf").querySelectorAll("select,input,button").forEach(x=>x.disabled=!W.supported);$("wdf").hwake.disabled=!W.supported||!W.hwake_supported;$("wdf").upoll.disabled=$("wdf").usol.disabled=!W.supported||!W.upoll_supported;
+ $("wdnote").hidden=!!W.supported;["wdsend"].forEach(x=>$(x).disabled=!W.supported);$("wdf").querySelectorAll("select,input,button").forEach(x=>x.disabled=!W.supported);$("wdf").hwake.disabled=!W.supported||!W.hwake_supported;$("wdf").upoll.disabled=$("wdf").usol.disabled=!W.supported||!W.upoll_supported;$("wdf").edrx.disabled=$("wdf").edrxv.disabled=$("wdf").psm.disabled=$("wdf").smesh.disabled=!W.supported||!W.lp_supported;   // v1.7.9
  const dev=L.wd_int;
  $("wdsum").textContent=!W.supported?"· needs T-SIM 1.7.1":"· "+(dev==null?"not reported yet":dev?"every "+hrs(dev):"off on the T-SIM")+(X?" · last check "+ago(X.at):"")+(W.pending?" · change waiting for the T-SIM":"");
  const ok=X&&X.stage==="ok";
@@ -3067,8 +3096,8 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
   ["Last recovery",X&&X.last_recovery?(X.last_recovery.stage==="hard"?"power-cycle":"AT+CFUN reset")+" · "+t(X.last_recovery.at)+" ET":"none"],["Texts waiting on the modem",X&&X.sms_waiting!=null&&X.sms_waiting>=0?X.sms_waiting:null]]);
  const EV=(X&&X.events)||[];$("wdev").innerHTML=EV.length?"<b>Recent recovery attempts</b><ul style='margin:4px 0'>"+EV.map(v=>"<li>"+e(v.stage)+": "+e(v.result)+(v.secs!=null?" ("+e(v.secs)+" s)":"")+(v.at?" · "+e(t(v.at))+" ET":"")+"</li>").join("")+"</ul>":"";
  $("wddel").innerHTML=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':W.pending?"⏳ Saved; waiting for the T-SIM's next wake":"";
- if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;f.hwake.checked=X&&X.hwake!=null?X.hwake===1:S.hwake!==false;const P=(W.upoll_now||{}).running;f.upoll.value=String(P&&P.int_min!=null?P.int_min:60);f.usol.value=((P&&P.usol!=null?P.usol:2000)/1000).toFixed(1);wdLoaded=true}}
-async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.checked,sms:f.sms.checked,send};if(!f.hwake.disabled)b.hwake=f.hwake.checked;if(!f.upoll.disabled){b.upoll=+f.upoll.value;b.usol=Math.round((+f.usol.value||0)*1000)}
+ if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;f.hwake.checked=X&&X.hwake!=null?X.hwake===1:S.hwake!==false;const P=(W.upoll_now||{}).running;f.upoll.value=String(P&&P.int_min!=null?P.int_min:60);f.usol.value=((P&&P.usol!=null?P.usol:2000)/1000).toFixed(1);f.edrx.checked=!!S.edrx;f.psm.checked=!!S.psm;f.edrxv.value=/^(0000|0001|0010|0011|0100|0101)$/.test(S.edrxv)?S.edrxv:"0010";f.smesh.checked=S.smesh!==false;wdLoaded=true}}   // v1.7.9: omitted smesh stays on
+async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.checked,sms:f.sms.checked,send};if(!f.hwake.disabled)b.hwake=f.hwake.checked;if(!f.upoll.disabled){b.upoll=+f.upoll.value;b.usol=Math.round((+f.usol.value||0)*1000)}if(!f.edrx.disabled){b.edrx=f.edrx.checked;b.psm=f.psm.checked;b.edrxv=f.edrxv.value}if(!f.smesh.disabled)b.smesh=f.smesh.checked;   // v1.7.9
  if(send&&!confirm("Save and send ONE text now so the T-SIM wakes and applies the watchdog settings?"))return;
  const r=await post("watchdog-settings",b);const j=await rj(r);
  say("wdmsg",r.ok&&!(j.wake&&!j.wake.sent),!r.ok?(j.error||friendly(j,r.status)):j.unchanged?"No change: the T-SIM already uses these settings.":j.wake?(j.wake.sent?"Saved and sent; waiting for the T-SIM to wake.":"Saved; text not sent: "+friendly(j.wake,j.wake.status)):"Saved. Applied at the T-SIM's next wake (no text sent).");if(r.ok){wdLoaded=false;load()}}

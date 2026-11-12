@@ -32,8 +32,11 @@ static inline int hmClassify(HmState &st, uint32_t now_ms) {
   return HM_NEW;
 }
 
-// SMS merge (one inbox pass): identical STATUS or CMD texts run once. body = normalized text (no " ACK").
-static inline bool smsMergeable(const char *n) { return n && (!strcasecmp(n, "STATUS") || !strcasecmp(n, "CMD")); }
+// SMS merge (one inbox pass): identical STATUS, STATUS AUTO, or CMD texts run once.
+// body = normalized text (no " ACK"). STATUS and STATUS AUTO do not merge with each other. v1.7.9
+static inline bool smsMergeable(const char *n) {
+  return n && (!strcasecmp(n, "STATUS") || !strcasecmp(n, "STATUS AUTO") || !strcasecmp(n, "CMD"));
+}
 // true when n is mergeable and already in seen[0..nseen-1]
 static inline bool smsIsDup(const char *const *seen, int nseen, const char *n) {
   if (!smsMergeable(n)) return false;
