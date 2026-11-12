@@ -11,7 +11,7 @@ export const OLD_PS_NAME = "powersaving-serial";
 // Default Heltec update source: stock MeshCore repeater, app-only image from meshcore-dev/MeshCore.
 // Newest release whose tag starts with repeater-. Heltec_v3_repeater-v*.bin keeps identity and settings.
 const DEFAULT_SOURCE = { enabled: true, repo: "meshcore-dev/MeshCore", asset_pattern: "Heltec_v3_repeater-v*.bin", tag_prefix: "repeater-", direct_url: "" };
-// Saved sources carry v: SOURCE_VERSION. An untouched previous default moves once to stock. A custom repo, pattern, tag prefix, or direct URL stays. A selected upload stays selected.
+// Saved sources carry v: SOURCE_VERSION. An untouched previous default moves once to stock. A saved EasySkyMesh preset (any version) also falls back to stock. A custom repo, pattern, tag prefix, or direct URL stays. A selected upload stays selected.
 export const SOURCE_VERSION = 6;
 export const LEGACY_DEFAULT_SOURCE = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
 // v2 default (the older release names, see OLD_PS_NAME)
@@ -30,6 +30,10 @@ const asStock = (stored, from) => {
 };
 export function migrateSource(stored) {
   if (!stored || typeof stored !== "object") return { src: { ...DEFAULT_SOURCE }, migrated: false, stale: false };
+  // A saved EasySkyMesh preset (any version, including one stamped at SOURCE_VERSION) falls back to stock.
+  // A customized pattern, tag prefix, or direct URL on that repo stays. asStock keeps a selected upload.
+  if (stored.repo === LEGACY_DEFAULT_SOURCE.repo && stored.asset_pattern === LEGACY_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
+    return asStock(stored, LEGACY_DEFAULT_SOURCE.repo);
   if (stored.v >= SOURCE_VERSION) return { src: { ...DEFAULT_SOURCE, ...stored }, migrated: false, stale: false };
   // Untouched v5 headless default, including a copy stamped at v5. A custom tag prefix or direct URL stays.
   if (stored.repo === V5_DEFAULT_SOURCE.repo && stored.asset_pattern === V5_DEFAULT_SOURCE.asset_pattern && !stored.tag_prefix && !stored.direct_url)
@@ -592,7 +596,6 @@ export async function heltecImageRisk(url, tsimFw) {
 export const FW_PRESETS = {
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: DEFAULT_SOURCE.tag_prefix, asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. meshcore-dev/MeshCore, newest release whose tag starts with repeater-. Uses the app-only Heltec V3 repeater image Heltec_v3_repeater-v*.bin (keeps identity and settings)." },
   meshcore_tsim: { label: "Custom MeshCore-TSim power saving (screen)", enabled: true, repo: V4_DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: V4_DEFAULT_SOURCE.asset_pattern, direct_url: "", note: "just-stuff-tm/MeshCore-TSim-Powersaving, latest release, app-only screen image Heltec_v3_repeater-MeshCore-TSim-Powersaving*-upgrade.bin (keeps identity and settings). It does not use the headless image, a freshInstall file, or a merged file." },
-  easyskymesh: { label: "EasySkyMesh PowerSaving", enabled: true, repo: LEGACY_DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: LEGACY_DEFAULT_SOURCE.asset_pattern, direct_url: "", note: "IoTThinks/EasySkyMesh. Uses the newest GitHub release that actually has the Heltec V3 repeater app-only upgrade image Heltec_v3_repeater-*-upgrade.bin (keeps identity and settings). PowerSaving18 currently has no GitHub bins (they moved builds to easyskymesh.com), so today that is PowerSaving 17.1; a newer tag is used automatically once it has the file." },
 };
 
 // Resolve what "latest" means for this device's update source.
@@ -1884,7 +1887,7 @@ const backupIndex = async (env, id) => (await kvJson(env, `backups:${id}`)) || [
 const backupFileName = (id, bk) => `${id}-repeater-backup-${bk.created_at.slice(0, 19).replace(/[:T]/g, "-")}${bk.identity && bk.identity.private_key ? "-PRIVATE-KEY" : ""}.json`;
 async function applyDashboardRestore(env, id, bk, cur) {
   const D = bk.dashboard || {}, done = [];
-  if (D.update_source) { const src = validateSource({ ...cur.src, ...Object.fromEntries(SRC_FIELDS.filter((k) => D.update_source[k] !== undefined).map((k) => [k, D.update_source[k]])), upload: "" }); delete src.upload; await putJson(env, `source:${id}`, src); await env.STATE.delete(`release:${id}`); done.push("update source"); }
+  if (D.update_source) { const src = migrateSource(validateSource({ ...cur.src, ...Object.fromEntries(SRC_FIELDS.filter((k) => D.update_source[k] !== undefined).map((k) => [k, D.update_source[k]])), upload: "" })).src; delete src.upload; await putJson(env, `source:${id}`, src); await env.STATE.delete(`release:${id}`); done.push("update source"); }
   if (D.tsim_source) { const t = validateTsimSource({ ...cur.tsrc, ...D.tsim_source }); await putJson(env, `tsimsrc:${id}`, t); await env.STATE.delete(`tsimrel:${id}`); done.push("T-SIM firmware source"); }
   if (D.settings) {
     const s = { ...cur.settings };
@@ -2040,6 +2043,7 @@ async function deviceApi(request, env, dev, action) {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     const cur0 = await getSource(env, id); delete cur0.upload;
     let src; try { src = validateSource({ ...cur0, ...b }); } catch (e) { return json({ error: e.message }, 400); }
+    src = migrateSource(src).src;
     let up = null;
     if (src.upload) {
       up = (await fwList(env, id)).find((x) => x.token === src.upload);
@@ -2862,7 +2866,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <details class="card" id="srcbox"><summary><b>Firmware update source</b> <small id="srcsum" class="mut"></small></summary><div class="in">
 <p class="small mut">GitHub presets for the Heltec (stock MeshCore is the default), or <b>upload a firmware .bin</b> (Firmware, above on this tab). Nothing is sent until you press <b>Update radio firmware</b>.</p>
 <label>GitHub source<select id="preset">${presetOpts}</select></label>
-<p class="small mut" id="presetnote">Stock MeshCore is the default: meshcore-dev/MeshCore, app-only Heltec V3 repeater image (keeps identity and settings), newest release tagged repeater-*. The list also has the custom screen build and EasySkyMesh.</p>
+<p class="small mut" id="presetnote">Stock MeshCore is the default: meshcore-dev/MeshCore, app-only Heltec V3 repeater image (keeps identity and settings), newest release tagged repeater-*. The list also has the custom screen build.</p>
 <form id="srcf">
 <div id="srccustom" hidden>
 <p class="small mut">This repeater has a saved custom GitHub source. Edit it here, or pick Stock MeshCore and press Save.</p>

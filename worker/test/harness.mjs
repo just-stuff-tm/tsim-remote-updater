@@ -42,8 +42,8 @@ assert.equal((await call("/admin/devices")).status, 401);
 assert.equal((await call("/admin/devices", { headers: { Authorization: "Bearer wrong" } })).status, 401);
 let r = await admin("/admin/devices", "POST", { id: "tsim-1", name: "Test", hologram_device_id: "1234567", heltec_fw: "base" });
 assert.equal(r.status, 201); const created = await r.json(); assert(created.password && created.ingest_key);
-// the update-flow tests below use an explicitly chosen EasySkyMesh source (saved by the user after v2, so never migrated)
-kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 2 }));
+// the update-flow tests below use a customized EasySkyMesh pattern (not the removed preset), so it is kept
+kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-PowerSaving17*-upgrade.bin", tag_prefix: "", direct_url: "", v: 2 }));
 assert.equal((await admin("/admin/devices", "POST", { id: "tsim-1", hologram_device_id: "1" })).status, 409);
 assert.equal((await admin("/admin/devices", "POST", { id: "Bad Id", hologram_device_id: "1" })).status, 400);
 const list = await (await admin("/admin/devices")).json();
@@ -1015,7 +1015,11 @@ console.log("tag/asset version ok");
   m = migrateSource({ enabled: true, ...STOCK, direct_url: "", v: 6, upload: UP });
   assert(!m.migrated && !m.stale && m.src.upload === UP && m.src.repo === STOCK.repo, "selected upload on stock stays");
   m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 2 });
-  assert(!m.migrated && m.src.repo === "IoTThinks/EasySkyMesh", "EasySkyMesh picked again after the change is respected");
+  assert(m.migrated && m.src.repo === STOCK.repo && m.src.asset_pattern === STOCK.asset_pattern && m.src.tag_prefix === "repeater-" && m.src.v === 6, "saved EasySkyMesh preset at v2 falls back to stock");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 6 });
+  assert(m.migrated && m.src.repo === STOCK.repo && m.src.asset_pattern === STOCK.asset_pattern && m.src.tag_prefix === "repeater-" && !m.src.direct_url, "saved EasySkyMesh preset at current version falls back to stock");
+  m = migrateSource({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 6, upload: UP });
+  assert(m.migrated && m.src.repo === STOCK.repo && m.src.upload === UP, "selected upload stays when the EasySkyMesh preset falls back to stock");
   // untouched v2 default -> stock. A tag prefix stays on the previous repo, whose pattern still matches the old names.
   m = migrateSource({ enabled: true, repo: PREV.repo, asset_pattern: OLD2, tag_prefix: "", direct_url: "", v: 2, migrated_from: "IoTThinks/EasySkyMesh" });
   assert(m.migrated && m.stale && m.src.repo === STOCK.repo && m.src.asset_pattern === STOCK.asset_pattern && m.src.tag_prefix === "repeater-" && m.src.v === 6 && m.src.migrated_from === OLD2, "old default pattern migrates to stock");
@@ -1081,12 +1085,16 @@ console.log("tag/asset version ok");
   assert.equal(s.repo, STOCK.repo); assert.equal(s.asset_pattern, STOCK.asset_pattern); assert.equal(s.tag_prefix, "repeater-"); assert.equal(s.upload, UP);
   assert.equal(JSON.parse(kv.get("source:tsim-1")).v, 6); assert.equal(kv.get("release:tsim-1"), undefined);
   assert(JSON.stringify([...kv.values()]).includes(`was ${TSIM.asset_pattern}`), "v5 migration logged");
-  // saving EasySkyMesh again sticks
-  let r2 = await P("source", { repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin" });
-  assert.equal(r2.status, 200); s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json(); assert.equal(s.repo, "IoTThinks/EasySkyMesh", "explicit EasySkyMesh choice is kept");
-  // three GitHub presets: stock (default), custom screen, EasySkyMesh. Headless is not a preset.
-  assert.deepEqual(Object.keys(FP), ["meshcore", "meshcore_tsim", "easyskymesh"]);
-  assert(FP.meshcore.default); assert(!FP.meshcore_tsim.default); assert(!FP.easyskymesh.default);
+  // a saved EasySkyMesh preset (including a POST of that exact source) falls back to stock
+  kv.set("source:tsim-1", JSON.stringify({ enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "", v: 6 }));
+  s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json();
+  assert.equal(s.repo, STOCK.repo); assert.equal(s.asset_pattern, STOCK.asset_pattern); assert.equal(s.tag_prefix, "repeater-");
+  assert.equal(JSON.parse(kv.get("source:tsim-1")).repo, STOCK.repo, "v6 EasySkyMesh preset was rewritten to stock");
+  let r2 = await P("source", { repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" });
+  assert.equal(r2.status, 200); s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json(); assert.equal(s.repo, STOCK.repo, "saving the EasySkyMesh preset falls back to stock");
+  // two GitHub presets: stock (default) and the custom screen build. Headless and EasySkyMesh are not presets.
+  assert.deepEqual(Object.keys(FP), ["meshcore", "meshcore_tsim"]);
+  assert(FP.meshcore.default); assert(!FP.meshcore_tsim.default); assert.equal(FP.easyskymesh, undefined);
   assert.equal(FP.meshcore.label, "Stock MeshCore repeater (latest repeater-* release)");
   assert.match(FP.meshcore.note, /app-only Heltec V3/); assert.match(FP.meshcore.note, /meshcore-dev\/MeshCore/);
   assert.doesNotMatch(FP.meshcore.note, /MeshCore-TSim-Powersaving/);
@@ -1096,10 +1104,8 @@ console.log("tag/asset version ok");
   assert.equal(FP.meshcore_tsim.enabled, true); assert.equal(FP.meshcore_tsim.repo, V4.repo); assert.equal(FP.meshcore_tsim.asset_pattern, V4.asset_pattern);
   assert.equal(FP.meshcore_tsim.tag_prefix, ""); assert.equal(FP.meshcore_tsim.direct_url, "");
   assert.match(FP.meshcore_tsim.note, /Heltec_v3_repeater-MeshCore-TSim-Powersaving\*-upgrade\.bin/);
-  assert.equal(FP.easyskymesh.label, "EasySkyMesh PowerSaving");
-  assert.equal(FP.easyskymesh.enabled, true); assert.equal(FP.easyskymesh.repo, "IoTThinks/EasySkyMesh"); assert.equal(FP.easyskymesh.asset_pattern, "Heltec_v3_repeater-*-upgrade.bin");
-  assert.equal(FP.easyskymesh.tag_prefix, ""); assert.equal(FP.easyskymesh.direct_url, "");
-  assert.match(FP.easyskymesh.note, /newest GitHub release/); assert.match(FP.easyskymesh.note, /PowerSaving 17\.1/);
+  assert.equal(FP.easyskymesh, undefined);
+  const ESM = { enabled: true, repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin", tag_prefix: "", direct_url: "" };
   const badName = (n) => /headless|merged|freshInstall/i.test(n || "");
   const stockNames = ["Heltec_v3_repeater-v1.18.0-81dbae5-merged.bin", "Heltec_v3_repeater_headless-v1.18.0-81dbae5.bin", "Heltec_v3_repeater-v1.18.0-freshInstall-merged.bin", "Heltec_v3_repeater-v1.18.0-81dbae5.bin"];
   assert.equal(pickAsset(stockNames, FP.meshcore.asset_pattern), "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
@@ -1108,14 +1114,15 @@ console.log("tag/asset version ok");
   assert.equal(pickAsset(screenNames, FP.meshcore_tsim.asset_pattern), SCREEN, "screen preset picks the app-only screen image");
   assert.equal(pickAsset(screenNames.filter(badName), FP.meshcore_tsim.asset_pattern), undefined);
   const esNames = ["Heltec_v3_repeater-PowerSaving17.1.6-freshInstall-merged.bin", "Heltec_v3_repeater_headless-PowerSaving17.1.6-upgrade.bin", "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin"];
-  assert.equal(pickAsset(esNames, FP.easyskymesh.asset_pattern), "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
-  assert.equal(pickAsset(esNames.filter(badName), FP.easyskymesh.asset_pattern), undefined);
-  for (const p of [FP.meshcore, FP.meshcore_tsim, FP.easyskymesh]) assert(!/headless|merged|freshInstall/i.test(p.asset_pattern), p.asset_pattern);
+  assert.equal(pickAsset(esNames, ESM.asset_pattern), "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
+  assert.equal(pickAsset(esNames.filter(badName), ESM.asset_pattern), undefined);
+  for (const p of [FP.meshcore, FP.meshcore_tsim]) assert(!/headless|merged|freshInstall/i.test(p.asset_pattern), p.asset_pattern);
   const page = dashboardPage({ id: "tsim-1", name: "x" });
   assert(page.includes("Upload a firmware .bin") && page.includes("Stock MeshCore repeater (latest repeater-* release)") && page.includes('id="upfile"') && page.includes('id="srcf"') && page.includes('id="srccustom"'));
-  assert(page.includes("Custom MeshCore-TSim power saving (screen)") && page.includes("EasySkyMesh PowerSaving"));
+  assert(page.includes("Custom MeshCore-TSim power saving (screen)"));
+  assert(!page.includes("EasySkyMesh PowerSaving") && !page.includes('value="easyskymesh"'));
   const sel = page.match(/<select id="preset">([\s\S]*?)<\/select>/);
-  assert(sel && sel[1].indexOf('value="meshcore"') < sel[1].indexOf('value="meshcore_tsim"') && sel[1].indexOf('value="meshcore_tsim"') < sel[1].indexOf('value="easyskymesh"'));
+  assert(sel && sel[1].indexOf('value="meshcore"') < sel[1].indexOf('value="meshcore_tsim"') && !sel[1].includes('value="easyskymesh"'));
   assert(!page.includes("MeshCore T-SIM power saving, headless"));
   for (const mm of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
   // new default resolves to the stock app-only repeater image, not a merged file
@@ -1124,7 +1131,7 @@ console.log("tag/asset version ok");
   assert(!/freshInstall|merged|headless/.test(rel.asset_name));
   const relScreen = await latestRelease({}, FP.meshcore_tsim);
   assert.equal(relScreen.tag, TTAG); assert.equal(relScreen.asset_name, SCREEN);
-  const relEs = await latestRelease({}, FP.easyskymesh);
+  const relEs = await latestRelease({}, ESM);
   assert.equal(relEs.tag, "PowerSaving17.2"); assert.equal(relEs.asset_name, "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin");
   // empty newest EasySkyMesh release (PowerSaving18): walk to the newest tag that has the app-only upgrade image
   const prevFetch = globalThis.fetch;
@@ -1148,7 +1155,7 @@ console.log("tag/asset version ok");
     return prevFetch(url, init);
   };
   try {
-    const walked = await latestRelease({}, FP.easyskymesh);
+    const walked = await latestRelease({}, ESM);
     assert.equal(walked.tag, "PowerSaving17.1"); assert.equal(walked.asset_name, "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
     const walkedPrefix = await latestRelease({}, FP.meshcore);
     assert.equal(walkedPrefix.tag, "repeater-v1.18.0"); assert.equal(walkedPrefix.asset_name, "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
@@ -1167,7 +1174,7 @@ console.log("tag/asset version ok");
     return prevFetch(url, init);
   };
   try {
-    const htmlWalk = await latestRelease({}, FP.easyskymesh);
+    const htmlWalk = await latestRelease({}, ESM);
     assert.equal(htmlWalk.via, "html"); assert.equal(htmlWalk.tag, "PowerSaving17.1"); assert.equal(htmlWalk.asset_name, "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
   } finally { globalThis.fetch = prevFetch; }
   // the old headless pattern still resolves when set explicitly (custom source, not the default)
