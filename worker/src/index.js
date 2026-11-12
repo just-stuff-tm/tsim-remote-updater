@@ -251,28 +251,72 @@ export function pickAsset(names, pattern) {
   const re = globToRegex(pattern), wantMerged = /merged/i.test(pattern), wantHeadless = /headless/i.test(pattern);
   return names.find((n) => re.test(n) && (wantMerged || !/-merged\.bin$/i.test(n)) && (wantHeadless || !/_headless\b/i.test(n)));
 }
-async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
-  let tag = "";
-  if (prefix) {  // releases list page, newest first
-    const r = await fetch(`https://github.com/${REPO}/releases`, { headers: { "User-Agent": UA } });
-    if (!r.ok) throw new Error(`GitHub releases page ${r.status}`);
-    const tags = [...(await r.text()).matchAll(/\/releases\/tag\/([^"/?#]+)"/g)].map((m) => decodeURIComponent(m[1]));
-    tag = tags.find((t) => t.startsWith(prefix)) || "";
-    if (!tag) return { skipped: `no release tagged ${prefix}* on the first releases page` };
-  } else {
-  const r = await fetch(`https://github.com/${REPO}/releases/latest`, { headers: { "User-Agent": UA }, redirect: "manual" });
-  const loc = r.headers.get("Location") || "";
-  tag = decodeURIComponent((loc.match(/\/releases\/tag\/([^/?#]+)/) || [])[1] || "");
+function htmlTags(page) {
+  const seen = new Set(), out = [];
+  for (const m of String(page).matchAll(/\/releases\/tag\/([^"/?#]+)"/g)) {
+    const t = decodeURIComponent(m[1]);
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
   }
-  if (!tag) throw new Error(`GitHub releases/latest ${r.status}`);
+  return out;
+}
+async function htmlReleaseTags(REPO) {
+  const r = await fetch(`https://github.com/${REPO}/releases`, { headers: { "User-Agent": UA } });
+  if (!r.ok) throw new Error(`GitHub releases page ${r.status}`);
+  return htmlTags(await r.text());
+}
+async function htmlAsset(REPO, tag, ASSET_RE, pattern) {
   const a = await fetch(`https://github.com/${REPO}/releases/expanded_assets/${encodeURIComponent(tag)}`, { headers: { "User-Agent": UA } });
   if (!a.ok) throw new Error(`GitHub assets ${a.status}`);
   const page = await a.text();
   const names = [...page.matchAll(/\/releases\/download\/[^"]+?\/([^"/]+)"/g)].map((m) => decodeURIComponent(m[1]));
   const name = pattern ? pickAsset(names, pattern) : names.find((n) => ASSET_RE.test(n));
-  if (!name) return { skipped: `no upgrade asset in ${tag}` };
+  if (!name) return null;
   return { tag, asset_id: `${tag}/${name}`, asset_name: name, url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, published_at: null, via: "html", sha_asset: names.includes(name + ".sha256"),
     notes: "", html_url: safeRelUrl(null, REPO, tag) };
+}
+// Public release pages, used when the API rate-limits. Same walk as latestRelease: skip a tag with no matching file.
+async function latestReleaseHtml(REPO, ASSET_RE, prefix = "", pattern = "") {
+  if (prefix) {
+    const tags = (await htmlReleaseTags(REPO)).filter((t) => t.startsWith(prefix));
+    if (!tags.length) return { skipped: `no release tagged ${prefix}* on the first releases page` };
+    for (const tag of tags) {
+      const hit = await htmlAsset(REPO, tag, ASSET_RE, pattern);
+      if (hit) return hit;
+    }
+    return { skipped: `no upgrade asset in ${tags[0]}` };
+  }
+  const r = await fetch(`https://github.com/${REPO}/releases/latest`, { headers: { "User-Agent": UA }, redirect: "manual" });
+  const loc = r.headers.get("Location") || "";
+  const tag = decodeURIComponent((loc.match(/\/releases\/tag\/([^/?#]+)/) || [])[1] || "");
+  if (!tag) throw new Error(`GitHub releases/latest ${r.status}`);
+  const hit = await htmlAsset(REPO, tag, ASSET_RE, pattern);
+  if (hit) return hit;
+  let tags = [];
+  try { tags = (await htmlReleaseTags(REPO)).filter((t) => t !== tag); } catch { return { skipped: `no upgrade asset in ${tag}` }; }
+  for (const t of tags) {
+    const h = await htmlAsset(REPO, t, ASSET_RE, pattern);
+    if (h) return h;
+  }
+  return { skipped: `no upgrade asset in ${tag}` };
+}
+// Newer published_at first. Missing dates keep the API order (GitHub already lists newest first).
+function newestFirst(list) {
+  return list.map((rel, i) => ({ rel, i })).sort((a, b) => {
+    const db = Date.parse(b.rel.published_at || 0), da = Date.parse(a.rel.published_at || 0);
+    return ((Number.isFinite(db) ? db : 0) - (Number.isFinite(da) ? da : 0)) || a.i - b.i;
+  }).map((x) => x.rel);
+}
+function releaseCandidates(body, prefix) {
+  return newestFirst((Array.isArray(body) ? body : []).filter((x) => x && !x.draft && !x.prerelease && (!prefix || String(x.tag_name || "").startsWith(prefix))));
+}
+function releaseHit(rel, pattern, REPO) {
+  if (!rel || rel.draft || rel.prerelease) return null;
+  const an = pickAsset((rel.assets || []).map((a) => a.name), pattern);
+  const asset = (rel.assets || []).find((a) => a.name === an);
+  if (!asset) return null;
+  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null,
+    asset_updated_at: asset.updated_at || null, sha_asset: (rel.assets || []).some((a) => a.name === asset.name + ".sha256"),
+    notes: relNotes(rel.body), html_url: safeRelUrl(rel.html_url, REPO, rel.tag_name) };
 }
 
 export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
@@ -280,25 +324,40 @@ export async function latestRelease(env = {}, src = DEFAULT_SOURCE) {
   const headers = { "User-Agent": UA, Accept: "application/vnd.github+json" };
   if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
   const prefix = src.tag_prefix || "";
+  const pattern = src.asset_pattern;
+  const listUrl = `https://api.github.com/repos/${REPO}/releases?per_page=30`;
   // Repos that tag per role (MeshCore: repeater-/companion-/room-server-) need the newest release with the prefix,
-  // not /releases/latest (which may be another role).
-  const r = await fetch(prefix ? `https://api.github.com/repos/${REPO}/releases?per_page=30` : `https://api.github.com/repos/${REPO}/releases/latest`, { headers });
-  if (r.status === 403 || r.status === 429) return latestReleaseHtml(REPO, ASSET_RE, prefix, src.asset_pattern);
+  // not /releases/latest (which may be another role). A release with no matching file is skipped either way:
+  // walk newer-to-older until one has the asset (EasySkyMesh PowerSaving18 is an empty GitHub release).
+  if (prefix) {
+    const r = await fetch(listUrl, { headers });
+    if (r.status === 403 || r.status === 429) return latestReleaseHtml(REPO, ASSET_RE, prefix, pattern);
+    if (r.status === 404) throw new Error(`GitHub repo ${REPO} not found or has no releases`);
+    if (!r.ok) throw new Error(`GitHub API ${r.status}`);
+    const list = releaseCandidates(await r.json(), prefix);
+    if (!list.length) return { skipped: `no release tagged ${prefix}* in the newest 30` };
+    for (const rel of list) {
+      const hit = releaseHit(rel, pattern, REPO);
+      if (hit) return hit;
+    }
+    return { skipped: `no upgrade asset in ${list[0].tag_name}` };
+  }
+  const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers });
+  if (r.status === 403 || r.status === 429) return latestReleaseHtml(REPO, ASSET_RE, prefix, pattern);
   if (r.status === 404) throw new Error(`GitHub repo ${REPO} not found or has no releases`);
   if (!r.ok) throw new Error(`GitHub API ${r.status}`);
-  let rel = await r.json();
-  if (prefix) {
-    rel = (Array.isArray(rel) ? rel : []).filter((x) => !x.draft && !x.prerelease && String(x.tag_name || "").startsWith(prefix))
-      .sort((a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0))[0];
-    if (!rel) return { skipped: `no release tagged ${prefix}* in the newest 30` };
+  const latest = await r.json();
+  if (latest.draft || latest.prerelease) return { skipped: `draft/prerelease ${latest.tag_name}` };
+  const hit = releaseHit(latest, pattern, REPO);
+  if (hit) return hit;
+  const lr = await fetch(listUrl, { headers });
+  if (lr.status === 403 || lr.status === 429) return latestReleaseHtml(REPO, ASSET_RE, prefix, pattern);
+  if (!lr.ok) return { skipped: `no upgrade asset in ${latest.tag_name}` };
+  for (const rel of releaseCandidates(await lr.json(), "")) {
+    const h = releaseHit(rel, pattern, REPO);
+    if (h) return h;
   }
-  if (rel.draft || rel.prerelease) return { skipped: `draft/prerelease ${rel.tag_name}` };
-  const an = pickAsset((rel.assets || []).map((a) => a.name), src.asset_pattern);
-  const asset = (rel.assets || []).find((a) => a.name === an);
-  if (!asset) return { skipped: `no upgrade asset in ${rel.tag_name}` };
-  return { tag: rel.tag_name, asset_id: asset.id, asset_name: asset.name, url: asset.browser_download_url, published_at: rel.published_at, digest: asset.digest || null,
-    asset_updated_at: asset.updated_at || null, sha_asset: (rel.assets || []).some((a) => a.name === asset.name + ".sha256"),
-    notes: relNotes(rel.body), html_url: safeRelUrl(rel.html_url, REPO, rel.tag_name) };
+  return { skipped: `no upgrade asset in ${latest.tag_name}` };
 }
 // Release notes cached with the release check: plain text, control chars stripped, capped (rendered escaped in the dashboard).
 export function relNotes(body) { const t = String(body || "").replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trim(); return t ? t.slice(0, 4000) : ""; }
@@ -532,6 +591,8 @@ export async function heltecImageRisk(url, tsimFw) {
 }
 export const FW_PRESETS = {
   meshcore: { label: "Stock MeshCore repeater (latest repeater-* release)", enabled: true, repo: DEFAULT_SOURCE.repo, tag_prefix: DEFAULT_SOURCE.tag_prefix, asset_pattern: DEFAULT_SOURCE.asset_pattern, direct_url: "", default: true, note: "Default. meshcore-dev/MeshCore, newest release whose tag starts with repeater-. Uses the app-only Heltec V3 repeater image Heltec_v3_repeater-v*.bin (keeps identity and settings)." },
+  meshcore_tsim: { label: "Custom MeshCore-TSim power saving (screen)", enabled: true, repo: V4_DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: V4_DEFAULT_SOURCE.asset_pattern, direct_url: "", note: "just-stuff-tm/MeshCore-TSim-Powersaving, latest release, app-only screen image Heltec_v3_repeater-MeshCore-TSim-Powersaving*-upgrade.bin (keeps identity and settings). It does not use the headless image, a freshInstall file, or a merged file." },
+  easyskymesh: { label: "EasySkyMesh PowerSaving", enabled: true, repo: LEGACY_DEFAULT_SOURCE.repo, tag_prefix: "", asset_pattern: LEGACY_DEFAULT_SOURCE.asset_pattern, direct_url: "", note: "IoTThinks/EasySkyMesh. Uses the newest GitHub release that actually has the Heltec V3 repeater app-only upgrade image Heltec_v3_repeater-*-upgrade.bin (keeps identity and settings). PowerSaving18 currently has no GitHub bins (they moved builds to easyskymesh.com), so today that is PowerSaving 17.1; a newer tag is used automatically once it has the file." },
 };
 
 // Resolve what "latest" means for this device's update source.
@@ -2698,6 +2759,7 @@ load();
 const PS_HTML = `Repeater stats can still be retrieved over the mesh using MeshCore remote admin (e.g. from the MeshCore app). T-SIM stats (signal, battery, solar, modem) are still available here via Request status.`;
 
 export function dashboardPage(dev, acc = { kind: "d" }) {
+  const presetOpts = Object.entries(FW_PRESETS).map(([k, v]) => `<option value="${esc(k)}">${esc(v.label)}</option>`).join("");
   return `${HEAD(dev.name)}
 <body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span><button type="button" id="unitsbtn" class="g sm" onclick="unitsToggle()" style="margin-left:6px">m · °C</button></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
@@ -2729,7 +2791,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" id="mwack"> I understand this erases the identity, name, settings, ACL and regions</label>
 <label>Type ERASE to allow the update<input id="mwtyped" autocomplete="off" autocapitalize="characters" spellcheck="false"></label></div><div class="card"><div id="c-upd"></div><div id="p-heltec"></div></div>
 <details class="card" id="upbox"><summary><b>Upload a firmware .bin</b> <small id="upsum" class="mut"></small></summary><div class="in">
-<p class="small mut">The other Heltec choice, beside Stock MeshCore. Pick a Heltec V3 <code>.bin</code> on this computer or phone and upload it. The T-SIM downloads it over LTE when you press <b>Update radio firmware</b>; nothing is sent before that. Use the app-only file (keeps identity and settings). Merged / fresh-install files are accepted with extra warnings. Limits: 3 files, app code up to 3.19 MB (the Heltec app partition).</p>
+<p class="small mut">Your own file, beside the GitHub presets (stock MeshCore is the default). Pick a Heltec V3 <code>.bin</code> on this computer or phone and upload it. The T-SIM downloads it over LTE when you press <b>Update radio firmware</b>; nothing is sent before that. Use the app-only file (keeps identity and settings). Merged / fresh-install files are accepted with extra warnings. Limits: 3 files, app code up to 3.19 MB (the Heltec app partition).</p>
 <input type="file" id="upfile" accept=".bin,application/octet-stream"><div id="upcheck" class="small"></div>
 <div class="acts"><button type="button" id="upbtn">Upload</button><span id="upmsg" class="msg"></span></div>
 <div class="bar" id="upbar" hidden><i style="width:0%"></i></div><div id="uplist"></div></div></details></section>
@@ -2798,9 +2860,9 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <h3>Restore</h3><p class="small mut">Pick a backup file to compare it with the current values, then choose what to restore.</p>
 <input type="file" id="bkfile" accept=".json,application/json"><div id="bkprev"></div><div id="bkjob"></div></div></details>
 <details class="card" id="srcbox"><summary><b>Firmware update source</b> <small id="srcsum" class="mut"></small></summary><div class="in">
-<p class="small mut">Two choices for the Heltec: <b>Stock MeshCore</b> (below), or <b>upload a firmware .bin</b> (Firmware, above on this tab). Nothing is sent until you press <b>Update radio firmware</b>.</p>
-<label>GitHub source<select id="preset"></select></label>
-<p class="small mut" id="presetnote">Stock MeshCore from meshcore-dev/MeshCore. App-only Heltec V3 repeater image (keeps identity and settings). Newest release tagged repeater-*.</p>
+<p class="small mut">GitHub presets for the Heltec (stock MeshCore is the default), or <b>upload a firmware .bin</b> (Firmware, above on this tab). Nothing is sent until you press <b>Update radio firmware</b>.</p>
+<label>GitHub source<select id="preset">${presetOpts}</select></label>
+<p class="small mut" id="presetnote">Stock MeshCore is the default: meshcore-dev/MeshCore, app-only Heltec V3 repeater image (keeps identity and settings), newest release tagged repeater-*. The list also has the custom screen build and EasySkyMesh.</p>
 <form id="srcf">
 <div id="srccustom" hidden>
 <p class="small mut">This repeater has a saved custom GitHub source. Edit it here, or pick Stock MeshCore and press Save.</p>

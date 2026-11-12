@@ -1084,21 +1084,92 @@ console.log("tag/asset version ok");
   // saving EasySkyMesh again sticks
   let r2 = await P("source", { repo: "IoTThinks/EasySkyMesh", asset_pattern: "Heltec_v3_repeater-*-upgrade.bin" });
   assert.equal(r2.status, 200); s = await (await call("/api/d/tsim-1/source", { headers: { Cookie: c } })).json(); assert.equal(s.repo, "IoTThinks/EasySkyMesh", "explicit EasySkyMesh choice is kept");
-  // the only GitHub preset is stock MeshCore
-  assert.deepEqual(Object.keys(FP), ["meshcore"]); assert(FP.meshcore.default); assert.equal(FP.meshcore_tsim, undefined);
+  // three GitHub presets: stock (default), custom screen, EasySkyMesh. Headless is not a preset.
+  assert.deepEqual(Object.keys(FP), ["meshcore", "meshcore_tsim", "easyskymesh"]);
+  assert(FP.meshcore.default); assert(!FP.meshcore_tsim.default); assert(!FP.easyskymesh.default);
   assert.equal(FP.meshcore.label, "Stock MeshCore repeater (latest repeater-* release)");
   assert.match(FP.meshcore.note, /app-only Heltec V3/); assert.match(FP.meshcore.note, /meshcore-dev\/MeshCore/);
   assert.doesNotMatch(FP.meshcore.note, /MeshCore-TSim-Powersaving/);
-  assert.equal(FP.meshcore.repo, STOCK.repo); assert.equal(FP.meshcore.asset_pattern, STOCK.asset_pattern); assert.equal(FP.meshcore.tag_prefix, "repeater-");
-  assert.equal(FP.meshcore_serial, undefined); assert.equal(FP.easyskymesh, undefined);
+  assert.equal(FP.meshcore.repo, STOCK.repo); assert.equal(FP.meshcore.asset_pattern, STOCK.asset_pattern); assert.equal(FP.meshcore.tag_prefix, "repeater-"); assert.equal(FP.meshcore.direct_url, "");
+  assert.equal(FP.meshcore_serial, undefined);
+  assert.equal(FP.meshcore_tsim.label, "Custom MeshCore-TSim power saving (screen)");
+  assert.equal(FP.meshcore_tsim.enabled, true); assert.equal(FP.meshcore_tsim.repo, V4.repo); assert.equal(FP.meshcore_tsim.asset_pattern, V4.asset_pattern);
+  assert.equal(FP.meshcore_tsim.tag_prefix, ""); assert.equal(FP.meshcore_tsim.direct_url, "");
+  assert.match(FP.meshcore_tsim.note, /Heltec_v3_repeater-MeshCore-TSim-Powersaving\*-upgrade\.bin/);
+  assert.equal(FP.easyskymesh.label, "EasySkyMesh PowerSaving");
+  assert.equal(FP.easyskymesh.enabled, true); assert.equal(FP.easyskymesh.repo, "IoTThinks/EasySkyMesh"); assert.equal(FP.easyskymesh.asset_pattern, "Heltec_v3_repeater-*-upgrade.bin");
+  assert.equal(FP.easyskymesh.tag_prefix, ""); assert.equal(FP.easyskymesh.direct_url, "");
+  assert.match(FP.easyskymesh.note, /newest GitHub release/); assert.match(FP.easyskymesh.note, /PowerSaving 17\.1/);
+  const badName = (n) => /headless|merged|freshInstall/i.test(n || "");
+  const stockNames = ["Heltec_v3_repeater-v1.18.0-81dbae5-merged.bin", "Heltec_v3_repeater_headless-v1.18.0-81dbae5.bin", "Heltec_v3_repeater-v1.18.0-freshInstall-merged.bin", "Heltec_v3_repeater-v1.18.0-81dbae5.bin"];
+  assert.equal(pickAsset(stockNames, FP.meshcore.asset_pattern), "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
+  assert.equal(pickAsset(stockNames.filter(badName), FP.meshcore.asset_pattern), undefined);
+  const screenNames = [HEAD, SFRESH, HFRESH, `Heltec_v3_repeater_bridge_espnow-${TTAG}-upgrade.bin`, SCREEN];
+  assert.equal(pickAsset(screenNames, FP.meshcore_tsim.asset_pattern), SCREEN, "screen preset picks the app-only screen image");
+  assert.equal(pickAsset(screenNames.filter(badName), FP.meshcore_tsim.asset_pattern), undefined);
+  const esNames = ["Heltec_v3_repeater-PowerSaving17.1.6-freshInstall-merged.bin", "Heltec_v3_repeater_headless-PowerSaving17.1.6-upgrade.bin", "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin"];
+  assert.equal(pickAsset(esNames, FP.easyskymesh.asset_pattern), "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
+  assert.equal(pickAsset(esNames.filter(badName), FP.easyskymesh.asset_pattern), undefined);
+  for (const p of [FP.meshcore, FP.meshcore_tsim, FP.easyskymesh]) assert(!/headless|merged|freshInstall/i.test(p.asset_pattern), p.asset_pattern);
   const page = dashboardPage({ id: "tsim-1", name: "x" });
-  assert(page.includes("Upload a firmware .bin") && page.includes("Stock MeshCore") && page.includes('id="upfile"') && page.includes('id="srcf"') && page.includes('id="srccustom"'));
-  assert(!page.includes("meshcore_tsim") && !page.includes("MeshCore T-SIM power saving, headless"));
+  assert(page.includes("Upload a firmware .bin") && page.includes("Stock MeshCore repeater (latest repeater-* release)") && page.includes('id="upfile"') && page.includes('id="srcf"') && page.includes('id="srccustom"'));
+  assert(page.includes("Custom MeshCore-TSim power saving (screen)") && page.includes("EasySkyMesh PowerSaving"));
+  const sel = page.match(/<select id="preset">([\s\S]*?)<\/select>/);
+  assert(sel && sel[1].indexOf('value="meshcore"') < sel[1].indexOf('value="meshcore_tsim"') && sel[1].indexOf('value="meshcore_tsim"') < sel[1].indexOf('value="easyskymesh"'));
+  assert(!page.includes("MeshCore T-SIM power saving, headless"));
   for (const mm of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
   // new default resolves to the stock app-only repeater image, not a merged file
-  const rel = await latestRelease({});
+  const rel = await latestRelease({}, FP.meshcore);
   assert.equal(rel.tag, "repeater-v1.18.0"); assert.equal(rel.asset_name, "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
-  assert(!/freshInstall|merged/.test(rel.asset_name));
+  assert(!/freshInstall|merged|headless/.test(rel.asset_name));
+  const relScreen = await latestRelease({}, FP.meshcore_tsim);
+  assert.equal(relScreen.tag, TTAG); assert.equal(relScreen.asset_name, SCREEN);
+  const relEs = await latestRelease({}, FP.easyskymesh);
+  assert.equal(relEs.tag, "PowerSaving17.2"); assert.equal(relEs.asset_name, "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin");
+  // empty newest EasySkyMesh release (PowerSaving18): walk to the newest tag that has the app-only upgrade image
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("api.github.com/repos/IoTThinks/EasySkyMesh/releases/latest"))
+      return new Response(JSON.stringify({ tag_name: "PowerSaving18", published_at: "2026-11-01T00:00:00Z", assets: [] }));
+    if (u.includes("api.github.com/repos/IoTThinks/EasySkyMesh/releases?"))
+      return new Response(JSON.stringify([
+        { tag_name: "PowerSaving18", published_at: "2026-11-01T00:00:00Z", assets: [] },
+        { tag_name: "PowerSaving17.1", published_at: "2026-10-01T00:00:00Z", assets: [
+          { id: 71, name: "Heltec_v3_repeater-PowerSaving17.1.6-freshInstall-merged.bin", browser_download_url: "https://github.com/IoTThinks/EasySkyMesh/releases/download/PowerSaving17.1/Heltec_v3_repeater-PowerSaving17.1.6-freshInstall-merged.bin" },
+          { id: 72, name: "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin", browser_download_url: "https://github.com/IoTThinks/EasySkyMesh/releases/download/PowerSaving17.1/Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin" },
+        ] },
+      ]));
+    if (u.includes("api.github.com/repos/meshcore-dev/MeshCore/releases?"))
+      return new Response(JSON.stringify([
+        { tag_name: "repeater-v9.9.9", published_at: "2026-11-02T00:00:00Z", assets: [{ id: 1, name: "Heltec_v3_repeater-v9.9.9-aaaaaaa-merged.bin", browser_download_url: "https://g/m.bin" }] },
+        { tag_name: "repeater-v1.18.0", published_at: "2026-10-15T10:03:13Z", assets: [{ id: 3, name: "Heltec_v3_repeater-v1.18.0-81dbae5-merged.bin", browser_download_url: "https://g/b.bin" }, { id: 2, name: "Heltec_v3_repeater-v1.18.0-81dbae5.bin", browser_download_url: "https://g/a.bin" }] },
+      ]));
+    return prevFetch(url, init);
+  };
+  try {
+    const walked = await latestRelease({}, FP.easyskymesh);
+    assert.equal(walked.tag, "PowerSaving17.1"); assert.equal(walked.asset_name, "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
+    const walkedPrefix = await latestRelease({}, FP.meshcore);
+    assert.equal(walkedPrefix.tag, "repeater-v1.18.0"); assert.equal(walkedPrefix.asset_name, "Heltec_v3_repeater-v1.18.0-81dbae5.bin");
+  } finally { globalThis.fetch = prevFetch; }
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("api.github.com/repos/IoTThinks/EasySkyMesh")) return new Response("rate", { status: 403 });
+    if (u === "https://github.com/IoTThinks/EasySkyMesh/releases/latest")
+      return new Response(null, { status: 302, headers: { Location: "https://github.com/IoTThinks/EasySkyMesh/releases/tag/PowerSaving18" } });
+    if (u === "https://github.com/IoTThinks/EasySkyMesh/releases")
+      return new Response('<a href="/IoTThinks/EasySkyMesh/releases/tag/PowerSaving18"></a><a href="/IoTThinks/EasySkyMesh/releases/tag/PowerSaving17.1"></a>');
+    if (u.includes("/releases/expanded_assets/PowerSaving18"))
+      return new Response('<a href="/IoTThinks/EasySkyMesh/releases/download/PowerSaving18/README.txt">x</a>');
+    if (u.includes("/releases/expanded_assets/PowerSaving17.1"))
+      return new Response('<a href="/IoTThinks/EasySkyMesh/releases/download/PowerSaving17.1/Heltec_v3_repeater-PowerSaving17.1.6-freshInstall-merged.bin">m</a><a href="/IoTThinks/EasySkyMesh/releases/download/PowerSaving17.1/Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin">u</a>');
+    return prevFetch(url, init);
+  };
+  try {
+    const htmlWalk = await latestRelease({}, FP.easyskymesh);
+    assert.equal(htmlWalk.via, "html"); assert.equal(htmlWalk.tag, "PowerSaving17.1"); assert.equal(htmlWalk.asset_name, "Heltec_v3_repeater-PowerSaving17.1.6-upgrade.bin");
+  } finally { globalThis.fetch = prevFetch; }
   // the old headless pattern still resolves when set explicitly (custom source, not the default)
   const relOld = await latestRelease({}, { enabled: true, ...TSIM, tag_prefix: "", direct_url: "" });
   assert.equal(relOld.tag, TTAG); assert.equal(relOld.asset_name, HEAD);
