@@ -1970,3 +1970,86 @@ console.log("serial.ondemand tests OK");
   assert.equal(await due("tsim-updater 1.7.9"), "STATUS AUTO");
   console.log("v1.7.9 scheduled STATUS AUTO tests OK");
 }
+
+// ---------- GPIO6 checkbox: a newer applied/saved setting beats a stale watchdog report ----------
+{
+  const M = await import("../src/index.js");
+  const out = "WDCFG applied 1: int=180 hb=1 sms=0 cmd=0 hwake=0 upoll=60 usol=2000 edrx=0 psm=0 smesh=1";
+  const rep = { at: "2026-11-09T16:04:11.000Z", hwake: 1, hw_wakes: 4, hw_ignored: 1, hw_skipped: 2, hw_self: 0, hw_awake: 1, hw_arm: 4 };
+  // tsim-1: saved hwake=false applied Nov 13 (output confirms hwake=0); Nov 9 report still says on
+  const bug = M.hwakeNow({ hwake: false, applied_at: "2026-11-13T21:02:30Z", updated_at: "2026-11-13T21:02:00Z", applied_output: out }, rep);
+  assert.equal(bug.checked, false);
+  assert.equal(bug.source, "applied");
+  assert.equal(bug.report, 1);
+  assert.equal(bug.report_at, rep.at);
+  assert.equal(bug.saved_at, "2026-11-13T21:02:30Z");
+  assert.equal(bug.saved, false);
+  // confirmed applied_output is the saved value even when S.hwake is still true
+  const conf = M.hwakeNow({ hwake: true, applied_at: "2026-11-13T21:02:30Z", applied_output: "WDCFG applied 1: int=720 hb=1 sms=0 cmd=1 hwake=0 upoll=60 usol=2000" }, { at: "2026-11-09T16:04:11.000Z", hwake: 1 });
+  assert.equal(conf.checked, false);
+  assert.equal(conf.saved, false);
+  assert.equal(conf.source, "applied");
+  assert.equal(M.hwakeNow({ hwake: true, applied_at: "2026-11-13T21:02:30Z", applied_output: "hwake=0" }, null).checked, false);
+  assert.equal(M.hwakeNow({ hwake: false, applied_at: "2026-11-13T21:02:30Z", applied_output: "hwake=1" }, { at: "2026-11-09T00:00:00Z", hwake: 0 }).checked, true);
+  // newer report wins, including auto-off (hwake 2 is unchecked)
+  const auto = M.hwakeNow({ hwake: true, applied_at: "2026-11-09T00:00:00Z", applied_output: "hwake=1" }, { at: "2026-11-13T12:00:00Z", hwake: 2 });
+  assert.equal(auto.checked, false);
+  assert.equal(auto.source, "report");
+  assert.equal(auto.report, 2);
+  const newerOn = M.hwakeNow({ hwake: false, applied_at: "2026-11-09T00:00:00Z", applied_output: "hwake=0" }, { at: "2026-11-13T12:00:00Z", hwake: 1 });
+  assert.equal(newerOn.checked, true);
+  assert.equal(newerOn.source, "report");
+  assert.equal(M.hwakeNow({ hwake: true, applied_at: "2026-11-01T00:00:00Z", applied_output: "hwake=1" }, { at: "2026-11-13T00:00:00Z", hwake: 0 }).checked, false);
+  // equal timestamps: saved wins
+  const eq = M.hwakeNow({ hwake: false, applied_at: "2026-11-13T21:02:30Z", applied_output: "hwake=0" }, { at: "2026-11-13T21:02:30Z", hwake: 1 });
+  assert.equal(eq.checked, false);
+  assert.equal(eq.source, "applied");
+  // pending save (updated_at newer, applied_at null) uses S.hwake, not a leftover applied_output or the stale report
+  const pend = M.hwakeNow({ hwake: false, updated_at: "2026-11-13T22:00:00Z", applied_at: null, applied_output: "WDCFG applied 1: hwake=1" }, rep);
+  assert.equal(pend.checked, false);
+  assert.equal(pend.source, "saved");
+  assert.equal(pend.saved, false);
+  assert.equal(pend.saved_at, "2026-11-13T22:00:00Z");
+  assert.equal(M.hwakeNow({ updated_at: "2026-11-13T22:00:00Z", applied_at: null, applied_output: "hwake=0" }, { at: "2026-11-09T00:00:00Z", hwake: 0 }).checked, true);
+  // no report: on unless explicitly false
+  assert.equal(M.hwakeNow({}, null).checked, true);
+  assert.equal(M.hwakeNow({}, {}).source, "default");
+  assert.equal(M.hwakeNow({ hwake: false }, null).checked, false);
+  assert.equal(M.hwakeNow({}, { at: "2026-11-09T00:00:00Z", hwake: 1 }).checked, true);
+  assert.equal(M.hwakeNow({}, { at: "2026-11-09T00:00:00Z", hwake: 0 }).checked, false);
+  assert.equal(M.hwakeNow({}, { at: "2026-11-09T00:00:00Z", hwake: 2 }).checked, false);
+  const holo0 = holo;
+  kv.set("wd:tsim-1", JSON.stringify(rep));
+  kv.set("wdcfg:tsim-1", JSON.stringify({ int_min: 180, hb: true, sms: false, hwake: false, applied_at: "2026-11-13T21:02:30Z", updated_at: "2026-11-13T21:02:00Z", applied_output: out }));
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.86")).headers.get("Set-Cookie").split(";")[0];
+  const tl = await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json();
+  assert.equal(tl.watchdog.hwake_now.checked, false);
+  assert.equal(tl.watchdog.hwake_now.source, "applied");
+  assert.equal(tl.watchdog.hwake_now.report, 1);
+  assert.equal(holo, holo0, "nothing texted");
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert(/f\.hwake\.checked=W\.hwake_now\?!!W\.hwake_now\.checked:S\.hwake!==false/.test(pg));
+  assert(!pg.includes("X&&X.hwake!=null?X.hwake===1:S.hwake!==false"));
+  assert(pg.includes("auto-off (GPIO6 stayed low; tick the box to re-enable)") && pg.includes("own resets ignored") && pg.includes("last report"));
+  const expr = pg.match(/\["GPIO6 wake",(\(H=>\{[\s\S]*?\}\)\(W\.hwake_now\|\|\{\}\))\]/);
+  assert(expr, "gpio6 status expression");
+  const row = new Function("W", "X", "t", "ago", "return " + expr[1]);
+  const t = (s) => String(s || "").slice(0, 10);
+  const ago = () => "4 d ago";
+  const text = row({ hwake_now: bug }, rep, t, ago);
+  assert.match(text, /^off · applied 2026-11-13/);
+  assert.match(text, /last report \(2026-11-09/);
+  assert.match(text, /said on/);
+  assert.match(text, /counted 4/);
+  assert.match(text, /while awake 1/);
+  assert.match(text, /ignored 1/);
+  assert.match(text, /own resets ignored 0/);
+  assert.match(text, /not armed 2/);
+  assert.match(text, /last sleep: armed/);
+  const autoText = row({ hwake_now: auto }, { at: "2026-11-13T12:00:00Z", hwake: 2, hw_wakes: 3, hw_ignored: 0, hw_skipped: 1, hw_arm: 1 }, t, () => "1 h ago");
+  assert.match(autoText, /^auto-off \(GPIO6 stayed low; tick the box to re-enable\) · 2026-11-13/);
+  assert.match(autoText, /counted 3/);
+  assert.equal(holo, holo0, "page read texted nothing");
+  console.log("GPIO6 checkbox stale-report tests OK");
+}

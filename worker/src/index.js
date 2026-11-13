@@ -1309,6 +1309,25 @@ export function upollNow(cfg, last) {
   const reportNewer = !!(report && reportAt && appliedAt && String(reportAt) > String(appliedAt));
   return { running: reportNewer ? report : (saved || report), saved, waiting: !!(saved && !appliedAt) };
 }
+// GPIO6 checkbox. A save whose applied_at (else updated_at) is newer than the watchdog report wins;
+// equal timestamps keep the save, same comparison as upollNow. A newer report wins: hwake 1 is on,
+// 0 is off, 2 (auto-off, GPIO6 stayed low) is unchecked. Once applied_at is set, hwake=0|1 in
+// applied_output is the saved value. A pending save uses S.hwake and ignores a leftover applied_output.
+export function hwakeNow(cfg, last) {
+  const S = cfg || {};
+  const reportAt = (last && last.at) || null;
+  const report = last && typeof last.hwake === "number" && Number.isFinite(last.hwake) ? last.hwake : null;
+  const savedAt = S.applied_at || S.updated_at || null;
+  let saved = S.hwake !== false;
+  if (S.applied_at && typeof S.applied_output === "string") {
+    const m = S.applied_output.match(/\bhwake=([01])\b/);
+    if (m) saved = m[1] === "1";
+  }
+  const reportNewer = !!(report != null && reportAt && savedAt && String(reportAt) > String(savedAt));
+  const useReport = reportNewer || (report != null && !savedAt);
+  const source = useReport ? "report" : savedAt ? (S.applied_at ? "applied" : "saved") : "default";
+  return { checked: useReport ? report === 1 : saved, source, report, report_at: reportAt, saved_at: savedAt, saved };
+}
 // Heartbeat body {"type":"heartbeat","stage":..,"sms_waiting":n,"wd":{int,hb,sms,chk,ok,soft,hard,fail,fails,next,ev:[[ago_s,stage,result,secs],...]}}
 export function parseHeartbeat(t, receivedAt = new Date().toISOString()) {
   const w = t && typeof t.wd === "object" && t.wd ? t.wd : {};
@@ -2040,7 +2059,7 @@ async function deviceApi(request, env, dev, action) {
     const wdq = (cmds || []).find((c) => /^wdcfg\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent"));
     const wdSettings = { ...DEFAULT_WD, ...(wdCfgS || {}) };
     const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW), lp_supported: fwAtLeast(latest && latest.fw, LP_FW),
-      upoll_now: upollNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
+      upoll_now: upollNow(wdSettings, wdLast), hwake_now: hwakeNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
     const radio_debug = radioDebugReport({ history: history || [], mesh, latest });
     return json({ radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
@@ -3173,14 +3192,14 @@ function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||
  const ok=X&&X.stage==="ok";
  $("wdinfo").innerHTML=kv([["Running on T-SIM",dev==null?null:dev?"every "+hrs(dev):"off"],["Last check-in",X?{h:'<span class="'+(ok?"ok":X.stage==="lowbat"?"":"err")+'">'+e(WDST[X.stage]||X.stage)+"</span> · "+e(ago(X.at))}:"none yet"],["Next check (about)",X&&X.next_at?t(X.next_at)+" ET":null],
   ["Checks · OK · soft · hard · failed",L.wd_checks==null&&!X?null:[L.wd_checks??X.checks,X?X.ok:"?",L.wd_soft??X.soft,L.wd_hard??X.hard,L.wd_fail??X.fail].map(v=>v??"?").join(" · ")],
-  ["GPIO6 wake",X&&X.hwake!=null?["off","on","auto-off (GPIO6 stayed low; tick the box to re-enable)"][X.hwake]+" · counted "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+(X.hw_self!=null?" · own resets ignored "+X.hw_self:"")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+["off","auto-off","not armed (GPIO6 low)","arming failed","armed"][X.hw_arm]:""):null],
+  ["GPIO6 wake",(H=>{const has=X&&X.hwake!=null,arm=["off","auto-off","not armed (GPIO6 low)","arming failed","armed"],counts=has?" · counted "+(X.hw_wakes??"?")+(X.hw_awake!=null?" (while awake "+X.hw_awake+")":"")+" · ignored "+(X.hw_ignored??"?")+(X.hw_self!=null?" · own resets ignored "+X.hw_self:"")+" · not armed "+(X.hw_skipped??"?")+(X.hw_arm!=null&&X.hw_arm>=0?" · last sleep: "+arm[X.hw_arm]:""):"",rv=typeof H.report==="number"?H.report:(has?X.hwake:null),said=rv===2?"auto-off":rv===1?"on":rv===0?"off":null;if(!H.source)return has?["off","on","auto-off (GPIO6 stayed low; tick the box to re-enable)"][X.hwake]+counts:null;if(!has&&H.source!=="applied"&&H.source!=="saved")return null;if(H.source==="report"&&rv!=null){const label=rv===2?"auto-off (GPIO6 stayed low; tick the box to re-enable)":said;return label+" · "+t(H.report_at||X.at)+" ET ("+ago(H.report_at||X.at)+")"+counts}let s=H.checked?"on":"off";if(H.source==="applied"&&H.saved_at)s+=" · applied "+t(H.saved_at)+" ET";else if(H.source==="saved"&&H.saved_at)s+=" · saved "+t(H.saved_at)+" ET, not applied yet";if(said&&said!==(H.checked?"on":"off"))s+=" · last report ("+t(H.report_at||X.at)+" ET, "+ago(H.report_at||X.at)+") said "+said;return s+counts})(W.hwake_now||{})],
   ["Daylight uptime check",(V=>{const U=X&&X.upoll,phrase=o=>o?(o.int_min?"every "+hrs(o.int_min)+(o.usol?" when solar ≥ "+(o.usol/1000).toFixed(1)+" V":" day and night"):"off"):null,p=phrase(V.running);return p?p+(U?" · checks "+(U.polls??"?")+" · night "+(U.night??"?")+" · low battery "+(U.lowbat??"?")+" · no reply "+(U.noreply??"?")+" · reboots found "+(U.found??"?")+(U.uptime!=null?" · repeater up "+hrs(Math.round(U.uptime/60))+(U.age_s!=null?" ("+ago(new Date(Date.parse(X.at)-U.age_s*1000).toISOString())+")":""):""):"")+(V.waiting?" · waiting for the T-SIM":""):null})(W.upoll_now||{})],
   ["Wire self-test (since T-SIM boot)",L.wire_diag?"serial reply bytes "+L.wire_diag.cli_bytes+" · GPIO6 pulses during replies "+L.wire_diag.g6_cli_edges+(L.wire_diag.cli_bytes>50&&!L.wire_diag.g6_cli_edges?" ⚠ replies arrive but GPIO6 sees nothing: the wake wire isn't reaching GPIO6":"")+" · unprompted bytes "+L.wire_diag.unsol_bytes+" · unprompted pulses "+L.wire_diag.g6_idle_edges:null],
   ["Restarts · hang resets · command fetches",X&&(X.restarts!=null||X.deadline_resets!=null)?[X.restarts,X.deadline_resets,X.cmd_fetches].map(v=>v??"?").join(" · ")+(X.cmd===false?" (fetch off)":""):null],
   ["Last recovery",X&&X.last_recovery?(X.last_recovery.stage==="hard"?"power-cycle":"AT+CFUN reset")+" · "+t(X.last_recovery.at)+" ET":"none"],["Texts waiting on the modem",X&&X.sms_waiting!=null&&X.sms_waiting>=0?X.sms_waiting:null]]);
  const EV=(X&&X.events)||[];$("wdev").innerHTML=EV.length?"<b>Recent recovery attempts</b><ul style='margin:4px 0'>"+EV.map(v=>"<li>"+e(v.stage)+": "+e(v.result)+(v.secs!=null?" ("+e(v.secs)+" s)":"")+(v.at?" · "+e(t(v.at))+" ET":"")+"</li>").join("")+"</ul>":"";
  $("wddel").innerHTML=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':W.pending?"⏳ Saved; waiting for the T-SIM's next wake":"";
- if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;f.hwake.checked=X&&X.hwake!=null?X.hwake===1:S.hwake!==false;const P=(W.upoll_now||{}).running;f.upoll.value=String(P&&P.int_min!=null?P.int_min:60);f.usol.value=((P&&P.usol!=null?P.usol:2000)/1000).toFixed(1);f.edrx.checked=!!S.edrx;f.psm.checked=!!S.psm;f.edrxv.value=/^(0000|0001|0010|0011|0100|0101)$/.test(S.edrxv)?S.edrxv:"0010";f.smesh.checked=S.smesh!==false;wdLoaded=true}}   // v1.7.9: omitted smesh stays on
+ if(!wdLoaded){const f=$("wdf");f.int.value=String(S.int_min);f.hb.checked=!!S.hb;f.sms.checked=!!S.sms;f.hwake.checked=W.hwake_now?!!W.hwake_now.checked:S.hwake!==false;const P=(W.upoll_now||{}).running;f.upoll.value=String(P&&P.int_min!=null?P.int_min:60);f.usol.value=((P&&P.usol!=null?P.usol:2000)/1000).toFixed(1);f.edrx.checked=!!S.edrx;f.psm.checked=!!S.psm;f.edrxv.value=/^(0000|0001|0010|0011|0100|0101)$/.test(S.edrxv)?S.edrxv:"0010";f.smesh.checked=S.smesh!==false;wdLoaded=true}}   // v1.7.9: omitted smesh stays on
 async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.checked,sms:f.sms.checked,send};if(!f.hwake.disabled)b.hwake=f.hwake.checked;if(!f.upoll.disabled){b.upoll=+f.upoll.value;b.usol=Math.round((+f.usol.value||0)*1000)}if(!f.edrx.disabled){b.edrx=f.edrx.checked;b.psm=f.psm.checked;b.edrxv=f.edrxv.value}if(!f.smesh.disabled)b.smesh=f.smesh.checked;   // v1.7.9
  if(send&&!confirm("Save and send ONE text now so the T-SIM wakes and applies the watchdog settings?"))return;
  const r=await post("watchdog-settings",b);const j=await rj(r);
