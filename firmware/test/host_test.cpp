@@ -1,9 +1,11 @@
 // Host test for firmware/src/hw_guard.h (v1.7.6). Run: g++ -std=c++17 -Wall -I../src host_test.cpp -o /tmp/ht && /tmp/ht
 #include "hw_guard.h"
+#include "lp_power.h"
 #include "tsim_frame.h"
 #include "wake_path.h"
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #define HW_DEBOUNCE_S 60
 
 int main() {
@@ -88,5 +90,104 @@ int main() {
   { WakeExtras cmd = wakeExtras(false, false); assert(!cmd.mesh && !cmd.diag && !cmd.sys); }
   { WakeExtras cmd = wakeExtras(false, true); assert(!cmd.mesh && !cmd.diag && cmd.sys); }
   printf("v1.7.8 host tests OK (self-reset guard, RTC step-back, SMS merge, tsim wake frames, light SMS wake, CMD vs STATUS)\n");
+
+  // 11) v1.7.9: eDRX/PSM command strings, timer encoding, WDCFG tokens, read-back classification.
+  char enc[9];
+  assert(lpTimerEncode(1, 1, enc) && !strcmp(enc, "00100001"));
+  assert(lpTimerEncode(1, 2, enc) && !strcmp(enc, "00100010"));
+  assert(!strcmp(LP_PSM_TAU, "00100001") && !strcmp(LP_PSM_ACT, "00100010"));
+  assert(!lpTimerEncode(8, 1, enc) && !lpTimerEncode(1, 32, enc));
+  char cmd[64];
+  assert(lpCedrxsCmd(cmd, sizeof(cmd), 1, "0010") > 0 && !strcmp(cmd, "AT+CEDRXS=1,4,\"0010\""));
+  assert(lpCedrxsCmd(cmd, sizeof(cmd), 0, "0010") > 0 && !strcmp(cmd, "AT+CEDRXS=0"));
+  assert(lpCedrxsCmd(cmd, sizeof(cmd), 1, "0110") < 0);   // past 81.92 s: rejected
+  assert(lpCedrxsCmd(cmd, sizeof(cmd), 1, "0010") > 0 && !strstr(cmd, "=2") && !strstr(cmd, "=3"));
+  assert(lpCpsmsCmd(cmd, sizeof(cmd), 1) > 0 && !strcmp(cmd, "AT+CPSMS=1,,,\"00100001\",\"00100010\""));
+  assert(lpCpsmsCmd(cmd, sizeof(cmd), 0) > 0 && !strcmp(cmd, "AT+CPSMS=0"));
+  assert(!strstr(cmd, "=2"));
+  LpCfg cfg; lpCfgInit(&cfg);
+  assert(cfg.edrx == 0 && cfg.psm == 0 && !strcmp(cfg.edrxv, "0010"));
+  assert(lpCfgToken(&cfg, "edrx", "1") == 1 && cfg.edrx == 1);
+  assert(lpCfgToken(&cfg, "edrx", "2") < 0);
+  assert(lpCfgToken(&cfg, "edrxv", "0101") == 1 && !strcmp(cfg.edrxv, "0101"));
+  assert(lpCfgToken(&cfg, "edrxv", "0110") < 0 && !strcmp(cfg.edrxv, "0101"));
+  assert(lpCfgToken(&cfg, "edrxv", "001") < 0);
+  assert(lpCfgToken(&cfg, "psm", "0") == 1 && cfg.psm == 0);
+  assert(lpCfgToken(&cfg, "psm", "1") == 1 && cfg.psm == 1);
+  assert(lpCfgToken(&cfg, "int", "180") == 0 && cfg.psm == 1);   // not a low-power key
+  char frag[40];
+  assert(lpAppliedFragment(frag, sizeof(frag), 1, "0101", 0) > 0 && !strcmp(frag, "edrx=1 edrxv=0101 psm=0"));
+  assert(lpAppliedFragment(frag, sizeof(frag), 0, "0110", 1) > 0 && !strcmp(frag, "edrx=0 edrxv=0010 psm=1"));
+  LpEdrxRd er;
+  assert(lpParseCedrxrdp("+CEDRXRDP: 4,\"0010\",\"0010\",\"0001\"\r\nOK\r\n", &er) && er.act == 4 && !strcmp(er.req, "0010") && !strcmp(er.nw, "0010"));
+  assert(lpParseCedrxrdp("+CEDRXRDP: 0\r\nOK\r\n", &er) && er.act == 0 && !er.nw[0]);
+  assert(lpParseCedrxrdp("+CEDRXRDP: 4,\"\",\"\",\"\"\r\nOK\r\n", &er) && er.act == 4 && !er.nw[0]);
+  assert(!lpParseCedrxrdp("ERROR\r\n", &er));
+  LpPsmRd pr;
+  assert(lpParseCpsms("+CPSMS: 1,,,\"00100001\",\"00100010\"\r\nOK\r\n", &pr) && pr.mode == 1 && !strcmp(pr.tau, "00100001") && !strcmp(pr.actt, "00100010") && pr.grant_known == 0);
+  assert(lpParseCpsms("+CPSMS: 0\r\nOK\r\n", &pr) && pr.mode == 0 && !pr.tau[0]);
+  assert(!lpParseCpsms("ERROR\r\n", &pr));
+  LpTel tel;
+  strcpy(er.req, "0010"); strcpy(er.nw, "0100"); er.act = 4;
+  strcpy(pr.tau, "00100001"); strcpy(pr.actt, "00100010");
+  lpClassify(1, "0010", &er, 1, 1, &pr, 1, &tel);
+  assert(!strcmp(tel.edrx_req, "0010") && !strcmp(tel.edrx_nw, "0100"));
+  assert(!strcmp(tel.psm_tau, "00100001") && !strcmp(tel.psm_act, "00100010") && tel.psm_grant_known == 0);
+  er.act = 0; er.nw[0] = 0;
+  lpClassify(1, "0010", &er, 1, 1, &pr, 0, &tel);
+  assert(!strcmp(tel.edrx_nw, "rej") && !strcmp(tel.psm_tau, "rej") && !strcmp(tel.psm_act, "rej"));
+  assert(!strcmp(tel.edrx_req, "0010"));
+  lpClassify(0, "0010", &er, 0, 0, &pr, 0, &tel);
+  assert(!strcmp(tel.edrx_nw, "none") && !strcmp(tel.edrx_req, "0010"));
+  er.act = 4; er.nw[0] = 0; er.req[0] = 0; pr.tau[0] = 0; pr.actt[0] = 0;
+  lpClassify(0, "0010", &er, 1, 0, &pr, 1, &tel);
+  assert(!strcmp(tel.edrx_nw, "none") && !strcmp(tel.psm_tau, "none") && !strcmp(tel.psm_act, "none"));
+  assert(!strcmp(lpJsonTok("00100001", "none"), "00100001"));
+  assert(!strcmp(lpJsonTok("<script>", "none"), "none"));
+  assert(!strcmp(lpJsonTok("001000011", "none"), "none"));
+  // STATUS that already posted its report skips the second AT pass. CMD still skips. wakeExtras is unchanged.
+  assert(!wakeRunPostDiag(true, true));
+  assert(wakeRunPostDiag(true, false));
+  assert(!wakeRunPostDiag(false, false));
+  assert(!wakeRunPostDiag(false, true));
+  { WakeExtras st = wakeExtras(true, false); assert(st.mesh && st.diag && st.sys); }
+  assert(smsCatchupBeforeSleep(true, false, false));
+  assert(!smsCatchupBeforeSleep(false, false, false));
+  assert(!smsCatchupBeforeSleep(true, true, false));
+  assert(!smsCatchupBeforeSleep(true, false, true));
+  printf("v1.7.9 host tests OK (eDRX/PSM commands, WDCFG tokens, CEDRXRDP/CPSMS parse, awake-path)\n");
+
+  // 12) v1.7.9: scheduled mesh skip, CFGSNAP upload policy, STATUS AUTO merge.
+  assert(statusIsScheduled("STATUS AUTO") && statusIsScheduled("status auto"));
+  assert(!statusIsScheduled("STATUS") && !statusIsScheduled("STATUS AUTO ACK") && !statusIsScheduled(nullptr));
+  assert(statusFetchesMesh(false, 0) && statusFetchesMesh(false, 1));
+  assert(statusFetchesMesh(true, 1) && statusFetchesMesh(true, 2));
+  assert(!statusFetchesMesh(true, 0));
+  assert(cfgsnapShouldUpload(true, false, false));
+  assert(cfgsnapShouldUpload(false, true, false));
+  assert(cfgsnapShouldUpload(false, false, true));
+  assert(!cfgsnapShouldUpload(false, false, false));
+  assert(cfgsnapShouldCollect(true, false, true, false, false));
+  assert(!cfgsnapShouldCollect(false, false, false, true, true));
+  assert(!cfgsnapShouldCollect(false, true, true, true, false));
+  assert(cfgsnapShouldCollect(false, true, false, true, false));
+  assert(cfgsnapShouldCollect(false, true, false, false, true));
+  assert(!cfgsnapShouldCollect(false, true, false, false, false));
+  const uint32_t h0 = 2166136261u;
+  assert(cfgsnapHash(cfgsnapHash(h0, "ab"), "c") != cfgsnapHash(cfgsnapHash(h0, "a"), "bc"));
+  assert(cfgsnapHash(cfgsnapHash(h0, "get name"), "-> x") == cfgsnapHash(cfgsnapHash(h0, "get name"), "-> x"));
+  assert(cfgsnapHash(cfgsnapHash(h0, "get name"), "-> x") != cfgsnapHash(cfgsnapHash(h0, "get name"), "-> y"));
+  uint32_t o1 = cfgsnapHash(cfgsnapHash(h0, "get a"), "1");
+  o1 = cfgsnapHash(cfgsnapHash(o1, "get b"), "2");
+  uint32_t o2 = cfgsnapHash(cfgsnapHash(h0, "get b"), "2");
+  o2 = cfgsnapHash(cfgsnapHash(o2, "get a"), "1");
+  assert(o1 != o2);
+  assert(smsMergeable("STATUS AUTO") && smsMergeable("status auto"));
+  const char *seenSt[] = {"STATUS"};
+  assert(!smsIsDup(seenSt, 1, "STATUS AUTO"));
+  const char *seenAu[] = {"STATUS AUTO"};
+  assert(smsIsDup(seenAu, 1, "status auto"));
+  assert(!smsIsDup(seenAu, 1, "STATUS"));
+  printf("v1.7.9 host tests OK (smesh, cfgsnap hash, STATUS AUTO)\n");
   return 0;
 }

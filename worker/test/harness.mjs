@@ -8,7 +8,7 @@ const STATE = {
   list: async ({ prefix }) => ({ keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })) }),
 };
 const env = { STATE, HOLOGRAM_API_KEY: "k", ADMIN_TOKEN: "admintok", SESSION_SECRET: "sess-secret-for-tests" };
-let holo = 0, holoOk = true, ghList = 0;
+let holo = 0, holoOk = true, ghList = 0, holoLast = "";
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
   if (url.includes("api.github.com") && url.includes("tsim-remote-updater")) return new Response(JSON.stringify({ tag_name: "v1.6.0", assets: [
@@ -24,7 +24,7 @@ globalThis.fetch = async (url, init = {}) => {
     return new Response(JSON.stringify({ tag_name: T, published_at: "2026-10-18T20:30:00Z", body: "MeshCore v1.18.0 + power saving", assets: names.map((n, i) => ({ id: 100 + i, name: n, browser_download_url: D + n })) })); }
   if (url.includes("api.github.com")) return new Response(JSON.stringify({ tag_name: "PowerSaving17.2", assets: [
     { id: 5, name: "Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin", browser_download_url: "https://github.com/x/y/releases/download/t/Heltec_v3_repeater-PowerSaving17.2.0-upgrade.bin" }] }));
-  if (url.includes("hologram")) { holo++; assert.equal(JSON.parse(init.body).deviceid, 1234567);
+  if (url.includes("hologram")) { holo++; const hb = JSON.parse(init.body); assert.equal(hb.deviceid, 1234567); holoLast = hb.body;
     return new Response(JSON.stringify({ success: holoOk }), { status: holoOk ? 200 : 400 }); }
   throw new Error("unexpected fetch " + url);
 };
@@ -1830,6 +1830,57 @@ console.log("serial.ondemand tests OK");
   console.log("v1.7.8 poll schedule tests OK");
 }
 
+// ---------- v1.7.9: optional eDRX/PSM on WDCFG, telemetry fields, firmware gate ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.wdCfgCmd(M.DEFAULT_WD), "WDCFG int=180 hb=1 sms=0", "unchanged without edrx/psm/smesh");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, smesh: true }), "WDCFG int=180 hb=1 sms=0 smesh=1");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, smesh: false }), "WDCFG int=180 hb=1 sms=0 smesh=0");
+  assert.equal(M.validateWd({ smesh: true }, { int_min: 60 }).smesh, true);
+  assert.deepEqual(M.validateWd({}, { smesh: false }), { int_min: 180, hb: true, sms: false, smesh: false });
+  assert.equal(M.scheduledStatusText("tsim-updater 1.7.8"), "STATUS");
+  assert.equal(M.scheduledStatusText("tsim-updater 1.7.9"), "STATUS AUTO");
+  assert.equal(M.scheduledStatusText(""), "STATUS");
+  assert.equal(M.scheduledStatusText(undefined), "STATUS");
+  assert.deepEqual(M.validateWd({}, {}), { int_min: 180, hb: true, sms: false });
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, edrx: true, edrxv: "0010", psm: false }), "WDCFG int=180 hb=1 sms=0 edrx=1 edrxv=0010 psm=0");
+  assert.equal(M.wdCfgCmd({ ...M.DEFAULT_WD, edrx: false, psm: true }), "WDCFG int=180 hb=1 sms=0 edrx=0 psm=1");
+  assert.deepEqual(M.validateWd({}, { edrx: true, edrxv: "0101", psm: false }), { int_min: 180, hb: true, sms: false, edrx: true, edrxv: "0101", psm: false });
+  assert.deepEqual(M.validateWd({}, { edrxv: "0010" }), { int_min: 180, hb: true, sms: false, edrxv: "0010" }, "cycle alone does not turn eDRX on");
+  assert.throws(() => M.validateWd({}, { edrxv: "0110" }));
+  assert.throws(() => M.validateWd({}, { edrxv: "001" }));
+  assert.equal(M.validateWd({ edrx: false, psm: false }, { int_min: 60 }).edrx, false, "kept");
+  const tf = M.tlFields({ fw: "tsim-updater 1.7.9", wdi: 180, edrx: 1, edrx_req: "0010", edrx_nw: "0100", psm: 0, psm_tau: "none", psm_act: "none", awake_ms: 12345 });
+  assert.equal(tf.wd_int, 180); assert.equal(tf.edrx, 1); assert.equal(tf.edrx_nw, "0100"); assert.equal(tf.psm, 0); assert.equal(tf.awake_ms, 12345);
+  assert.equal(M.tlFields({ edrx_nw: "<script>", psm_tau: "00100001", awake_ms: -1 }).edrx_nw, undefined);
+  assert.equal(M.tlFields({ psm_tau: "00100001" }).psm_tau, "00100001");
+  assert.deepEqual(M.tlFields({ fw: "tsim-updater 1.7.8", wdi: 180 }), { fw: "tsim-updater 1.7.8", wd_int: 180 });
+  const dev = JSON.parse(kv.get("device:tsim-1")), holo0 = holo;
+  const c = (await login("tsim-1", "device-one-password", "7.7.7.79")).headers.get("Set-Cookie").split(";")[0];
+  const P = (a2, b) => call("/api/d/tsim-1/" + a2, { method: "POST", headers: { Cookie: c, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+  const TEL = async () => (await (await call("/api/d/tsim-1/telemetry", { headers: { Cookie: c } })).json());
+  const ingest = (b) => call("/ingest/tsim-1", { method: "POST", headers: { "X-Device-Key": dev.ingest_key }, body: JSON.stringify(b) });
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.8" } })).status, 200);
+  let tl = await TEL(); assert.equal(tl.watchdog.lp_supported, false);
+  assert.equal((await P("watchdog-settings", { int_min: 180, edrx: true })).status, 409);
+  assert.equal((await P("watchdog-settings", { int_min: 180, smesh: false })).status, 409);
+  assert.equal((await ingest({ type: "event", msg: "x", tl: { fw: "tsim-updater 1.7.9", edrx: 0, edrx_req: "0010", edrx_nw: "none", psm: 0, psm_tau: "none", psm_act: "none", awake_ms: 42000 } })).status, 200);
+  tl = await TEL(); assert.equal(tl.watchdog.lp_supported, true); assert.equal(tl.latest.edrx, 0); assert.equal(tl.latest.awake_ms, 42000); assert.equal(tl.latest.edrx_nw, "none");
+  let r = await P("watchdog-settings", { int_min: 180, hb: true, sms: false, edrx: true, edrxv: "0010", psm: false });
+  assert.equal(r.status, 200); let j = await r.json();
+  assert.match(j.queued.cmd, /^WDCFG int=180 hb=1 sms=0\b/);
+  assert.match(j.queued.cmd, / edrx=1 edrxv=0010 psm=0$/);
+  assert.equal((await P("watchdog-settings", { edrxv: "0110" })).status, 400);
+  const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
+  assert(pg.includes('name="edrx"') && pg.includes('name="psm"') && pg.includes('name="edrxv"') && pg.includes('name="smesh"'));
+  r = await P("watchdog-settings", { int_min: 180, hb: true, sms: false, smesh: false });
+  assert.equal(r.status, 200); j = await r.json();
+  assert.match(j.queued.cmd, / smesh=0$/);
+  for (const mm of pg.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  assert.equal(holo, holo0, "nothing texted");
+  console.log("v1.7.9 eDRX/PSM tests OK");
+}
+
 // ---------- radio debugger: read-only verdicts from stored samples ----------
 {
   const iso = (ms) => new Date(ms).toISOString();
@@ -1894,4 +1945,28 @@ console.log("serial.ondemand tests OK");
   const pg = await (await call("/d/tsim-1", { headers: { Cookie: c } })).text();
   assert(pg.includes("Radio debugger") && pg.includes("function showRd"));
   console.log("radio debugger tests OK");
+}
+
+// v1.7.9: scheduled cron body follows the firmware already on the device.
+{
+  await admin("/admin/devices", "POST", { id: "sch179", name: "Sch", hologram_device_id: "1234567" });
+  for (const k of [...kv.keys()]) {
+    if (!k.startsWith("settings:") || k === "settings:sch179") continue;
+    const s = JSON.parse(kv.get(k));
+    if (s.schedule_hours) { s.schedule_hours = 0; kv.set(k, JSON.stringify(s)); }
+  }
+  kv.set("settings:sch179", JSON.stringify({ console_enabled: false, schedule_hours: 12 }));
+  const due = async (fw) => {
+    const st = { last_sched_ts: 1, last_send_ts: 0 };
+    kv.set("state:sch179", JSON.stringify(st));
+    if (fw) kv.set("telem:sch179:latest", JSON.stringify({ fw })); else kv.delete("telem:sch179:latest");
+    holoLast = "";
+    const res = await runSchedules(env, Date.now());
+    assert.equal(res.filter((x) => x.id === "sch179").length, 1);
+    return holoLast;
+  };
+  assert.equal(await due(""), "STATUS");
+  assert.equal(await due("tsim-updater 1.7.8"), "STATUS");
+  assert.equal(await due("tsim-updater 1.7.9"), "STATUS AUTO");
+  console.log("v1.7.9 scheduled STATUS AUTO tests OK");
 }

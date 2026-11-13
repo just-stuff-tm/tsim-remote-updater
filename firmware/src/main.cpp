@@ -19,6 +19,7 @@
 #include "hw_guard.h"   // v1.7.6 self-reset guard + SMS merge (host-tested)
 #include "tsim_frame.h" // v1.7.7 @TSIM frame parser (host-tested)
 #include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras (host-tested)
+#include "lp_power.h"   // v1.7.9 eDRX / PSM parsing (host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -75,7 +76,15 @@ static int s_log_head = 0;
 static int s_log_count = 0;
 static char s_last_result[160] = "none";
 static esp_sleep_wakeup_cause_t s_wake_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
+// v1.7.9: text (ext0), GPIO6 (ext1) and timer wakes are in the field. A cold/USB power-on is not.
+static bool fieldWake() {
+  return s_wake_cause == ESP_SLEEP_WAKEUP_EXT0
+      || s_wake_cause == ESP_SLEEP_WAKEUP_EXT1
+      || s_wake_cause == ESP_SLEEP_WAKEUP_TIMER;
+}
 static bool s_pdp_up = false;
+static bool s_modem_ready = false;  // v1.7.9: AT has answered this wake (gates the one SMS catch-up)
+static bool s_sms_catch_done = false;  // v1.7.9: that catch-up runs once per boot, not in a loop
 static bool s_busy_update = false;
 static bool s_tcp_busy = false;  // true while TLS/TCP socket owns the modem AT UART
 
@@ -227,6 +236,18 @@ RTC_DATA_ATTR static int64_t s_up_due = 0;
 RTC_DATA_ATTR static uint32_t s_dg_clib = 0, s_dg_g6c = 0, s_dg_ub = 0, s_dg_g6i = 0;
 RTC_DATA_ATTR static uint8_t s_hw_armres = 255;
 RTC_DATA_ATTR static int64_t s_hw_own = 0;   // v1.7.3: rtcNow() when the T-SIM itself last reset the Heltec (its boot log isn't a "reboot")
+// v1.7.9 low-power (NVS "tsimwd" holds the settings; these remember what was last sent and the last read-back).
+// s_lp_need is set by a full modem reset or CFUN, because those can drop CEDRXS/CPSMS. Deep sleep does not.
+#define LP_MAGIC 0xE9
+RTC_DATA_ATTR static uint8_t s_lp_need = 0;
+RTC_DATA_ATTR static uint8_t s_lp_magic = 0;
+RTC_DATA_ATTR static uint8_t s_lp_sent_edrx = 0;
+RTC_DATA_ATTR static uint8_t s_lp_sent_psm = 0;
+RTC_DATA_ATTR static char s_lp_sent_v[5] = "";
+RTC_DATA_ATTR static LpTel s_lp_tel = {};
+RTC_DATA_ATTR static uint32_t s_prev_awake_ms = 0;  // millis() at the previous esp_deep_sleep_start, reported next wake
+static int s_edrx = 0, s_psm = 0;                    // defaults OFF: v1.7.8 behavior until WDCFG says otherwise
+static char s_edrxv[5] = LP_EDRX_DEFAULT;
 // v1.7.6: the self-reset guard no longer depends on the RTC clock alone. The awake monitor's state carries a
 // millis()-timed "self reset pending" flag that absorbs the first boot of the Heltec after heltecReboot(); the
 // console "reboot" relay gets the same. s_hw_self counts boots absorbed as the T-SIM's own (NVS "hwo").
@@ -313,6 +334,8 @@ static bool modemAT(const char *cmd, uint32_t timeout_ms = 3000) {
 }
 
 static bool modemPowerOn() {
+  s_lp_need = 1;          // v1.7.9: RESET + PWRKEY can drop eDRX/PSM; re-send once we are registered
+  s_modem_ready = false;
   pinMode(MODEM_DTR_PIN, OUTPUT);
   digitalWrite(MODEM_DTR_PIN, LOW);
   pinMode(MODEM_RESET_PIN, OUTPUT);
@@ -331,7 +354,7 @@ static bool modemPowerOn() {
   ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
   delay(500);
   for (int i = 0; i < 40; i++) {
-    if (modemAT("AT", 1000)) { logf("Modem online"); return true; }
+    if (modemAT("AT", 1000)) { s_modem_ready = true; logf("Modem online"); return true; }
     if (i == 20) {
       digitalWrite(MODEM_PWRKEY_PIN, HIGH);
       delay(MODEM_PWR_PULSE_MS);
@@ -731,10 +754,11 @@ static bool ingestPostTls(const char *json) {
 static void markOtaValidIfPending(const char *why);
 // v1.7.0: every post carries a compact telemetry snapshot ("tl") so the dashboard's T-SIM card stays current.
 static size_t telemJson(char *out, size_t cap);
-static char s_post_buf[4096 + 512];
+static char s_post_buf[4096 + 1024];  // v1.7.9: telemJson grew (eDRX/PSM/awake_ms); keep room on a large post
 static bool ingestSendRaw(const char *json) {
   size_t L = strlen(json);
-  if (L > 1 && L + 400 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
+  // v1.7.9: reserve ~768 B so the tl block is not started and then dropped.
+  if (L > 1 && L + 768 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
     memcpy(s_post_buf, json, L - 1); size_t o = L - 1;
     o += telemJson(s_post_buf + o, sizeof(s_post_buf) - o - 2);
     s_post_buf[o++] = '}'; s_post_buf[o] = 0; json = s_post_buf;
@@ -1114,8 +1138,8 @@ static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty
       ingestSendBig(s_mesh_body); ran++; continue;
     }
     if (clean && strncasecmp(cmd, "WDCFG ", 6) == 0) {  // v1.7.1 modem watchdog config (Worker system command)
-      static char wo[200]; wdApplyCfg(cmd + 6, wo, sizeof(wo));
-      static char we[300]; jsonEsc(we, sizeof(we), wo); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      static char wo[400]; wdApplyCfg(cmd + 6, wo, sizeof(wo));  // v1.7.9: reply also carries edrx=/psm=
+      static char we[480]; jsonEsc(we, sizeof(we), wo); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, we);
       ingestSendBig(s_mesh_body); ran++; continue;
     }
@@ -1147,6 +1171,7 @@ static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty
 // ?sys=1 runs only when wakeExtras says a system command is still pending. After this
 // fetch nothing is: an empty body had nothing queued, and a non-empty body already ran
 // the system lines, so an empty ?sys=1 is not issued.
+// v1.7.9: no extra wait after the replies. goToSleep does one unread-SMS pass, then sleeps.
 static bool s_did_cmd = false, s_did_status = false;
 static void finishCmdWake(bool queue_empty) {
   WakeExtras ex = wakeExtras(false, false);
@@ -2243,6 +2268,7 @@ RTC_DATA_ATTR static uint8_t s_wd_fails = 0;      // consecutive failed checks (
 // restart after WD_RESTART_FAILS failed recoveries in a row, and NVS counters for restarts and awake-deadline resets.
 #define WD_RESTART_FAILS   3
 static bool s_wd_cmd = true;
+static bool s_smesh = true;   // v1.7.9: WDCFG smesh=1 (default). 0 skips mesh on scheduled STATUS only.
 static uint32_t s_wd_rst = 0, s_wd_dlx = 0, s_wd_cmdn = 0;
 // v1.7.3 Heltec-reboot wake (GPIO6, ext1 any-low). WDCFG hwake=0|1 (default on). Accepted wakes are rate limited (60 s
 // apart, 6 per rolling 24 h); stuck-low / too-soon / over-limit wakes count as spurious and HW_SPUR_MAX in a row turn it
@@ -2318,6 +2344,17 @@ static size_t telemJson(char *out, size_t cap) {
   if (o < cap && now > 1700000000LL) o += snprintf(out + o, cap - o, ",\"ts\":%lld", (long long)now);
   if (o < cap && s_gc_at > 0) o += snprintf(out + o, cap - o, ",\"glat\":%.6f,\"glon\":%.6f,\"gsats\":%d,\"gat\":%lld", s_gc_lat, s_gc_lon, s_gc_sats, (long long)s_gc_at);
   if (o < cap) o += snprintf(out + o, cap - o, ",\"dg\":[%u,%u,%u,%u]", (unsigned)s_dg_clib, (unsigned)s_dg_g6c, (unsigned)s_dg_ub, (unsigned)(s_dg_g6i + (s_g6_on && s_g6_edges > s_g6_cli_wake ? s_g6_edges - s_g6_cli_wake : 0)));   // v1.7.5 wire diagnostics
+  // v1.7.9: eDRX/PSM settings plus the last read-back. psm_tau/psm_act are the REQUESTED values
+  // (A76XX AT+CPSMS? does not report the network grant). awake_ms is the previous wake.
+  if (o < cap) o += snprintf(out + o, cap - o,
+    ",\"edrx\":%d,\"edrx_req\":\"%s\",\"edrx_nw\":\"%s\",\"psm\":%d,\"psm_tau\":\"%s\",\"psm_act\":\"%s\",\"awake_ms\":%lu",
+    s_edrx ? 1 : 0,
+    lpJsonTok(s_lp_tel.edrx_req, s_edrxv[0] ? s_edrxv : LP_EDRX_DEFAULT),
+    lpJsonTok(s_lp_tel.edrx_nw, "none"),
+    s_psm ? 1 : 0,
+    lpJsonTok(s_lp_tel.psm_tau, "none"),
+    lpJsonTok(s_lp_tel.psm_act, "none"),
+    (unsigned long)s_prev_awake_ms);
   s_hrp_sent = 0;
   if (o < cap && s_hrp_n) {  // v1.7.4 pending Heltec-reboot report: count, seconds ago (-1 = before a cold boot), source
     long long ago = s_hrp_t > 0 && s_hrp_t <= now ? (long long)(now - s_hrp_t) : -1;
@@ -2360,7 +2397,7 @@ static void doStatusReport(void) {
     (unsigned long)(millis()/1000UL), (int)s_wake_cause, (unsigned)ESP.getFreeHeap(),
     (unsigned)(tot - used), (unsigned)tot, s_last_result,
     g_apn, (unsigned long)(AWAKE_WINDOW_MS/1000UL));
-  Serial.println(s_text_body);
+  if (!fieldWake()) Serial.println(s_text_body);   // v1.7.9: USB copy only. Field wakes already post this body.
   {
     int csqv = -1, rsrq = 0, rsrp = 0, reg = -1;
     char *p = strstr(csq, "+CSQ:"); if (p) sscanf(p, "+CSQ: %d", &csqv);
@@ -2457,8 +2494,18 @@ static bool doUpdate(const char *url, bool flash_too) {
 // list of read-only "get" commands from the Worker (/api/dev/<id>/cfglist), runs them over serial, and posts the
 // replies as {"type":"cfgsnap"}. Unsent parts are kept in LittleFS and retried on the next wake.
 #define CFGSNAP_Q "/cfgsnap.q"
-static bool s_cs_en = false, s_cs_now = false; static uint32_t s_cs_int_h = 24; static int64_t s_cs_last = 0;
-static void csLoad() { Preferences p; p.begin("tsimcs", true); s_cs_en = p.getBool("en", false); s_cs_int_h = p.getUInt("int", 24); s_cs_last = p.getLong64("last", 0); p.end(); if (s_cs_int_h < 1 || s_cs_int_h > 168) s_cs_int_h = 24; }
+#define CFGSNAP_B "/cfgsnap.b"   // v1.7.9: build file for one snapshot. Not the retry queue.
+#define CFGSNAP_HASH_INIT 2166136261u
+static bool s_cs_en = false, s_cs_now = false, s_cs_have = false;
+static uint32_t s_cs_int_h = 24, s_cs_hash = 0;
+static int64_t s_cs_last = 0;
+static void csLoad() {
+  Preferences p; p.begin("tsimcs", true);
+  s_cs_en = p.getBool("en", false); s_cs_int_h = p.getUInt("int", 24); s_cs_last = p.getLong64("last", 0);
+  s_cs_hash = p.getUInt("hash", 0); s_cs_have = p.getBool("have", false);   // v1.7.9
+  p.end();
+  if (s_cs_int_h < 1 || s_cs_int_h > 168) s_cs_int_h = 24;
+}
 static void csApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimcs", false);
   char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0; char *save = nullptr; int n = 0;
@@ -2483,18 +2530,51 @@ static void csFlush() {
   while (f.available()) { size_t n = f.readBytesUntil('\n', s_mesh_body, sizeof(s_mesh_body) - 1); s_mesh_body[n] = 0; trimInPlace(s_mesh_body); if (s_mesh_body[0] && !ingestSendBig(s_mesh_body)) { all = false; break; } }
   f.close(); if (all) LittleFS.remove(CFGSNAP_Q);
 }
+// v1.7.9: one snapshot is built in /cfgsnap.b, then posted or dropped. A hash match never deletes /cfgsnap.q.
+static bool csBufAppend(const char *body) {
+  File f = LittleFS.open(CFGSNAP_B, "a", true);
+  if (!f) f = LittleFS.open(CFGSNAP_B, "a");
+  if (!f) return false;
+  f.println(body); f.close();
+  return true;
+}
+static void csBufSend() {
+  if (!LittleFS.exists(CFGSNAP_B)) return;
+  File f = LittleFS.open(CFGSNAP_B, "r"); if (!f) return;
+  while (f.available()) {
+    size_t n = f.readBytesUntil('\n', s_mesh_body, sizeof(s_mesh_body) - 1);
+    s_mesh_body[n] = 0; trimInPlace(s_mesh_body);
+    if (s_mesh_body[0]) csSendOrKeep(s_mesh_body);
+  }
+  f.close();
+  LittleFS.remove(CFGSNAP_B);
+}
+static void csSaveStamp(uint32_t hash) {
+  s_cs_last = rtcNow(); s_cs_hash = hash; s_cs_have = true;
+  Preferences p; p.begin("tsimcs", false);
+  p.putLong64("last", s_cs_last); p.putUInt("hash", hash); p.putBool("have", true);
+  p.end();
+}
 static void cfgSnapshot() {
-  csFlush();
+  csFlush();   // v1.7.9: retry queue first. A later hash match does not touch it.
   int64_t now = rtcNow();
-  bool due = s_cs_en && (s_cs_last <= 0 || now < s_cs_last || now - s_cs_last >= (int64_t)s_cs_int_h * 3600);
-  if (!s_cs_now && (!due || s_lb_state == 1)) return;   // battery protection: only on explicit request
+  bool refresh = s_cs_now;
+  bool interval_due = s_cs_en && (s_cs_last <= 0 || (now >= s_cs_last && now - s_cs_last >= (int64_t)s_cs_int_h * 3600));
+  bool clock_back = s_cs_en && s_cs_last > 0 && now < s_cs_last;
+  // v1.7.9: low battery still blocks unless the dashboard asked (s_cs_now).
+  if (!cfgsnapShouldCollect(refresh, s_cs_en, s_lb_state == 1, interval_due, clock_back)) return;
   s_cs_now = false;
+  if (LittleFS.exists(CFGSNAP_B)) LittleFS.remove(CFGSNAP_B);   // crash leftover is an incomplete build
   static char url[240]; snprintf(url, sizeof(url), "%s/api/dev/%s/cfglist", g_worker_url, g_device_id);
   if (httpsGetTls(url, s_cmd_list, sizeof(s_cmd_list)) != 200) { logf("cfgsnap: list fetch failed"); return; }
   static char esc[CLI_OUT_MAX + 256], ec[200];
   int part = 0, items = 0, noreply = 0, total = 0; uint32_t t0 = millis();
+  uint32_t h = CFGSNAP_HASH_INIT; bool spilled = false;
   size_t o = 0; char *save = nullptr;
   auto head = [&]() { o = snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cfgsnap\",\"fw\":\"%s\",\"part\":%d%s,\"items\":[", FW_VERSION, part, now > 1700000000LL ? "" : ""); items = 0; };
+  auto keepPart = [&]() {
+    if (!csBufAppend(s_mesh_body)) { csSendOrKeep(s_mesh_body); spilled = true; }   // v1.7.9: a full disk still posts
+  };
   head();
   for (char *line = strtok_r(s_cmd_list, "\n", &save); line && total < 48; line = strtok_r(nullptr, "\n", &save)) {
     trimInPlace(line); if (!line[0]) continue;
@@ -2504,15 +2584,22 @@ static void cfgSnapshot() {
     if (!strncasecmp(line, "region ", 7) && strcasecmp(line, "region home") && strcasecmp(line, "region default")) continue;
     if (millis() - t0 > 180000UL || noreply >= 3) break;
     bool ok = heltecCli(line, s_cli_out, sizeof(s_cli_out), 4000); noreply = ok ? 0 : noreply + 1; total++;
+    h = cfgsnapHash(h, line); h = cfgsnapHash(h, ok ? s_cli_out : "");   // v1.7.9: hash the reply, not the JSON part cut
     jsonEsc(esc, sizeof(esc), ok ? s_cli_out : ""); jsonEsc(ec, sizeof(ec), line);
-    if (o + strlen(esc) + strlen(ec) + 64 > 3400) { snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "]}"); csSendOrKeep(s_mesh_body); part++; head(); }
+    if (o + strlen(esc) + strlen(ec) + 64 > 3400) { snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "]}"); keepPart(); part++; head(); }
     o += snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "%s[\"%s\",\"%s\"]", items ? "," : "", ec, esc); items++;
   }
   heltecCliEnd();
   snprintf(s_mesh_body + o, sizeof(s_mesh_body) - o, "],\"final\":true,\"count\":%d%s}", total, noreply >= 3 ? ",\"error\":\"no reply from Heltec\"" : "");
-  csSendOrKeep(s_mesh_body);
-  if (total && noreply < 3) { s_cs_last = rtcNow(); Preferences p; p.begin("tsimcs", false); p.putLong64("last", s_cs_last); p.end(); }
-  logf("cfgsnap: %d command(s) in %lus", total, (unsigned long)((millis() - t0) / 1000));
+  keepPart();
+  bool clean = total && noreply < 3;
+  bool changed = !s_cs_have || h != s_cs_hash;
+  // A failed read still posts (the dashboard sees the error) and stays due. An unchanged clock step-back does not.
+  bool upload = !clean || spilled || cfgsnapShouldUpload(changed, refresh, interval_due);
+  if (upload) csBufSend();
+  else { if (LittleFS.exists(CFGSNAP_B)) LittleFS.remove(CFGSNAP_B); logf("v1.7.9: cfgsnap unchanged, skip upload"); }
+  if (clean) csSaveStamp(h);   // rebase even when the post was skipped, so a clock step-back collects once
+  logf("cfgsnap: %d command(s) in %lus%s", total, (unsigned long)((millis() - t0) / 1000), upload ? "" : " (not posted)");
 }
 
 // -------------------- v1.7.1 modem watchdog (self-recovery) --------------------
@@ -2525,7 +2612,8 @@ static void cfgSnapshot() {
 // A heartbeat is posted to the dashboard after a recovery, after a failure that was not reported yet, and (hb=1,
 // default) after every check. Queued dashboard commands are never fetched on a watchdog wake. Texts already stored
 // on the modem are processed only when sms=1 (default off). No SMS is ever sent.
-static void processSmsInbox();
+static void processSmsInbox(bool unread_only = false);
+static void lpApply();   // v1.7.9: defined with the watchdog, after wdRegistered()
 static void wdSave() {
   Preferences p; p.begin("tsimwd", false);
   p.putUInt("chk", s_wd_chk); p.putUInt("ok", s_wd_ok); p.putUInt("soft", s_wd_soft); p.putUInt("hard", s_wd_hard); p.putUInt("fail", s_wd_fail);
@@ -2549,6 +2637,9 @@ static void wdLoad() {
   s_hw_aw = p.getUInt("hwa", 0); s_hw_up = p.getUInt("hwu", 0); s_hw_self = p.getUInt("hwo", 0); s_hrp_n = p.getUInt("hrpn", 0); s_hrp_t = p.getLong64("hrpt", 0);
   { String hs = p.getString("hrps", ""); strncpy(s_hrp_src, hs.c_str(), sizeof(s_hrp_src) - 1); s_hrp_src[sizeof(s_hrp_src) - 1] = 0; }
   s_wd_cmd = p.getBool("cmd", true); s_wd_rst = p.getUInt("rst", 0); s_wd_dlx = p.getUInt("dlx", 0); s_wd_cmdn = p.getUInt("cmdn", 0);
+  s_smesh = p.getUChar("smesh", 1) != 0;   // v1.7.9 default 1: scheduled STATUS still fetches the mesh snapshot
+  s_edrx = p.getBool("edrx", false) ? 1 : 0; s_psm = p.getBool("psm", false) ? 1 : 0;   // v1.7.9 defaults OFF
+  { String ev = p.getString("edrxv", LP_EDRX_DEFAULT); if (lpEdrxValueOk(ev.c_str())) memcpy(s_edrxv, ev.c_str(), 5); else memcpy(s_edrxv, LP_EDRX_DEFAULT, 5); s_edrxv[4] = 0; }
   {  // last wake hit the awake deadline (esp_timer) or a hardware/task watchdog reset
     esp_reset_reason_t rr = esp_reset_reason();
     bool hit = s_dl_hit == DL_MAGIC || rr == ESP_RST_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT;
@@ -2584,10 +2675,12 @@ static void wdSchedule(bool ok) {
   s_wd_due = rtcNow() + secs;
 }
 // WDCFG int=<30..1440 min, 0 = 1440> hb=<0|1> sms=<0|1> cmd=<0|1>  (system command from the Worker; cmd since 1.7.2)
+// v1.7.9 also accepts edrx=0|1, edrxv=0000..0101, psm=0|1, smesh=0|1. Defaults stay off / mesh on.
 static void wdApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimwd", false);
-  char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+  char buf[180]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;  // v1.7.9: room for edrx/edrxv/psm/smesh
   char *save = nullptr; int n = 0; bool rej = false;
+  LpCfg lp; lp.edrx = s_edrx ? 1 : 0; lp.psm = s_psm ? 1 : 0; memcpy(lp.edrxv, s_edrxv, 5);
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
     if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m == 0) m = WD_MAX_MIN; if (m >= WD_MIN_MIN && m <= WD_MAX_MIN) { s_wd_int_min = m; p.putUInt("int", m); n++; } else rej = true; }
@@ -2597,12 +2690,28 @@ static void wdApplyCfg(const char *args, char *out, size_t cap) {
     else if (!strcmp(k, "upoll")) { uint32_t m = (uint32_t)atoi(v); if (m == 0 || (m >= UP_MIN_MIN && m <= WD_MAX_MIN)) { s_up_min = m; p.putUInt("upm", m); s_up_due = 0; n++; } else rej = true; }   // v1.7.5
     else if (!strcmp(k, "usol")) { uint32_t mv = (uint32_t)atoi(v); if (mv <= 20000) { s_up_sol = mv; p.putUInt("usol", mv); n++; } else rej = true; }
     else if (!strcmp(k, "hwake")) { s_hw_en = atoi(v) != 0; s_hw_auto = false; s_hw_spur = 0; p.putBool("hwake", s_hw_en); p.putBool("hwauto", false); p.putUInt("hwsp", 0); n++; }
+    else if (!strcmp(k, "smesh")) {   // v1.7.9: 0 skips the mesh snapshot on scheduled STATUS only
+      if (strcmp(v, "0") && strcmp(v, "1")) rej = true;
+      else { s_smesh = v[0] == '1'; p.putUChar("smesh", s_smesh ? 1 : 0); n++; }
+    }
+    else {  // v1.7.9: unknown keys stay ignored. A bad edrx/edrxv/psm value is rejected, not stored.
+      int r = lpCfgToken(&lp, k, v);
+      if (r > 0) {
+        n++;
+        if (!strcmp(k, "edrx")) { s_edrx = lp.edrx; p.putBool("edrx", s_edrx != 0); }
+        else if (!strcmp(k, "edrxv")) { memcpy(s_edrxv, lp.edrxv, 5); p.putString("edrxv", s_edrxv); }
+        else if (!strcmp(k, "psm")) { s_psm = lp.psm; p.putBool("psm", s_psm != 0); }
+      } else if (r < 0) rej = true;
+    }
   }
   p.end();
   s_wd_fails = 0; wdSchedule(true);
-  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d hwake=%d upoll=%u usol=%u", n, rej ? " (a value was REJECTED: int 30-1440, upoll 0 or 15-1440, usol 0-20000)" : "",
-           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd, (int)s_hw_en, (unsigned)s_up_min, (unsigned)s_up_sol);
+  char frag[40]; lpAppliedFragment(frag, sizeof(frag), s_edrx, s_edrxv, s_psm);
+  snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d hwake=%d upoll=%u usol=%u %s smesh=%d", n,
+           rej ? " (a value was REJECTED: int 30-1440, upoll 0 or 15-1440, usol 0-20000, edrx 0|1, edrxv 0000-0101, psm 0|1, smesh 0|1)" : "",
+           (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd, (int)s_hw_en, (unsigned)s_up_min, (unsigned)s_up_sol, frag, s_smesh ? 1 : 0);
   logf("%s", out);
+  lpApply();  // v1.7.9: push before this reply is posted, so its telemetry matches the new settings
 }
 static int wdRegStat(const char *tag) {
   const char *p = strstr(s_at_resp, tag); if (!p) return -1;
@@ -2615,6 +2724,43 @@ static bool wdRegistered() {
   if (modemAT("AT+CEREG?", 2000) && wdRegOk(wdRegStat("+CEREG:"))) return true;
   if (modemAT("AT+CREG?", 2000) && wdRegOk(wdRegStat("+CREG:"))) return true;
   return false;
+}
+// v1.7.9: send the stored eDRX/PSM once per modem generation. One attempt, no retry loop.
+// A full reset or CFUN (s_lp_need) and the first power-on (RTC magic is 0) are dirty even at the
+// defaults, so AT+CEDRXS=0 and AT+CPSMS=0 go out once and later idle wakes match v1.7.8 (no extra AT).
+// Not registered: leave the flag set and try on a later wake. An ERROR is recorded and not retried
+// until the modem is reset, so a module that rejects the command cannot add 40 s to every wake.
+static void lpApply() {
+  if (s_tcp_busy || s_busy_update || !s_modem_ready) return;
+  bool dirty = s_lp_need || s_lp_magic != LP_MAGIC
+            || s_lp_sent_edrx != (uint8_t)(s_edrx ? 1 : 0)
+            || s_lp_sent_psm != (uint8_t)(s_psm ? 1 : 0)
+            || strncmp(s_lp_sent_v, s_edrxv, 4) != 0;
+  if (!dirty) return;
+  if (!wdRegistered()) {
+    logf("v1.7.9: eDRX/PSM not sent (not registered); retry after the next registration");
+    return;
+  }
+  char c_edrx[40], c_psm[64];
+  if (lpCedrxsCmd(c_edrx, sizeof(c_edrx), s_edrx, s_edrxv) < 0 || lpCpsmsCmd(c_psm, sizeof(c_psm), s_psm) < 0) {
+    logf("v1.7.9: eDRX/PSM command not built; left unchanged");
+    return;
+  }
+  LpEdrxRd er; memset(&er, 0, sizeof(er)); int er_valid = 0;
+  if (!modemAT(c_edrx, 10000)) logf("v1.7.9: AT+CEDRXS not accepted; idle DRX continues");
+  if (modemAT("AT+CEDRXRDP", 10000) || strstr(s_at_resp, "+CEDRXRDP:")) er_valid = lpParseCedrxrdp(s_at_resp, &er) ? 1 : 0;
+  LpPsmRd pr; memset(&pr, 0, sizeof(pr)); int pr_valid = 0;
+  if (!modemAT(c_psm, 10000)) logf("v1.7.9: AT+CPSMS not accepted");
+  if (modemAT("AT+CPSMS?", 10000) || strstr(s_at_resp, "+CPSMS:")) pr_valid = lpParseCpsms(s_at_resp, &pr) ? 1 : 0;
+  lpClassify(s_edrx, s_edrxv, &er, er_valid, s_psm, &pr, pr_valid, &s_lp_tel);
+  logf("v1.7.9: PSM network grant unknown (A76XX AT+CPSMS? echoes the request only)");
+  s_lp_magic = LP_MAGIC;
+  s_lp_sent_edrx = (uint8_t)(s_edrx ? 1 : 0);
+  s_lp_sent_psm = (uint8_t)(s_psm ? 1 : 0);
+  memcpy(s_lp_sent_v, s_edrxv, 5);
+  s_lp_need = 0;
+  logf("v1.7.9: low-power edrx=%d edrxv=%s nw=%s psm=%d tau=%s act=%s",
+       s_edrx, s_edrxv, s_lp_tel.edrx_nw, s_psm, s_lp_tel.psm_tau, s_lp_tel.psm_act);
 }
 static bool wdWaitReg(uint32_t ms) {
   uint32_t t0 = millis();
@@ -2634,6 +2780,7 @@ static bool wdHealthy(uint32_t cpin_ms, uint32_t reg_ms) {
   return modemWaitCpinReady(cpin_ms) && wdWaitReg(reg_ms) && wdAttached();
 }
 static bool wdSoft() {
+  s_lp_need = 1;   // v1.7.9: AT+CFUN can drop CEDRXS/CPSMS; re-send once we are registered again
   logf("WD: soft recovery (AT+CFUN=0/1)");
   modemAT("AT+CFUN=0", 15000); delay(2000);
   modemAT("AT+CFUN=1", 15000); delay(1000);
@@ -2649,7 +2796,7 @@ static bool wdHard(bool at_alive) {
   delay(5000);
   ModemSerial.end();
   s_pdp_up = false;
-  if (!modemPowerOn()) return false;                    // RESET pulse + PWRKEY on (the normal boot sequence)
+  if (!modemPowerOn()) { s_modem_ready = false; return false; }  // v1.7.9: a failed power-on is not "modem ready"
   modemAT("ATE0"); modemAT("AT+CMEE=2");
   return wdHealthy(20000, 90000);
 }
@@ -2701,7 +2848,7 @@ static bool wdRun(bool force = false) {
   ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
   delay(150);
   bool at = wdProbe(5);
-  if (at) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
+  if (at) { s_modem_ready = true; modemAT("ATE0"); modemAT("AT+CMEE=2"); }  // v1.7.9: DTR-low wake, settings kept
   bool ok = at && wdHealthy(5000, 20000);
   if (s_hrp_n) s_wd_pend = true;   // v1.7.4: an undelivered Heltec-reboot report goes out with this heartbeat
   if (force) { logf("WD: forced recovery (check said healthy=%d)", (int)ok); ok = false; s_wd_pend = true; }
@@ -2733,10 +2880,13 @@ static bool wdRun(bool force = false) {
       if (ok) { modemConfigureSms(); s_wd_pend = true; }
     }
     if (ok) {
+      lpApply();   // v1.7.9: before the heartbeat, so this post's tl is the read-back. One try, no loop.
       sms = wdSmsStored();
       if (s_lb_pending[0]) pwrReportPending();
       if (wdHeartbeat(stage, sms)) s_wd_pend = false;
     }
+  } else if (ok && !lowbat) {
+    lpApply();   // v1.7.9: still apply when no heartbeat is posted. Skipped on low battery (no extra AT).
   }
   if (ok) { if (strcmp(stage, "ok") == 0) s_wd_ok++; s_wd_fails = 0; }
   else if (strcmp(stage, "lowbat") != 0) { s_wd_fail++; if (s_wd_fails < 255) s_wd_fails++; s_wd_pend = true; if (!hard_tried) wdAddEvent("check", "fail", (millis() - t0) / 1000); }
@@ -2863,12 +3013,14 @@ static bool handleCommand(const char *from, const char *body) {
     s_cmdbuf[len - 4] = 0; normalizeSmsBody(s_cmdbuf);
   }
   telemRefreshSignal();
-  if (strcasecmp(s_cmdbuf, "STATUS") == 0) {
+  if (strcasecmp(s_cmdbuf, "STATUS") == 0 || statusIsScheduled(s_cmdbuf)) {
     WakeExtras ex = wakeExtras(true, true);   // v1.7.8: STATUS keeps snapshot, diagnostics, ?sys=1
+    bool scheduled = statusIsScheduled(s_cmdbuf);   // v1.7.9: "STATUS AUTO" is the scheduled check
     doStatusReport();
     if (ex.sys) doConsoleCommands(true);   // v1.6.5: pick up queued system commands (e.g. PWRCFG) with no extra SMS
     if (s_gps_auto && !s_gps_done) { static char go[300]; gpsReport("auto", go, sizeof(go)); }  // v1.6.7 optional location on check-in
-    if (ex.mesh) meshSnapshot();
+    if (ex.mesh && statusFetchesMesh(scheduled, s_smesh ? 1 : 0)) meshSnapshot();
+    else if (ex.mesh) logf("v1.7.9: scheduled STATUS skips mesh (WDCFG smesh=0)");
     cfgSnapshot();   // v1.7.0
     s_did_status = true;
     return true;
@@ -2999,15 +3151,20 @@ static int parseOneCmgl(const char **p_inout) {
 static bool looksLikeCommand(const char *body) {
   static char n[1024]; strncpy(n, body, sizeof(n) - 1); n[sizeof(n) - 1] = 0; normalizeSmsBody(n);
   size_t l = strlen(n); if (l >= 4 && strcasecmp(n + l - 4, " ACK") == 0) { n[l - 4] = 0; normalizeSmsBody(n); }
-  return !strcasecmp(n, "STATUS") || !strcasecmp(n, "CMD") || !strcasecmp(n, "REBOOT") ||
-         !strncasecmp(n, "UPDATE ", 7) || !strncasecmp(n, "TSIMUPDATE ", 11);
+  return !strcasecmp(n, "STATUS") || statusIsScheduled(n) || !strcasecmp(n, "CMD") || !strcasecmp(n, "REBOOT") ||
+         !strncasecmp(n, "UPDATE ", 7) || !strncasecmp(n, "TSIMUPDATE ", 11);   // v1.7.9: STATUS AUTO is a command
 }
 
-static void processSmsInbox() {
+static void processSmsInbox(bool unread_only) {
   // Read with UCS2 so every char ('_', '@', '$', ...) arrives as unambiguous hex.
   modemAT("AT+CSCS=\"UCS2\"");
   bool all_mode = false;
-  if (!modemAT("AT+CMGL=\"REC UNREAD\"", 15000) || !strstr(s_at_resp, "+CMGL:")) {
+  bool unread_ok = modemAT("AT+CMGL=\"REC UNREAD\"", 15000);
+  bool has_unread = unread_ok && strstr(s_at_resp, "+CMGL:");
+  // v1.7.9: the pre-sleep catch-up only wants new texts. An empty unread list is enough;
+  // do not scan the whole store (that is the normal inbox fallback, and it can be slow).
+  if (!has_unread) {
+    if (unread_only && unread_ok) { modemAT("AT+CSCS=\"GSM\""); logf("v1.7.9: no unread SMS before sleep"); return; }
     modemAT("AT+CMGL=\"ALL\"", 15000); all_mode = true;
   }
   static char inbox[8192];
@@ -3128,12 +3285,23 @@ static void sleepQuick() {
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
   gpio_deep_sleep_hold_en();
   armWakeups();
-  Serial.flush(); delay(50);
+  Serial.flush(); delay(50);   // UART drain. v1.7.9: this path never woke the modem, so no SMS check.
+  s_prev_awake_ms = millis();   // v1.7.9: reported as awake_ms on the next wake (timer / GPIO6 quick path)
   esp_deep_sleep_start();
 }
 
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  // v1.7.9: one unread-SMS pass, then sleep. Not a timed linger. Only after a wake that already
+  // reads the inbox (text ring or GPIO6 STATUS). A watchdog wake stays on WDCFG sms=0|1, which
+  // wdRun already honored. Messages are deleted before they run, so this cannot replay them.
+  // Sleep is still modemEnableSleep (DTR high, AT+CSCLK=1). The modem is not powered off.
+  bool inbox_wake = smsWakeUsesLight((int)s_wake_cause) || s_tf_status_boot || s_did_status || s_did_cmd;
+  if (!s_sms_catch_done && inbox_wake && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
+    s_sms_catch_done = true;
+    processSmsInbox(true);
+    if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  }
   hwAwakeService();   // v1.7.4: a Heltec reboot seen during this wake is handled before sleeping
   heltecMonStop();
   g6DiagStop();
@@ -3146,7 +3314,8 @@ static void goToSleep() {
   gpio_hold_en((gpio_num_t)MODEM_DTR_PIN);
   gpio_deep_sleep_hold_en();
   armWakeups();   // v1.7.1: SMS ring + one timer (battery check / GNSS warm window end / modem watchdog)
-  Serial.flush(); delay(100);
+  Serial.flush(); delay(100);   // UART drain, not an SMS wait. v1.7.9: the unread check above replaced a linger.
+  s_prev_awake_ms = millis();   // v1.7.9: reported as awake_ms on the next wake
   esp_deep_sleep_start();
 }
 
@@ -3240,16 +3409,18 @@ static bool modemSmsLight() {
     logf("SMS wake: light wake not enough (AT=%d reg=%d)", (int)at, (int)reg);
     return false;
   }
+  s_modem_ready = true;   // v1.7.9: light wake (DTR low) does not drop eDRX/PSM and does not set s_lp_need
   logf("SMS wake: modem already up and registered");
   return true;
 }
 
 void setup() {
   deadlineArm(AWAKE_MAX_S);   // v1.7.2: first thing, so nothing after this can keep the T-SIM awake forever
-  Serial.begin(115200);
-  delay(800);
-  s_wake_cause = esp_sleep_get_wakeup_cause();
+  s_wake_cause = esp_sleep_get_wakeup_cause();   // v1.7.9: before the USB settle, so a field wake can skip it
   bool fast = (s_wake_cause == ESP_SLEEP_WAKEUP_EXT0) || (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER);
+  Serial.begin(115200);
+  if (fieldWake()) Serial.setTxTimeoutMs(10);   // v1.7.9: an idle USB host must not stall each log line (default 100 ms)
+  else delay(800);                               // v1.7.9: bench USB-monitor settle on a cold power-on only
   logf("=== %s ===", FW_VERSION);
   logf("Built: %s", FW_BUILD_DATE);
   logf("Wake: %d%s", (int)s_wake_cause, fast ? " (fast)" : " (cold/RST)");
@@ -3354,13 +3525,15 @@ void setup() {
   else {
     logf("LittleFS OK total=%u used=%u", (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
     loadLastResult();
-    printLastLog();
+    if (!fast && !s_tf_status_boot) printLastLog();   // v1.7.9: field wakes keep the result; they do not dump the file to USB
+    else logf("v1.7.9: skip last-log dump on this wake");
   }
   // v1.7.8: an SMS ring (ext0, wake code 2) does not hard-reset the modem. Timer and
   // power-on paths still call modemPowerOn. GPIO6 STATUS boot is ext1 and stays on that path.
-  bool modem_up;
+  bool modem_up, ate_done = false;
   if (smsWakeUsesLight((int)s_wake_cause)) {
     modem_up = modemSmsLight();
+    ate_done = modem_up;   // v1.7.9: a successful light wake already sent ATE0 and AT+CMEE=2
     if (!modem_up) { logf("SMS wake: falling back to full modem reset"); modem_up = modemPowerOn(); }
   } else modem_up = modemPowerOn();
   if (!modem_up) {
@@ -3368,14 +3541,18 @@ void setup() {
     if (!fast) interactiveWindow(AWAKE_WINDOW_MS);
     goToSleep(); return;
   }
-  modemAT("ATE0"); modemAT("AT+CMEE=2");
+  if (!ate_done) { modemAT("ATE0"); modemAT("AT+CMEE=2"); }
+  else logf("v1.7.9: skip repeat ATE0/CMEE after light wake");
   gpsHousekeep();   // v1.6.8: GNSS warm window / battery protection
   bool sim = modemWaitCpinReady(20000);
   const bool sms_wake = smsWakeUsesLight((int)s_wake_cause);
-  if (!sms_wake) modemLogDiagnostics();   // SMS diags run after the text, so a CMD wake can skip them
+  if (!sms_wake && !s_tf_status_boot) modemLogDiagnostics();   // SMS diags run after the text, so a CMD wake can skip them
+  else if (s_tf_status_boot) logf("v1.7.9: skip AT diagnostics; the STATUS report repeats them");
   if (sim) {
-    if (modemWaitNetwork(fast ? 30000 : 60000)) { s_wd_fails = 0; wdSchedule(true); }  // v1.7.1 a good wake restarts the watchdog interval
+    bool reg_ok = modemWaitNetwork(fast ? 30000 : 60000);
+    if (reg_ok) { s_wd_fails = 0; wdSchedule(true); }  // v1.7.1 a good wake restarts the watchdog interval
     modemConfigureSms();
+    if (reg_ok) lpApply();   // v1.7.9: awake and registered. Defaults off send CEDRXS=0/CPSMS=0 once, then idle wakes skip it.
     if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
     if (s_wake_cause != ESP_SLEEP_WAKEUP_TIMER || !s_lb_en) pwrCheck("wake");
     pwrReportPending();
@@ -3384,9 +3561,12 @@ void setup() {
     if (s_tf_status_boot) doStatusReport();
   } else if (s_tf_status_boot) logf("tsim wake STATUS: no SIM, report skipped");
   if (sms_wake) {
-    // CMD only: skip the extra AT diagnostics. STATUS (and any other text) keeps them.
-    WakeExtras ex = wakeExtras(s_did_status || !s_did_cmd, false);
-    if (ex.diag) modemLogDiagnostics();
+    // v1.7.9: STATUS already posted CSQ/CPSI/COPS/CEREG/CGMR, so the second AT pass only delayed sleep.
+    // CMD still skips it. A text wake that did not post STATUS (REBOOT, empty inbox) still logs diagnostics.
+    // wakeExtras() itself is unchanged (STATUS still *asks* for diagnostics; this is only the post-report skip).
+    bool is_status = s_did_status || !s_did_cmd;
+    if (wakeRunPostDiag(is_status, s_did_status)) modemLogDiagnostics();
+    else if (s_did_status) logf("v1.7.9: skip extra AT diagnostics after STATUS");
     else logf("CMD wake: skip extra AT diagnostics");
   }
   if (s_tf_status_boot) { goToSleep(); return; }
