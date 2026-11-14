@@ -513,7 +513,7 @@ export function flashFile(msg) {
   const m = String(msg || "").match(/^SUCCESS:\s*(\S+)/); return m ? decodeURIComponent(m[1].split(/[?#]/)[0].split("/").pop()) : null;
 }
 // kind "heltec" | "tsim". history is newest-first.
-export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
+export function computeProgress(kind, history = [], st = {}, now = Date.now(), wdIntMin) {
   const sent = kind === "tsim" ? st.tsim_update_sent : st.last_update_sent;
   const isK = (h) => h.type === "update" && h.msg && (kind === "tsim" ? /^TSIM OTA/.test(h.msg) : !/^TSIM OTA/.test(h.msg) && !/^TESTDL/.test(h.msg)) ||
     (kind === "tsim" && /booted new firmware after OTA/.test(h.msg || ""));
@@ -565,8 +565,15 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
   if (state === "running" && now - lastAt > STALL_MS) { state = "timeout";
     const reportedAfter = step === 0 && ((st.last_checkin_ts || 0) > startAt ||
       (history || []).some((h) => h && h.type && h.type !== "action" && (Date.parse(h.received_at) || 0) > startAt));
+    // Optional 5th arg or st.wd_int_min: dashboard/queued WDCFG interval. Only an explicit 0 (watchdog off)
+    // drops the backup-copy promise; unknown/missing keeps it so existing callers stay unchanged.
+    const wdRaw = wdIntMin !== undefined ? wdIntMin : st.wd_int_min;
+    const wdN = Number(wdRaw);
+    const wdOff = wdRaw !== undefined && wdRaw !== null && wdRaw !== "" && Number.isFinite(wdN) && wdN === 0;
     reason = step === 0 ? (reportedAfter
-      ? "The T-SIM woke up after the update text but did not start the update. The text is probably still waiting on the modem and should run on its next wake (or the watchdog backup copy will). Press Retry to text it again."
+      ? (wdOff
+        ? "The T-SIM woke up after the update text but did not start the update. The text is probably still waiting on the modem and should run on the T-SIM's next text wake. Press Retry to text it again."
+        : "The T-SIM woke up after the update text but did not start the update. The text is probably still waiting on the modem and should run on its next wake (or the watchdog backup copy will). Press Retry to text it again.")
       : "The T-SIM never woke up to start the update. It may be out of power or have lost its cell connection. Press Retry to text it again.") :
       step === 4 && kind === "tsim" ? "The T-SIM didn't check in after rebooting. It has probably rolled back to its previous firmware. Press Retry to try again." :
       "The update started but stopped reporting for 10 minutes, most likely a lost cell connection mid-download. Press Retry to start it again."; }
@@ -1261,13 +1268,43 @@ export const cfgListCmds = (vals = {}) => [...Object.keys(CACHE_LISTS), ...rptRe
 // v1.7.2: watchdog wakes also fetch queued commands ("?wd=1"). A Heltec update is texted as usual AND queued as a
 // watchdog-only backup (wdonly): served only on watchdog fetches, cancelled when the text path starts it.
 // v1.7.10: TTL must outlive the T-SIM's watchdog interval (every good wake restarts that timer).
-// TTL = max(26 h, device wd interval + 2 h). Unknown interval (no telemetry wd_int, no settings) = 48 h.
+// TTL = max(26 h, device wd interval + 2 h). Unknown / off / non-numeric interval = 48 h
+// (wdOnlyTtlMs(0), undefined, NaN, "abc" all fall back; never NaN).
+// Dashboard int=0 means the user turned the watchdog off, but firmware still reports
+// telem.wd_int=1440 (wdSchedule never unschedules the 24 h timer). For TTL, telemetry
+// wd_int > 0 wins over stored wdcfg.int_min, so user int=0 + telem 1440 → 26 h.
 export const WDCMD_FW = "1.7.2", WDONLY_TTL_MS = 24 * 3600 * 1000;  // historical 24 h; expireWdOnly uses wdOnlyTtlMs
 export const WDONLY_TTL_MIN_MS = 26 * 3600 * 1000, WDONLY_TTL_FALLBACK_MS = 48 * 3600 * 1000;
 export function wdOnlyTtlMs(wdIntMin) {
   const m = Number(wdIntMin);
   if (!Number.isFinite(m) || m <= 0) return WDONLY_TTL_FALLBACK_MS;
   return Math.max(WDONLY_TTL_MIN_MS, m * 60 * 1000 + 2 * 3600 * 1000);
+}
+// User-facing watchdog interval for stall copy: stored wdcfg.int_min (0 = dashboard off,
+// written immediately on Save) then newest queued/sent/done WDCFG int=N. Not telem.wd_int
+// (firmware still reports 1440 when the user set 0). Missing → undefined (stall keeps the backup wording).
+export function wdUserInterval(wdcfg, cmds) {
+  if (wdcfg && wdcfg.int_min !== undefined && wdcfg.int_min !== null && wdcfg.int_min !== "") {
+    const n = Number(wdcfg.int_min);
+    if (Number.isFinite(n)) return n;
+  }
+  for (const c of cmds || []) {
+    if (!c || !/^wdcfg\s/i.test(c.cmd || "")) continue;
+    if (c.status !== "queued" && c.status !== "sent" && c.status !== "done") continue;
+    const m = /\bint=(\d+)\b/i.exec(c.cmd);
+    if (m) { const n = Number(m[1]); if (Number.isFinite(n)) return n; }
+  }
+  return undefined;
+}
+// Interval used for wdonly TTL. telem.wd_int wins when finite > 0 (including 1440 after
+// dashboard int=0). Else wdcfg.int_min when finite > 0. User 0 is never passed through
+// (caller then uses undefined → 48 h fallback).
+export function wdTtlIntervalMin(lat, wdcfg) {
+  const t = lat != null ? Number(lat.wd_int) : NaN;
+  if (Number.isFinite(t) && t > 0) return t;
+  const s = wdcfg != null ? Number(wdcfg.int_min) : NaN;
+  if (Number.isFinite(s) && s > 0) return s;
+  return undefined;
 }
 export function queueWdUpdate(list, url, nowIso = new Date().toISOString(), idFn = () => randomHex(4)) {
   for (const c of list) if (c.wdonly && c.status === "queued") { c.status = "cancelled"; c.error = "replaced by a newer update"; }
@@ -1510,8 +1547,8 @@ async function handleDeviceCommands(request, env, id) {
   const wdWake = sp.get("wd") === "1";    // v1.7.2 watchdog wake: everything, plus a watchdog-only Heltec UPDATE
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
   const wdCfg = (await kvJson(env, `wdcfg:${id}`)) || {};
-  const wdInt = typeof lat.wd_int === "number" && lat.wd_int > 0 ? lat.wd_int
-    : (typeof wdCfg.int_min === "number" && wdCfg.int_min > 0 ? wdCfg.int_min : undefined);
+  // telem.wd_int > 0 wins (firmware 1440 after dashboard int=0); else wdcfg.int_min > 0; else 48 h.
+  const wdInt = wdTtlIntervalMin(lat, wdCfg);
   const expired = expireWdOnly(list, Date.now(), wdInt);
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
@@ -2078,13 +2115,14 @@ async function deviceApi(request, env, dev, action) {
     const watchdog = { settings: wdSettings, last: wdLast || null, pending: wdq ? wdq.status : null, supported: fwAtLeast(latest && latest.fw, WD_FW), hwake_supported: fwAtLeast(latest && latest.fw, HWAKE_FW), upoll_supported: fwAtLeast(latest && latest.fw, UPOLL_FW), lp_supported: fwAtLeast(latest && latest.fw, LP_FW),
       upoll_now: upollNow(wdSettings, wdLast), hwake_now: hwakeNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
     const radio_debug = radioDebugReport({ history: history || [], mesh, latest });
+    const stProg = { ...s, wd_int_min: wdUserInterval(wdCfgS, cmds) };
     return json({ radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, ondemand: s.serial_ondemand === true, blocks: psBlocks(s), unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
-      progress: { heltec: computeProgress("heltec", history || [], s), tsim: computeProgress("tsim", history || [], s) }, presets: FW_PRESETS,
+      progress: { heltec: computeProgress("heltec", history || [], stProg), tsim: computeProgress("tsim", history || [], stProg) }, presets: FW_PRESETS,
       update_status: statuses(latest, mesh, s, history, rel, tsimRel), fwup, backup });
   }
   if (action === "source" && request.method === "GET") return json(await getSource(env, id));
