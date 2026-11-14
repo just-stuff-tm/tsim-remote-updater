@@ -1,6 +1,7 @@
 // v1.7.8: pure wake decisions (no Arduino). Shared by main.cpp and firmware/test/host_test.cpp.
 #pragma once
 #include <stdint.h>
+#include <string.h>
 #include <strings.h>
 
 // ESP_SLEEP_WAKEUP_EXT0 is 2: the modem RI pin, an incoming text. Power-on (0),
@@ -76,4 +77,36 @@ static inline bool cfgsnapShouldCollect(bool refresh, bool enabled, bool lowbat,
   if (refresh) return true;
   if (!enabled || lowbat) return false;
   return interval_due || clock_back;
+}
+
+// v1.7.10: on a text (RI/ext0) wake the +CMTI for the text that rang the pin can land after the
+// first inbox pass (especially with eDRX). Keep the modem up until SMS_LATE_WINDOW_MS after boot
+// (millis() since reset), watching UART for "+CMTI". Extra wait added is capped at
+// SMS_LATE_MAX_WAIT_MS (~20 s) and is 0 if this wake already ran past the window.
+// Awake-time cost: up to ~20 s extra on a short text wake; 0 s on a STATUS/CMD/UPDATE that
+// already passed ~22 s; GPIO6 and watchdog wakes do not wait.
+// At most SMS_LATE_MAX_PASSES extra processSmsInbox(true) calls if +CMTI arrives, then one
+// final unread pass (the v1.7.9 one-shot catch-up). No loop: the pass counter is the cap.
+#define SMS_LATE_WINDOW_MS    22000u
+#define SMS_LATE_MAX_WAIT_MS  20000u
+#define SMS_LATE_MAX_PASSES   3u
+
+static inline uint32_t smsLateRemainMs(uint32_t now_ms) {
+  if (now_ms >= SMS_LATE_WINDOW_MS) return 0;
+  uint32_t left = SMS_LATE_WINDOW_MS - now_ms;
+  if (left > SMS_LATE_MAX_WAIT_MS) left = SMS_LATE_MAX_WAIT_MS;
+  return left;
+}
+
+// Text wake only, modem already answering, not during TLS or an update.
+static inline bool smsLateWaitOk(bool sms_wake, bool modem_ready, bool tcp_busy, bool busy_update) {
+  return sms_wake && modem_ready && !tcp_busy && !busy_update;
+}
+
+static inline bool smsLateShouldRecheck(bool saw_cmti, unsigned extra_done, unsigned max_passes) {
+  return saw_cmti && extra_done < max_passes;
+}
+
+static inline bool smsLateLineIsCmti(const char *line) {
+  return line && strstr(line, "+CMTI") != nullptr;
 }

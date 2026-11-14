@@ -18,7 +18,7 @@
 #include "board.h"
 #include "hw_guard.h"   // v1.7.6 self-reset guard + SMS merge (host-tested)
 #include "tsim_frame.h" // v1.7.7 @TSIM frame parser (host-tested)
-#include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras (host-tested)
+#include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras; v1.7.10 late +CMTI window (host-tested)
 #include "lp_power.h"   // v1.7.9 eDRX / PSM parsing (host-tested)
 #include <Update.h>
 #include <Preferences.h>
@@ -1172,6 +1172,7 @@ static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty
 // fetch nothing is: an empty body had nothing queued, and a non-empty body already ran
 // the system lines, so an empty ?sys=1 is not issued.
 // v1.7.9: no extra wait after the replies. goToSleep does one unread-SMS pass, then sleeps.
+// v1.7.10: on a text (ext0) wake goToSleep may linger until ~22 s after boot for a late +CMTI.
 static bool s_did_cmd = false, s_did_status = false;
 static void finishCmdWake(bool queue_empty) {
   WakeExtras ex = wakeExtras(false, false);
@@ -3225,6 +3226,26 @@ static void processSmsInbox(bool unread_only) {
   logf("SMS processed: %d", count);
 }
 
+// v1.7.10: drain modem UART for a +CMTI URC. Does not send AT (modemAT would flush the URC).
+// Skipped while TLS owns the UART. Host-tested matcher: smsLateLineIsCmti.
+static bool modemPollCmti() {
+  if (s_tcp_busy || s_busy_update) return false;
+  static char line[96];
+  static size_t n = 0;
+  bool saw = false;
+  while (ModemSerial.available()) {
+    char c = (char)ModemSerial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      line[n] = 0;
+      if (smsLateLineIsCmti(line)) { logf("v1.7.10: %s", line); saw = true; }
+      n = 0;
+    } else if (n + 1 < sizeof(line)) line[n++] = c;
+    else n = 0;
+  }
+  return saw;
+}
+
 // v1.7.1: one timer for every reason to wake (battery check, GNSS warm window end, modem watchdog). 0 = none.
 static uint64_t sleepTimerSecs() {
   if (s_ext0_failed) return 60;
@@ -3296,10 +3317,40 @@ static void goToSleep() {
   // reads the inbox (text ring or GPIO6 STATUS). A watchdog wake stays on WDCFG sms=0|1, which
   // wdRun already honored. Messages are deleted before they run, so this cannot replay them.
   // Sleep is still modemEnableSleep (DTR high, AT+CSCLK=1). The modem is not powered off.
-  bool inbox_wake = smsWakeUsesLight((int)s_wake_cause) || s_tf_status_boot || s_did_status || s_did_cmd;
-  if (!s_sms_catch_done && inbox_wake && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
+  // v1.7.10: a text (RI/ext0) wake keeps the modem up until ~22 s after boot so the +CMTI for
+  // the text that rang RI can land (with eDRX it often is not in the store at the first pass).
+  // Extra wait is at most ~20 s, 0 if this wake already ran past 22 s. At most 3 extra inbox
+  // passes on +CMTI, then one final unread check. UPDATE/TLS aborts the wait (same as before).
+  const bool sms_wake = smsWakeUsesLight((int)s_wake_cause);
+  bool inbox_wake = sms_wake || s_tf_status_boot || s_did_status || s_did_cmd;
+  if (sms_wake && smsLateWaitOk(true, s_modem_ready, s_tcp_busy, s_busy_update)) {
+    uint32_t remain = smsLateRemainMs(millis());
+    logf("v1.7.10: SMS late window %u ms left (keep modem up until ~22 s after wake)", (unsigned)remain);
+    uint8_t extra = 0;
+    uint32_t deadline = millis() + remain;
+    while ((int32_t)(deadline - millis()) > 0) {
+      if (s_tcp_busy || s_busy_update) break;
+      if (smsLateShouldRecheck(modemPollCmti(), extra, SMS_LATE_MAX_PASSES)) {
+        extra++;
+        logf("v1.7.10: +CMTI during late window, unread pass %u/%u", (unsigned)extra, (unsigned)SMS_LATE_MAX_PASSES);
+        processSmsInbox(true);
+        lpApply();  // v1.7.10: WDCFG in this pass (edrx=0/psm=0) is sent this wake; no-op if clean/busy
+        if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+      }
+      hwAwakeService();
+      delay(20);
+    }
+    if (!s_sms_catch_done && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
+      s_sms_catch_done = true;
+      logf("v1.7.10: final unread SMS check after late window");
+      processSmsInbox(true);
+      lpApply();
+      if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+    }
+  } else if (!s_sms_catch_done && inbox_wake && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
     s_sms_catch_done = true;
     processSmsInbox(true);
+    lpApply();  // v1.7.10: same dirty check as setup(); skipped during TLS/update / not registered
     if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
   }
   hwAwakeService();   // v1.7.4: a Heltec reboot seen during this wake is handled before sleeping
@@ -3558,6 +3609,10 @@ void setup() {
     pwrReportPending();
     if (s_hrp_n) wdHeartbeat("ok", -1);   // v1.7.4: deliver an earlier Heltec-reboot report that couldn't go out
     processSmsInbox();
+    // v1.7.10: WDCFG in this inbox may have skipped lpApply while TLS ingest had s_tcp_busy.
+    // lpApply is idempotent (dirty check). It no-ops during s_tcp_busy / s_busy_update, when
+    // the modem is not ready, and when not registered.
+    lpApply();
     if (s_tf_status_boot) doStatusReport();
   } else if (s_tf_status_boot) logf("tsim wake STATUS: no SIM, report skipped");
   if (sms_wake) {

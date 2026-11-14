@@ -189,5 +189,39 @@ int main() {
   assert(smsIsDup(seenAu, 1, "status auto"));
   assert(!smsIsDup(seenAu, 1, "STATUS"));
   printf("v1.7.9 host tests OK (smesh, cfgsnap hash, STATUS AUTO)\n");
+
+  // 13) v1.7.10: SMS late window. Extra wait is capped at 20 s and is 0 once past 22 s.
+  assert(SMS_LATE_WINDOW_MS == 22000u);
+  assert(SMS_LATE_MAX_WAIT_MS == 20000u);
+  assert(SMS_LATE_MAX_PASSES == 3u);
+  assert(smsLateRemainMs(0) == 20000u);          // 22 s left, extra wait capped at 20 s
+  assert(smsLateRemainMs(1000) == 20000u);       // 21 s left, still capped
+  assert(smsLateRemainMs(2000) == 20000u);
+  assert(smsLateRemainMs(3000) == 19000u);
+  assert(smsLateRemainMs(12000) == 10000u);
+  assert(smsLateRemainMs(21999) == 1u);
+  assert(smsLateRemainMs(22000) == 0);
+  assert(smsLateRemainMs(30000) == 0);
+  assert(smsLateWaitOk(true, true, false, false));
+  assert(!smsLateWaitOk(false, true, false, false));  // GPIO6 / timer / power-on: no wait
+  assert(!smsLateWaitOk(true, false, false, false));
+  assert(!smsLateWaitOk(true, true, true, false));    // TLS
+  assert(!smsLateWaitOk(true, true, false, true));    // UPDATE
+  assert(smsLateShouldRecheck(true, 0, SMS_LATE_MAX_PASSES));
+  assert(smsLateShouldRecheck(true, 2, SMS_LATE_MAX_PASSES));
+  assert(!smsLateShouldRecheck(true, 3, SMS_LATE_MAX_PASSES));  // cap: no infinite inbox loop
+  assert(!smsLateShouldRecheck(false, 0, SMS_LATE_MAX_PASSES));
+  assert(smsLateLineIsCmti("+CMTI: \"SM\",1"));
+  assert(smsLateLineIsCmti("+CMTI: \"ME\",3"));
+  assert(smsLateLineIsCmti("prefix +CMTI: \"SM\",2"));
+  assert(!smsLateLineIsCmti("+CMT: \"SM\",1"));
+  assert(!smsLateLineIsCmti("+CEREG: 1,1"));
+  assert(!smsLateLineIsCmti(""));
+  assert(!smsLateLineIsCmti(nullptr));
+  // v1.7.9 catch-up still one-shot and still skipped during TLS/update
+  assert(smsCatchupBeforeSleep(true, false, false));
+  assert(!smsCatchupBeforeSleep(true, true, false));
+  assert(!smsCatchupBeforeSleep(true, false, true));
+  printf("v1.7.10 host tests OK (SMS late window, +CMTI recheck cap)\n");
   return 0;
 }

@@ -398,6 +398,11 @@ console.log("ALL TESTS PASSED");
   p = computeProgress("tsim", H, st, now); assert.equal(p.step, 4); assert.equal(p.target, "firmware.bin (v1.6.1)");
   p = computeProgress("tsim", [{ type: "update", msg: "TSIM OTA OK: 1.6.1 running", received_at: T(3) }, ...H], st, now); assert.equal(p.state, "done"); assert.equal(p.pct, 100);
   p = computeProgress("tsim", H, st, now + 20 * 60e3); assert.equal(p.state, "timeout"); assert(/rolled back/.test(p.reason));
+  p = computeProgress("tsim", [], st, now + 11 * 60e3); assert.equal(p.state, "timeout"); assert(/never woke up/.test(p.reason));
+  p = computeProgress("tsim", [{ type: "event", msg: "CMD: lighter wake", received_at: T(1) }], st, now + 11 * 60e3);
+  assert.equal(p.state, "timeout"); assert(/woke up after the update text/.test(p.reason)); assert(!/never woke up/.test(p.reason));
+  p = computeProgress("tsim", [{ type: "action", msg: "Heltec UPDATE text sent", received_at: T(1) }], st, now + 11 * 60e3);
+  assert.equal(p.state, "timeout"); assert(/never woke up/.test(p.reason), "dashboard action is not a device report");
   p = computeProgress("heltec", [{ type: "update", msg: "FAIL: download", received_at: T(2) }, { type: "update", msg: "UPDATE start: https://x", received_at: T(1) }], st, now);
   assert.equal(p.state, "failed"); assert(/downloaded/.test(p.reason));
   p = computeProgress("heltec", [{ type: "update", msg: "SUCCESS: https://x", received_at: T(2) }, { type: "update", msg: "Download done: 9 bytes, flashing", received_at: T(1.5) }], st, now);
@@ -412,6 +417,8 @@ console.log("ALL TESTS PASSED");
   assert.equal(await heltecImageRisk("https://h/x.bin", "tsim-updater 1.6.2"), null);
   assert.equal(await heltecImageRisk("https://h/x.bin", "tsim-updater 1.10.0"), null);
   assert(fwAtLeast("tsim-updater 2.0.0", "1.6.2") && !fwAtLeast("tsim-updater 1.5.9", "1.6.2") && !fwAtLeast(null, "1.6.2"));
+  assert(fwAtLeast("tsim-updater 1.7.10", "1.7.9") && fwAtLeast("tsim-updater 1.7.10", "1.7.2") && fwAtLeast("tsim-updater 1.7.10", "1.7.10"));
+  assert(!fwAtLeast("tsim-updater 1.7.9", "1.7.10") && fwAtLeast("tsim-updater 1.7.9", "1.7.2"));
   globalThis.fetch = async () => new Response(new Uint8Array([0xE9]), { status: 206, headers: { "Content-Range": "bytes 0-0/900000" } });
   assert.equal(await heltecImageRisk("https://h/small.bin"), null);
   globalThis.fetch = of;
@@ -1529,7 +1536,7 @@ console.log("serial.ondemand tests OK");
   assert.equal(list[0], e1); assert.equal(e1.cmd, "UPDATE https://x/b.bin"); assert.equal(list[1].status, "cancelled", "older backup replaced");
   assert.equal(M.wdOnlyOk(e1, false, "tsim-updater 1.7.2"), false); assert.equal(M.wdOnlyOk(e1, true, "tsim-updater 1.7.1"), false);
   assert.equal(M.wdOnlyOk(e1, true, "tsim-updater 1.7.2"), true); assert.equal(M.wdOnlyOk({ cmd: "ver" }, false, "x"), true);
-  const stale = [{ id: "s", cmd: "UPDATE u", wdonly: true, status: "queued", queued_at: new Date(Date.now() - 25 * 3600e3).toISOString() }];
+  const stale = [{ id: "s", cmd: "UPDATE u", wdonly: true, status: "queued", queued_at: new Date(Date.now() - 49 * 3600e3).toISOString() }];
   assert.equal(M.expireWdOnly(stale), 1); assert.equal(stale[0].status, "cancelled");
   assert.equal(M.isSysCmd("UPDATE https://x"), false, "console history logic unchanged");
   // served only on watchdog fetches from 1.7.2+
@@ -1546,7 +1553,7 @@ console.log("serial.ondemand tests OK");
   assert.equal((await ing({ type: "update", fw: "tsim-updater 1.7.2", msg: "UPDATE start: https://x/d.bin" })).status, 200);
   assert.equal(L().find((c) => c.id === "wdu2").status, "cancelled"); assert.equal(await fetchCmds("?wd=1"), "");
   // expired backups are dropped on the next fetch
-  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu3", cmd: "UPDATE https://x/e.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date(Date.now() - 25 * 3600e3).toISOString() }, ...keep]));
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu3", cmd: "UPDATE https://x/e.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date(Date.now() - 49 * 3600e3).toISOString() }, ...keep]));
   assert.equal(await fetchCmds("?wd=1"), ""); assert.equal(L().find((c) => c.id === "wdu3").status, "cancelled");
   // heartbeat counters
   const hb = M.parseHeartbeat({ stage: "ok", wd: { int: 180, hb: 1, sms: 0, chk: 9, ok: 9, soft: 0, hard: 0, fail: 0, fails: 0, next: 100, cmd: 1, cmdn: 4, rst: 2, dlx: 1, ev: [] } });
@@ -2052,4 +2059,51 @@ console.log("serial.ondemand tests OK");
   assert.match(autoText, /counted 3/);
   assert.equal(holo, holo0, "page read texted nothing");
   console.log("GPIO6 checkbox stale-report tests OK");
+}
+
+// ---------- v1.7.10: wdonly TTL outlives the watchdog interval; stall copy if the T-SIM reported ----------
+{
+  const M = await import("../src/index.js");
+  assert.equal(M.wdOnlyTtlMs(undefined), 48 * 3600e3);
+  assert.equal(M.wdOnlyTtlMs(null), 48 * 3600e3);
+  assert.equal(M.wdOnlyTtlMs(0), 48 * 3600e3);
+  assert.equal(M.wdOnlyTtlMs(180), 26 * 3600e3);          // 3 h + 2 h < 26 h
+  assert.equal(M.wdOnlyTtlMs(1440), 26 * 3600e3);         // 24 h + 2 h = 26 h
+  assert.equal(M.wdOnlyTtlMs(30), 26 * 3600e3);
+  const now = Date.now();
+  const q = (h) => [{ id: "s", cmd: "UPDATE u", wdonly: true, status: "queued", queued_at: new Date(now - h * 3600e3).toISOString() }];
+  let a = q(25); assert.equal(M.expireWdOnly(a), 0, "25 h is inside 48 h fallback"); assert.equal(a[0].status, "queued");
+  a = q(25); assert.equal(M.expireWdOnly(a, now, 180), 0, "25 h is inside 26 h for a 3 h interval");
+  a = q(27); assert.equal(M.expireWdOnly(a, now, 180), 1); assert.equal(a[0].status, "cancelled"); assert.match(a[0].error, /26 h/);
+  a = q(49); assert.equal(M.expireWdOnly(a), 1); assert.match(a[0].error, /48 h/);
+  a = q(25); assert.equal(M.expireWdOnly(a, now), 0);      // signature: optional third arg
+  assert(M.fwAtLeast("tsim-updater 1.7.10", "1.7.9") && M.fwAtLeast("tsim-updater 1.7.10", "1.7.2"));
+  assert.equal(M.scheduledStatusText("tsim-updater 1.7.10"), "STATUS AUTO");
+  const T = (m) => new Date(Date.parse("2026-10-14T20:00:00Z") + m * 60e3).toISOString();
+  const sentAt = Date.parse(T(0));
+  const st0 = { tsim_update_sent: { at: T(0), asset_name: "firmware.bin", tag: "v1.7.10" } };
+  let p = M.computeProgress("tsim", [], st0, sentAt + 11 * 60e3);
+  assert.equal(p.state, "timeout"); assert.match(p.reason, /never woke up/);
+  p = M.computeProgress("tsim", [{ type: "heartbeat", msg: "Watchdog: check OK", received_at: T(2) }], st0, sentAt + 11 * 60e3);
+  assert.equal(p.state, "timeout"); assert.match(p.reason, /woke up after the update text/); assert.match(p.reason, /watchdog backup/);
+  p = M.computeProgress("tsim", [{ type: "status", msg: "STATUS", received_at: T(1) }], st0, sentAt + 11 * 60e3);
+  assert.match(p.reason, /woke up after the update text/);
+  p = M.computeProgress("tsim", [], { ...st0, last_checkin_ts: sentAt + 1000 }, sentAt + 12 * 60e3);
+  assert.equal(p.state, "timeout"); assert.match(p.reason, /woke up after the update text/);
+  p = M.computeProgress("tsim", [{ type: "action", msg: "Heltec UPDATE text sent", received_at: T(1) }], st0, sentAt + 11 * 60e3);
+  assert.match(p.reason, /never woke up/, "dashboard action is not a device report");
+  // fetch path uses telem wd_int, then wdcfg.int_min
+  const keep = JSON.parse(kv.get("cmds:tsim-1") || "[]").filter((c) => c.status !== "queued");
+  const lat = JSON.parse(kv.get("telem:tsim-1:latest") || "{}");
+  kv.set("telem:tsim-1:latest", JSON.stringify({ ...lat, fw: "tsim-updater 1.7.10", wd_int: 180 }));
+  kv.set("wdcfg:tsim-1", JSON.stringify({ int_min: 180, hb: true, sms: false }));
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu25", cmd: "UPDATE https://x/keep.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date(Date.now() - 25 * 3600e3).toISOString() }, ...keep]));
+  const K = { "X-Device-Key": JSON.parse(kv.get("device:tsim-1")).ingest_key };
+  const body25 = await (await call("/api/dev/tsim-1/commands?wd=1", { headers: K })).text();
+  assert.equal(body25, "wdu25\tUPDATE https://x/keep.bin\n", "25 h backup still served when wd interval is 3 h");
+  kv.set("cmds:tsim-1", JSON.stringify([{ id: "wdu49", cmd: "UPDATE https://x/drop.bin", sys: true, wdonly: true, status: "queued", queued_at: new Date(Date.now() - 49 * 3600e3).toISOString() }, ...keep]));
+  const body49 = await (await call("/api/dev/tsim-1/commands?wd=1", { headers: K })).text();
+  assert.equal(body49, "");
+  assert.equal(JSON.parse(kv.get("cmds:tsim-1")).find((c) => c.id === "wdu49").status, "cancelled");
+  console.log("v1.7.10 wdonly TTL and stall-message tests OK");
 }

@@ -563,7 +563,11 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now()) {
   }
   const lastAt = Math.max(startAt, ...mine.map((h) => Date.parse(h.received_at) || 0), st.last_checkin_ts || 0);
   if (state === "running" && now - lastAt > STALL_MS) { state = "timeout";
-    reason = step === 0 ? "The T-SIM never woke up to start the update. It may be out of power or have lost its cell connection. Press Retry to text it again." :
+    const reportedAfter = step === 0 && ((st.last_checkin_ts || 0) > startAt ||
+      (history || []).some((h) => h && h.type && h.type !== "action" && (Date.parse(h.received_at) || 0) > startAt));
+    reason = step === 0 ? (reportedAfter
+      ? "The T-SIM woke up after the update text but did not start the update. The text is probably still waiting on the modem and should run on its next wake (or the watchdog backup copy will). Press Retry to text it again."
+      : "The T-SIM never woke up to start the update. It may be out of power or have lost its cell connection. Press Retry to text it again.") :
       step === 4 && kind === "tsim" ? "The T-SIM didn't check in after rebooting. It has probably rolled back to its previous firmware. Press Retry to try again." :
       "The update started but stopped reporting for 10 minutes, most likely a lost cell connection mid-download. Press Retry to start it again."; }
   const out = { state, step, steps: STEPS, times, target, started_at: times[0], finished_at: finished, reason, pct: Math.round((step / 5) * 100) };
@@ -1255,16 +1259,26 @@ export const cfgListCmds = (vals = {}) => [...Object.keys(CACHE_LISTS), ...rptRe
 // v1.7.1 modem watchdog: the T-SIM wakes on a timer, checks the modem (AT, SIM, registration, packet attach), recovers it
 // (AT+CFUN, then a modem power-cycle) and posts a heartbeat. Settings reach the T-SIM as the WDCFG system command.
 // v1.7.2: watchdog wakes also fetch queued commands ("?wd=1"). A Heltec update is texted as usual AND queued as a
-// watchdog-only backup (wdonly): served only on watchdog fetches, cancelled when the text path starts it, expires after 24 h.
-export const WDCMD_FW = "1.7.2", WDONLY_TTL_MS = 24 * 3600 * 1000;
+// watchdog-only backup (wdonly): served only on watchdog fetches, cancelled when the text path starts it.
+// v1.7.10: TTL must outlive the T-SIM's watchdog interval (every good wake restarts that timer).
+// TTL = max(26 h, device wd interval + 2 h). Unknown interval (no telemetry wd_int, no settings) = 48 h.
+export const WDCMD_FW = "1.7.2", WDONLY_TTL_MS = 24 * 3600 * 1000;  // historical 24 h; expireWdOnly uses wdOnlyTtlMs
+export const WDONLY_TTL_MIN_MS = 26 * 3600 * 1000, WDONLY_TTL_FALLBACK_MS = 48 * 3600 * 1000;
+export function wdOnlyTtlMs(wdIntMin) {
+  const m = Number(wdIntMin);
+  if (!Number.isFinite(m) || m <= 0) return WDONLY_TTL_FALLBACK_MS;
+  return Math.max(WDONLY_TTL_MIN_MS, m * 60 * 1000 + 2 * 3600 * 1000);
+}
 export function queueWdUpdate(list, url, nowIso = new Date().toISOString(), idFn = () => randomHex(4)) {
   for (const c of list) if (c.wdonly && c.status === "queued") { c.status = "cancelled"; c.error = "replaced by a newer update"; }
   const e = { id: idFn(), cmd: `UPDATE ${url}`, sys: true, wdonly: true, status: "queued", queued_at: nowIso };
   list.unshift(e); return e;
 }
-export function expireWdOnly(list, nowMs = Date.now()) {
+export function expireWdOnly(list, nowMs = Date.now(), wdIntMin) {
+  const ttl = wdOnlyTtlMs(wdIntMin);
+  const hours = Math.round(ttl / 3600e3);
   let n = 0;
-  for (const c of list) if (c.wdonly && c.status === "queued" && nowMs - Date.parse(c.queued_at || 0) > WDONLY_TTL_MS) { c.status = "cancelled"; c.error = "expired (not picked up by a watchdog check-in within 24 h)"; n++; }
+  for (const c of list) if (c.wdonly && c.status === "queued" && nowMs - Date.parse(c.queued_at || 0) > ttl) { c.status = "cancelled"; c.error = `expired (not picked up by a watchdog check-in within ${hours} h)`; n++; }
   return n;
 }
 export function cancelWdOnlyOnTextStart(list) {
@@ -1495,7 +1509,10 @@ async function handleDeviceCommands(request, env, id) {
   const sysOnly = sp.get("sys") === "1";  // STATUS/REBOOT wakes: system commands only
   const wdWake = sp.get("wd") === "1";    // v1.7.2 watchdog wake: everything, plus a watchdog-only Heltec UPDATE
   const lat = (await kvJson(env, `telem:${id}:latest`)) || {};
-  const expired = expireWdOnly(list);
+  const wdCfg = (await kvJson(env, `wdcfg:${id}`)) || {};
+  const wdInt = typeof lat.wd_int === "number" && lat.wd_int > 0 ? lat.wd_int
+    : (typeof wdCfg.int_min === "number" && wdCfg.int_min > 0 ? wdCfg.int_min : undefined);
+  const expired = expireWdOnly(list, Date.now(), wdInt);
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
   const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || "")) && wdOnlyOk(c, wdWake, lat.fw)).reverse().slice(0, cmdsPerWake(lat.fw));
