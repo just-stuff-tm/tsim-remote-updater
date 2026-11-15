@@ -1331,7 +1331,8 @@ export function cancelWdOnlyOnTextStart(list) {
 export const wdOnlyOk = (c, wd, fw) => !c.wdonly || (wd && fwAtLeast(fw, WDCMD_FW));
 
 // ---------- v1.7.11: uploaded-file retry, cancel marker, SMS delivery check, text timing ----------
-export const UPLOAD_DELETED_MSG = "The uploaded file was deleted. Press Update radio firmware to send the current file.";
+export const UPLOAD_DELETED_MSG = "The uploaded file was deleted. Press Update radio firmware to send the file that is selected now.";
+export const RETRY_CANCELLED_MSG = "Nothing to retry: the last update was cancelled. Press Update radio firmware.";
 export function fwTokenFromUrl(url) {
   const m = String(url || "").match(/\/fw\/([0-9a-f]{32})(?:[/?#]|$)/i);
   return m ? m[1].toLowerCase() : "";
@@ -1354,21 +1355,75 @@ function relFromUpload(item, prev) {
     url: item.url, asset_name: item.name || (prev && prev.asset_name) || "firmware.bin",
     tag: (prev && prev.tag) || "upload",
     merged: item.merged != null ? !!item.merged : !!(prev && prev.merged),
-    size: item.size, via: "upload", asset_id: item.token, sha256: item.sha256, md5: item.md5 || null, kind: item.kind,
+    size: item.size != null ? item.size : (prev && prev.size),
+    via: "upload", asset_id: item.token,
+    sha256: item.sha256 || (prev && prev.sha256) || undefined,
+    md5: item.md5 || (prev && prev.md5) || null,
+    kind: item.kind || (prev && prev.kind) || undefined,
   };
 }
-// Retry of an upload-sourced send. Present = still in fwup AND the blob is still stored.
-// Missing: reuse a current upload with the same sha256. Otherwise 409.
-export function resolveUploadRetry(prevSent, uploads, blobOk) {
+// Same file as the send that is being retried: asset name and size both match.
+function sameUploadFile(a, prev) {
+  if (!a || !prev || prev.size == null || a.size == null) return false;
+  const name = a.name || a.asset_name;
+  return !!name && name === prev.asset_name && Number(a.size) === Number(prev.size);
+}
+// 4th arg of resolveUploadRetry. A fwup item, a token string, or { upload, item, release }.
+function selectedArg(selected, list) {
+  if (selected == null || selected === "") return null;
+  if (typeof selected === "string") {
+    const token = selected.toLowerCase();
+    return { item: (list || []).find((x) => x && x.token === token) || null, release: null };
+  }
+  const wrapped = selected.item != null || selected.upload != null || (selected.release && !selected.url);
+  if (wrapped) {
+    const release = selected.release || null;
+    const token = String((selected.item && selected.item.token) || selected.upload || "").toLowerCase();
+    const listed = token && (list || []).find((x) => x && x.token === token);
+    return { item: listed || selected.item || null, release };
+  }
+  if (selected.token) {
+    const listed = (list || []).find((x) => x && x.token === selected.token);
+    return { item: listed || selected, release: null };
+  }
+  return null;
+}
+// prevSent has no sha256. Use the selected upload's sha when that file's name and size match,
+// or release:<id> sha256 when that record is for the same upload and the same name and size.
+function recoveredSha(prevSent, sel) {
+  if (!sel) return "";
+  const item = sel.item, release = sel.release;
+  const relSha = release && release.sha256 ? String(release.sha256) : "";
+  const relForThis = !!(relSha && item && (release.via == null || release.via === "upload") &&
+    (!release.asset_id || String(release.asset_id).toLowerCase() === String(item.token || "").toLowerCase()));
+  if (item && item.sha256 && sameUploadFile(item, prevSent)) return String(item.sha256);
+  if (relForThis && (sameUploadFile(item, prevSent) || sameUploadFile(release, prevSent))) return relSha;
+  return "";
+}
+// Retry of an upload-sourced send.
+// 1. Same token still stored (and its blob) → that file.
+// 2. Same sha256 still in fwup → that file (sha recovered from the selected upload when prevSent has none).
+// 3. No sha known → the selected upload when its name and size match.
+// 4. Otherwise 409.
+// selected (optional 4th arg) is the currently selected upload: a token, a fwup item, or { upload, item, release }.
+export function resolveUploadRetry(prevSent, uploads, blobOk, selected) {
   const okBlob = typeof blobOk === "function" ? blobOk : () => true;
   const list = uploads || [];
   const prevTok = prevSent && FW_TOKEN_RE.test(String(prevSent.asset_id || "")) ? String(prevSent.asset_id).toLowerCase() : fwTokenFromUrl(prevSent && prevSent.url);
   const cur = prevTok && list.find((x) => x && x.token === prevTok);
   if (cur && okBlob(cur.token)) return { ok: true, rel: relFromUpload(cur, prevSent), replaced: false };
-  const sha = prevSent && prevSent.sha256;
+  const sel = selectedArg(selected, list);
+  const known = !!(prevSent && prevSent.sha256);
+  const sha = known ? String(prevSent.sha256) : recoveredSha(prevSent, sel);
   if (sha) {
     const alt = list.find((x) => x && x.sha256 === sha && x.token !== prevTok && okBlob(x.token));
     if (alt) return { ok: true, rel: relFromUpload(alt, prevSent), replaced: true };
+  }
+  if (!known && sel && sel.item && sel.item.token && sel.item.token !== prevTok && okBlob(sel.item.token) && sameUploadFile(sel.item, prevSent)) {
+    const rel = relFromUpload(sel.item, prevSent);
+    const rs = recoveredSha(prevSent, sel);
+    if (!rel.sha256 && rs) rel.sha256 = rs;
+    return { ok: true, rel, replaced: true };
   }
   return { ok: false, status: 409, error: UPLOAD_DELETED_MSG };
 }
@@ -2700,8 +2755,10 @@ async function deviceApi(request, env, dev, action) {
   if (action === "update-latest") {
     let rel;
     const retry = await bodyRetry(request);
+    const st0 = await loadState(env, id);
+    if (retry && heltecCancelActive(st0)) return json({ sent: false, error: RETRY_CANCELLED_MSG }, 409);
     const d = await dupeCheck(env, id, "heltec", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409);
-    const prevSent = ((await kvJson(env, `state:${id}`)) || {}).last_update_sent;
+    const prevSent = st0.last_update_sent;
     if (retry && prevSent && prevSent.url) {
       if (isUploadSent(prevSent)) {
         const uploads = await fwList(env, id);
@@ -2709,12 +2766,16 @@ async function deviceApi(request, env, dev, action) {
         const t0 = fwTokenFromUrl(prevSent.url) || (FW_TOKEN_RE.test(String(prevSent.asset_id || "")) ? String(prevSent.asset_id).toLowerCase() : "");
         if (t0) tokens.add(t0);
         for (const it of uploads) if (it && it.token) tokens.add(it.token);
+        const src = await getSource(env, id);
+        if (src && src.upload) tokens.add(src.upload);
         const have = new Set();
         for (const t of tokens) if (await env.STATE.get(`fwblob:${t}`)) have.add(t);
-        const resolved = resolveUploadRetry(prevSent, uploads, (t) => have.has(t));
+        const releaseRec = await kvJson(env, `release:${id}`);
+        const selected = (src && src.upload) || releaseRec ? { upload: src && src.upload, release: releaseRec } : null;
+        const resolved = resolveUploadRetry(prevSent, uploads, (t) => have.has(t), selected);
         if (!resolved.ok) return json({ sent: false, error: resolved.error }, resolved.status || 409);
         rel = resolved.rel;
-      } else rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via, asset_id: prevSent.asset_id };
+      } else rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via, asset_id: prevSent.asset_id, sha256: prevSent.sha256, md5: prevSent.md5, kind: prevSent.kind };
     } else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const merged = rel.merged === true || MERGED_NAME_RE.test(rel.asset_name || "");
@@ -2730,8 +2791,9 @@ async function deviceApi(request, env, dev, action) {
     const smsUrl = (String(sms).match(/^UPDATE (\S+)/) || [])[1];
     const qUrl = smsUrl ? smsUrl.replace(/%5F/gi, "_") : rel.url;
     const [o, c] = await manualSend(env, dev, sms, `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
-      delete st.heltec_cancel;  // v1.7.11: a new Update/Retry clears the cancel marker
-      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, sms_url: qUrl, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
+      delete st.heltec_cancel;  // a new Update or Retry clears the cancel marker
+      const checksum = { ...(rel.sha256 ? { sha256: rel.sha256 } : {}), ...(rel.md5 ? { md5: rel.md5 } : {}), ...(rel.kind ? { kind: rel.kind } : {}) };
+      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, sms_url: qUrl, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, ...checksum } : checksum) };
     });
     // v1.7.2 backup: same URL the text used (short /gh/<id> when the direct URL does not fit in 160).
     // v1.7.11: do not queue a backup of a URL the user just cancelled.
@@ -2842,6 +2904,14 @@ export function radioStatus(mesh, s, rel, flashedFallback = null) {
 // Already-current radios stay updatable (reinstall). The button asks before sending.
 export function radioUpdateConfirm(upToDate) {
   return upToDate ? "already up to date, reinstall?" : "Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.";
+}
+// Which radio-update buttons to show. Update stays available whenever a source is selected.
+// Retry only after the latest send (one newer than any cancel) has stalled or failed.
+// Cancel while running, stalled, or failed — not after cancelled. Injected into the page via toString.
+export function updButtons(state, hasSource) {
+  var s = state || "idle";
+  var on = hasSource !== false;
+  return { update: on, retry: !!(on && (s === "timeout" || s === "failed")), cancel: s === "running" || s === "timeout" || s === "failed" };
 }
 function statuses(latest, mesh, s, hist, rel, tsimRel) {
   return { tsim: updateStatus(latest && latest.fw, tsimRel), radio: radioStatus(mesh, s, rel, radioFlashed(s, hist)) };
@@ -3126,7 +3196,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 
 <div class="pane" id="t-radio" hidden>
 <div class="acts">
-<button data-a="update-latest" class="w" data-c="Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.">Update radio firmware</button>
+<button data-a="update-latest" data-mode="update" class="w" data-c="Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.">Update radio firmware</button>
+<button type="button" id="hretry" data-a="update-latest" data-mode="retry" class="w" hidden>Retry radio update</button>
 <button type="button" id="hcancel" class="g" hidden>Cancel update</button>
 <button data-a="reboot" class="g" data-c="Restart the LoRa radio (repeater)?">Reboot radio</button>
 <button data-a="check" data-c="" class="g">Check for updates</button>
@@ -3358,7 +3429,7 @@ function armText(j){
  if(dly!=null)window._t=setTimeout(load,dly)}
 const rj=async r=>{try{return await r.json()}catch{return{}}};
 const say=(id,ok,msg)=>{const el=$(id);el.className="msg "+(ok?"ok":"bad");el.textContent=msg};
-let first=true,pending={},PRE={},RADCUR=false;
+let first=true,pending={},PRE={},RADCUR=false,SRC_ON=true;
 let fastUntil=0,waitReport=0,waitIds=null,pollBusy=false,pollAgain=false;
 function prog(p,label,pend){
  if(pend&&(!p||p.state==="idle"||(p.started_at&&new Date(p.started_at)<pend)))p={state:"running",step:0,pct:0,steps:["Waiting for T-SIM to wake","Downloading","Verifying","Writing / flashing","Rebooting","Done"],times:{0:pend.toISOString()}};
@@ -3449,7 +3520,7 @@ $("tsimf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const j=await rj(r);say("tsimmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){tsimLoaded=false;showTsim(j.source);load();}};
 let srcLoaded=false;
 function showSource(s){const f=$("srcf");$("srcsum").textContent=s.enabled?s.repo+" · "+(s.tag_prefix?s.tag_prefix+"* · ":"")+s.asset_pattern:(s.direct_url?"direct link":"not set");
- const off=!s.enabled&&!s.direct_url&&!s.upload;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
+ const off=!s.enabled&&!s.direct_url&&!s.upload;SRC_ON=!off;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=off;b.title=off?"Set an update source first":""});
  if(!srcLoaded){srcSaved={enabled:!!s.enabled,repo:s.repo||"",asset_pattern:s.asset_pattern||"",tag_prefix:s.tag_prefix||"",direct_url:s.direct_url||""};writeSrc(f,s);
   const key=presetMatch(s),sel=$("preset");let c=sel.querySelector('option[value="custom"]');
   if(!key){if(!c){c=document.createElement("option");c.value="custom";c.textContent="Custom GitHub source (saved)";sel.appendChild(c)}sel.value="custom";$("srccustom").hidden=false;$("presetnote").textContent="Saved custom GitHub source. Edit it below, or choose Stock MeshCore and press Save."}
@@ -3684,14 +3755,22 @@ const OKMSG={status:"Text sent. The T-SIM will wake and report within ~2 minutes
  "update-latest":"Text sent. The Heltec update starts when the T-SIM wakes. Follow it on the LoRa radio tab.","tsim-update":"Text sent. The T-SIM update starts when it wakes. Follow it on the T-SIM tab."};
 const ULBL={"update-latest":"Update radio firmware","tsim-update":"Update T-SIM firmware"},UKIND={"update-latest":"heltec","tsim-update":"tsim"};
 ${radioUpdateConfirm.toString()}
-// Dynamic update buttons: Update (idle/done) -> Cancel (queued/running) -> Retry (failed/stalled/cancelled). Up to date does not disable Update.
+${updButtons.toString()}
+// Radio: Update radio firmware stays (normal send of the selected source). Retry is #hretry, only when stalled or failed.
+// Cancel is #hcancel while running, stalled, or failed. T-SIM stays one button (Update -> Cancel -> Retry): its cancel
+// is refused once the update has failed, and a retry after cancel still re-resolves the release.
 function setUpd(a,kind,p,pend){const s=pend&&(!p||p.state==="idle"||p.state==="done")?"running":(p&&p.state)||"idle";
- const mode=s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"update";
- document.querySelectorAll('button[data-a="'+a+'"]').forEach(b=>{if(b.dataset.busy)return;b.dataset.mode=mode;
-  b.textContent=mode==="cancel"?"Cancel "+(kind==="tsim"?"T-SIM":"radio")+" update":mode==="retry"?"Retry "+(kind==="tsim"?"T-SIM":"radio")+" update":ULBL[a];
-  b.className=mode==="cancel"?"g":"w";
-  if(a==="update-latest"&&mode==="update")b.dataset.c=radioUpdateConfirm(RADCUR)});
- const hc=$("hcancel");if(hc&&a==="update-latest")hc.hidden=!(s==="running"||s==="timeout"||s==="failed")}
+ if(a!=="update-latest"){const mode=s==="running"?"cancel":(s==="failed"||s==="timeout"||s==="cancelled")?"retry":"update";
+  document.querySelectorAll('button[data-a="'+a+'"]').forEach(b=>{if(b.dataset.busy)return;b.dataset.mode=mode;
+   b.textContent=mode==="cancel"?"Cancel T-SIM update":mode==="retry"?"Retry T-SIM update":ULBL[a];
+   b.className=mode==="cancel"?"g":"w"});
+  return}
+ const bt=updButtons(s,SRC_ON);
+ document.querySelectorAll('button[data-a="update-latest"][data-mode="update"]').forEach(b=>{if(b.dataset.busy)return;
+  b.textContent=ULBL[a];b.className="w";b.disabled=!bt.update;b.title=bt.update?"":"Set an update source first";
+  b.dataset.c=radioUpdateConfirm(RADCUR)});
+ const rb=$("hretry");if(rb){rb.hidden=!bt.retry;if(!rb.dataset.busy)rb.disabled=!bt.retry}
+ const hc=$("hcancel");if(hc)hc.hidden=!bt.cancel}
 async function updClick(b,a){const kind=UKIND[a],mode=b.dataset.mode||"update";
  if(mode==="cancel"){if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return null;
   const r=await post("update-cancel",{kind});const j=await rj(r);if(r.ok){delete pending[kind];toast(j.note,"ok")}else toast(friendly(j,r.status),"bad");return true}
@@ -3729,7 +3808,7 @@ function fwKind(u8,name){const L=u8.length,g=o=>[u8[o],u8[o+1]],h=g(0),p=L>0x800
  if(pt||(app10&&gap)||(pt7&&app0))return{ok:true,merged:true};if(app0)return{ok:true,merged:nm,nameOnly:nm};return{ok:false}}
 function showFwup(d){const F=d.fwup||{items:[]};FWU=F;TGTM=!!F.target_merged;
  const sel=F.items.find(x=>x.token===F.selected);
- if(sel){$("srcsum").textContent="Uploaded file: "+sel.name;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=false;b.title=""})}
+ if(sel){$("srcsum").textContent="Uploaded file: "+sel.name;SRC_ON=true;document.querySelectorAll('button[data-a="update-latest"]').forEach(b=>{b.disabled=false;b.title=""})}
  $("upsum").textContent=F.items.length?F.items.length+" file(s)"+(sel?" · Update uses "+sel.name:""):"none";
  $("mwarn").hidden=!TGTM;
  const fl=((d.progress||{}).heltec||{}).flash;
