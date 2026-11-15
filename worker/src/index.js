@@ -547,7 +547,9 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
     }
   }
   const cancel = kind === "tsim" ? st.tsim_cancel : st.heltec_cancel;
-  if (state === "running" && cancel && Date.parse(cancel.at) >= startAt)
+  // v1.7.11: a Heltec cancel also clears a failed (and, while still "running", a stall) display.
+  const cancelStops = state === "running" || (kind === "heltec" && state === "failed");
+  if (cancelStops && cancel && Date.parse(cancel.at) >= startAt)
     return { state: "cancelled", step, steps: STEPS, times, target, started_at: times[0], finished_at: cancel.at, pct: 0,
       reason: cancel.note || "Cancel requested." };
   // Version check: if the device already runs the target (or newer), the update is done, whatever the log says.
@@ -812,7 +814,10 @@ async function handleIngest(request, env, id) {
   const tlf = tlFields(t.tl);
   if (Object.keys(tlf).length) {  // v1.7.0: every post refreshes the T-SIM card
     const prev0 = (await kvJson(env, `telem:${id}:latest`)) || {};
+    const diagLine = tlf.sms_diag ? smsDiagLine(tlf.sms_diag) : "";
+    const prevDiag = smsDiagLine(prev0.sms_diag);
     await putJson(env, `telem:${id}:latest`, { ...prev0, ...tlf, tl_at: entry.received_at, received_at: entry.received_at });
+    if (diagLine && diagLine !== prevDiag) await logActivity(env, id, { type: "event", msg: diagLine });  // v1.7.11
   }
   const hrp = hrpInfo(t.tl, entry.received_at);  // v1.7.4: Heltec reboots the T-SIM couldn't report when they happened
   if (hrp) {
@@ -1324,6 +1329,177 @@ export function cancelWdOnlyOnTextStart(list) {
   return n;
 }
 export const wdOnlyOk = (c, wd, fw) => !c.wdonly || (wd && fwAtLeast(fw, WDCMD_FW));
+
+// ---------- v1.7.11: uploaded-file retry, cancel marker, SMS delivery check, text timing ----------
+export const UPLOAD_DELETED_MSG = "The uploaded file was deleted. Press Update radio firmware to send the current file.";
+export function fwTokenFromUrl(url) {
+  const m = String(url || "").match(/\/fw\/([0-9a-f]{32})(?:[/?#]|$)/i);
+  return m ? m[1].toLowerCase() : "";
+}
+export function isUploadSent(sent) {
+  if (!sent) return false;
+  if (sent.via === "upload") return true;
+  return !!fwTokenFromUrl(sent.url);
+}
+export function urlsMatch(a, b) {
+  const A = String(a || ""), B = String(b || "");
+  if (!A || !B) return false;
+  if (A === B) return true;
+  const ta = fwTokenFromUrl(A), tb = fwTokenFromUrl(B);
+  if (ta && tb && ta === tb) return true;
+  return A.replace(/\/+$/, "") === B.replace(/\/+$/, "");
+}
+function relFromUpload(item, prev) {
+  return {
+    url: item.url, asset_name: item.name || (prev && prev.asset_name) || "firmware.bin",
+    tag: (prev && prev.tag) || "upload",
+    merged: item.merged != null ? !!item.merged : !!(prev && prev.merged),
+    size: item.size, via: "upload", asset_id: item.token, sha256: item.sha256, md5: item.md5 || null, kind: item.kind,
+  };
+}
+// Retry of an upload-sourced send. Present = still in fwup AND the blob is still stored.
+// Missing: reuse a current upload with the same sha256. Otherwise 409.
+export function resolveUploadRetry(prevSent, uploads, blobOk) {
+  const okBlob = typeof blobOk === "function" ? blobOk : () => true;
+  const list = uploads || [];
+  const prevTok = prevSent && FW_TOKEN_RE.test(String(prevSent.asset_id || "")) ? String(prevSent.asset_id).toLowerCase() : fwTokenFromUrl(prevSent && prevSent.url);
+  const cur = prevTok && list.find((x) => x && x.token === prevTok);
+  if (cur && okBlob(cur.token)) return { ok: true, rel: relFromUpload(cur, prevSent), replaced: false };
+  const sha = prevSent && prevSent.sha256;
+  if (sha) {
+    const alt = list.find((x) => x && x.sha256 === sha && x.token !== prevTok && okBlob(x.token));
+    if (alt) return { ok: true, rel: relFromUpload(alt, prevSent), replaced: true };
+  }
+  return { ok: false, status: 409, error: UPLOAD_DELETED_MSG };
+}
+export function cancelQueuedForToken(list, token, error = "the uploaded file was deleted") {
+  const tok = String(token || "").toLowerCase();
+  let n = 0;
+  for (const c of list || []) {
+    if (!c || c.status !== "queued" || !/^UPDATE\s/i.test(c.cmd || "")) continue;
+    const u = (String(c.cmd).match(/^UPDATE\s+(\S+)/i) || [])[1] || "";
+    if (tok && fwTokenFromUrl(u) === tok) { c.status = "cancelled"; c.error = error; n++; }
+  }
+  return n;
+}
+export function heltecCancelMatches(cancel, url) {
+  if (!cancel || !url) return false;
+  if (urlsMatch(cancel.url, url) || urlsMatch(cancel.sms_url, url)) return true;
+  if (Array.isArray(cancel.urls) && cancel.urls.some((u) => urlsMatch(u, url))) return true;
+  const tok = fwTokenFromUrl(url);
+  if (tok && cancel.token && tok === String(cancel.token).toLowerCase()) return true;
+  return false;
+}
+// A cancel blocks that URL until a newer send of the same URL supersedes it.
+// No url: the marker is active unless a newer last_update_sent exists (any URL).
+export function heltecCancelActive(st, url) {
+  const cancel = st && st.heltec_cancel;
+  if (!cancel || !cancel.at) return false;
+  const sent = st.last_update_sent;
+  if (url) {
+    if (!heltecCancelMatches(cancel, url)) return false;
+    if (sent && sent.at && String(sent.at) > String(cancel.at) && (urlsMatch(sent.url, url) || urlsMatch(sent.sms_url, url))) return false;
+    return true;
+  }
+  if (sent && sent.at && String(sent.at) > String(cancel.at)) return false;
+  return true;
+}
+// Device check before an SMS UPDATE. Missing url is 400 so the firmware fails open.
+export function updateDeliveryOk(url, st, uploads, blobOkFn) {
+  const u = String(url || "").trim();
+  if (!u) return { status: 400, body: { ok: false, reason: "missing url" } };
+  if (heltecCancelActive(st, u)) return { status: 200, body: { ok: false, reason: "cancelled on the dashboard" } };
+  const tok = fwTokenFromUrl(u);
+  if (tok) {
+    const it = (uploads || []).find((x) => x && x.token === tok);
+    const blobOk = typeof blobOkFn === "function" ? !!blobOkFn(tok) : true;
+    if (!it || !blobOk) return { status: 200, body: { ok: false, reason: "uploaded file was deleted" } };
+  }
+  return { status: 200, body: { ok: true, reason: "" } };
+}
+// Compact line for the T-SIM card. Self-contained (injected into the page via toString): no backticks, no other helpers.
+export function smsDiagLine(sd) {
+  if (!sd || typeof sd !== "object") return "";
+  var wake = sd.w != null ? sd.w : sd.wake;
+  var passes = Array.isArray(sd.st) ? sd.st : (Array.isArray(sd.passes) ? sd.passes : []);
+  var rawTx = Array.isArray(sd.tx) ? sd.tx : [];
+  var txs = [];
+  for (var i = 0; i < rawTx.length && txs.length < 4; i++) {
+    var t = rawTx[i];
+    if (Array.isArray(t)) txs.push({ idx: t[0], scts: t[1], read_ms: t[2] });
+    else if (t && typeof t === "object") txs.push({ idx: t.idx, scts: t.scts, read_ms: t.read_ms });
+  }
+  var cm = Array.isArray(sd.cm) ? sd.cm : (Array.isArray(sd.cmti) ? sd.cmti : []);
+  function sec(ms) {
+    var n = Number(ms);
+    if (!Number.isFinite(n) || n < 0) return "";
+    if (n < 1000) return Math.round(n) + " ms";
+    return (Math.round(n / 100) / 10).toFixed(1) + " s";
+  }
+  function clock(s) {
+    var m = String(s || "").match(/(\d{2}:\d{2}:\d{2})/);
+    return m ? m[1] : "";
+  }
+  var names = { 0: "power", 2: "text", 3: "gpio6", 4: "timer", 7: "usb" };
+  var parts = [];
+  var nums = [];
+  for (var p = 0; p < passes.length && p < 4; p++) {
+    var nv = Number(passes[p]);
+    if (Number.isFinite(nv) && nv >= 0) nums.push(nv);
+  }
+  if (nums.length === 1) parts.push("store " + nums[0]);
+  else if (nums.length > 1) parts.push("store " + nums[0] + "→" + nums[nums.length - 1]);
+  for (var j = 0; j < txs.length; j++) {
+    var tx = txs[j];
+    var bit = "read #" + tx.idx;
+    var ck = clock(tx.scts);
+    var at = sec(tx.read_ms);
+    if (ck) bit += " sent " + ck;
+    if (at) bit += " at " + at;
+    parts.push(bit);
+  }
+  var cms = [];
+  for (var c = 0; c < cm.length && c < 4; c++) {
+    var cv = Number(cm[c]);
+    if (Number.isFinite(cv) && cv >= 0) {
+      var cs = sec(cv);
+      if (cs) cms.push(cs);
+    }
+  }
+  if (cms.length) parts.push("+CMTI at " + cms.join(", "));
+  if (!parts.length && (wake == null || wake === "")) return "";
+  var line = "Texts: " + parts.join(", ");
+  if (wake != null && wake !== "" && Number.isFinite(Number(wake))) {
+    var w = Number(wake);
+    var wn = Object.prototype.hasOwnProperty.call(names, w) ? names[w] : String(w);
+    line += (parts.length ? ", " : "") + "wake=" + wn;
+  }
+  return line;
+}
+export function smsDiagKeep(sd) {
+  if (!sd || typeof sd !== "object") return null;
+  const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const out = {};
+  const w = n(sd.w) != null ? sd.w : n(sd.wake);
+  if (w != null) out.w = Math.max(-1, Math.min(99, Math.floor(w)));
+  const st = Array.isArray(sd.st) ? sd.st : sd.passes;
+  if (Array.isArray(st)) {
+    const a = st.slice(0, 4).map(n).filter((v) => v != null && v >= 0 && v <= 999).map((v) => Math.floor(v));
+    if (a.length) out.st = a;
+  }
+  const txs = [];
+  for (const t of (Array.isArray(sd.tx) ? sd.tx : []).slice(0, 4)) {
+    if (Array.isArray(t) && n(t[0]) != null && n(t[2]) != null) txs.push([Math.floor(t[0]), String(t[1] ?? "").replace(/[^0-9:/,+-]/g, "").slice(0, 24), Math.max(0, Math.floor(t[2]))]);
+    else if (t && typeof t === "object" && n(t.idx) != null) txs.push([Math.floor(t.idx), String(t.scts ?? "").replace(/[^0-9:/,+-]/g, "").slice(0, 24), Math.max(0, Math.floor(n(t.read_ms) || 0))]);
+  }
+  if (txs.length) out.tx = txs;
+  const cmSrc = Array.isArray(sd.cm) ? sd.cm : sd.cmti;
+  if (Array.isArray(cmSrc)) {
+    const a = cmSrc.slice(0, 4).map(n).filter((v) => v != null && v >= 0 && v <= 3600000).map((v) => Math.floor(v));
+    if (a.length) out.cm = a;
+  }
+  return smsDiagLine(out) ? out : null;
+}
 export const WD_FW = "1.7.1", DEFAULT_WD = { int_min: 180, hb: true, sms: false };
 export const WD_CHOICES = [0, 30, 60, 120, 180, 360, 720, 1440];
 // v1.7.3: hwake (Heltec-reboot wake on GPIO6) is only added once set, so 1.7.1/1.7.2 commands stay byte-identical.
@@ -1439,6 +1615,8 @@ export function tlFields(tl) {
   const pt = tok(tl.psm_tau, /^(rej|none|[01]{8})$/); if (pt) o.psm_tau = pt;
   const pa = tok(tl.psm_act, /^(rej|none|[01]{8})$/); if (pa) o.psm_act = pa;
   if (n(tl.awake_ms) !== undefined && tl.awake_ms >= 0 && tl.awake_ms <= 3600000) o.awake_ms = tl.awake_ms;
+  const sd = smsDiagKeep(tl.sd);  // v1.7.11 text-timing diagnostic
+  if (sd) o.sms_diag = sd;
   return o;
 }
 export const DEFAULT_GPS = { auto: false, timeout_s: 180 };
@@ -1550,6 +1728,13 @@ async function handleDeviceCommands(request, env, id) {
   // telem.wd_int > 0 wins (firmware 1440 after dashboard int=0); else wdcfg.int_min > 0; else 48 h.
   const wdInt = wdTtlIntervalMin(lat, wdCfg);
   const expired = expireWdOnly(list, Date.now(), wdInt);
+  const stCmd = await loadState(env, id);
+  let blocked = 0;
+  for (const c of list) {  // v1.7.11: a dashboard cancel also drops a queued UPDATE (normal and wdonly)
+    if (!c || c.status !== "queued" || !/^UPDATE\s/i.test(c.cmd || "")) continue;
+    const u = (String(c.cmd).match(/^UPDATE\s+(\S+)/i) || [])[1] || "";
+    if (u && heltecCancelActive(stCmd, u)) { c.status = "cancelled"; c.error = "update cancelled"; blocked++; }
+  }
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
   const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || "")) && wdOnlyOk(c, wdWake, lat.fw)).reverse().slice(0, cmdsPerWake(lat.fw));
@@ -1557,9 +1742,23 @@ async function handleDeviceCommands(request, env, id) {
   let bytes = 0; const fits = []; for (const c of pending) { bytes += `${c.id}\t${c.cmd}\n`.length; if (bytes > (fwAtLeast(lat.fw, BATCH_FW) ? CMD_FETCH_BYTES : 1700)) break; fits.push(c); }
   pending.length = 0; pending.push(...fits);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
-  if (pending.length || expired) await putJson(env, `cmds:${id}`, list);
+  if (pending.length || expired || blocked) await putJson(env, `cmds:${id}`, list);
   const nowS = Math.floor(Date.now() / 1000) + 2;
   return new Response(pending.map((c) => `${c.id}\t${c.cmd.replace("{{now}}", String(nowS))}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
+}
+
+// v1.7.11: the T-SIM asks this before running an SMS-delivered UPDATE. Same device key as /commands.
+async function handleUpdateOk(request, env, id) {
+  const dev = await getDevice(env, id);
+  const key = request.headers.get("X-Device-Key") || "";
+  if (!dev || !dev.ingest_key || !safeEq(key, dev.ingest_key)) return json({ error: "unauthorized" }, 401);
+  const q = new URL(request.url).searchParams.get("url") || "";
+  const st = (await loadState(env, id)) || {};
+  const uploads = await fwList(env, id);
+  const tok = fwTokenFromUrl(q);
+  const blobOk = tok ? !!(await env.STATE.get(`fwblob:${tok}`)) : true;
+  const r = updateDeliveryOk(q, st, uploads, () => blobOk);
+  return json(r.body, r.status);
 }
 
 // v1.7.0: list of read-only commands the T-SIM caches (text/plain, one per line).
@@ -1820,7 +2019,11 @@ async function handleFwDelete(request, env, dev) {
   await putJson(env, `fwup:${id}`, list.filter((x) => x !== it));
   const src = await getSource(env, id);
   if (src.upload === it.token) { delete src.upload; await putJson(env, `source:${id}`, src); await env.STATE.delete(`release:${id}`); }
+  const cmds = (await kvJson(env, `cmds:${id}`)) || [];
+  const dropped = cancelQueuedForToken(cmds, it.token);
+  if (dropped) await putJson(env, `cmds:${id}`, cmds);
   await logActivity(env, id, { type: "action", msg: `Uploaded firmware deleted: ${it.name}` });
+  if (dropped) await logActivity(env, id, { type: "action", msg: `Cancelled ${dropped} queued update(s) for the deleted file` });
   return json({ deleted: true, source: src });
 }
 // Public download for the T-SIM: unguessable 128-bit token, no underscores, exact Content-Length, single Range supported.
@@ -2326,19 +2529,40 @@ async function deviceApi(request, env, dev, action) {
     const st = await loadState(env, id);
     const hist = (await kvJson(env, `telem:${id}:history`)) || [];
     const p = computeProgress(kind, hist, st);
-    if (p.state !== "running" && p.state !== "timeout") return json({ cancelled: false, error: "No update is in progress." }, 409);
+    const heltecOpen = kind === "heltec" && (p.state === "running" || p.state === "timeout" || p.state === "failed");
+    const tsimOpen = kind === "tsim" && (p.state === "running" || p.state === "timeout");
+    if (!heltecOpen && !tsimOpen) return json({ cancelled: false, error: "No update is in progress." }, 409);
     let cleared = 0;
+    const cancelledIds = [], cancelledUrls = [];
     if (kind === "tsim") {
       const list = (await kvJson(env, `cmds:${id}`)) || [];
       for (const c of list) if (c.status === "queued" && c.sys && isTsimUpd(c)) { c.status = "cancelled"; cleared++; }
+      if (cleared) await putJson(env, `cmds:${id}`, list);
+    } else {
+      const list = (await kvJson(env, `cmds:${id}`)) || [];
+      for (const c of list) {
+        if (!c || c.status !== "queued" || !/^UPDATE\s/i.test(c.cmd || "")) continue;
+        c.status = "cancelled"; c.error = "update cancelled"; cleared++;
+        if (c.id) cancelledIds.push(c.id);
+        const u = (String(c.cmd).match(/^UPDATE\s+(\S+)/i) || [])[1];
+        if (u) cancelledUrls.push(u);
+      }
       if (cleared) await putJson(env, `cmds:${id}`, list);
     }
     const note = kind === "tsim"
       ? (cleared ? "Cancelled before the T-SIM picked it up. Nothing will be installed." : "Cancel requested. The T-SIM had already started, so it may finish the current step.")
       : (p.step === 0 ? "Cancel requested. The update text was already delivered, so the T-SIM may still run it when it wakes." : "Cancel requested. The device may finish the current step.");
-    st[kind === "tsim" ? "tsim_cancel" : "heltec_cancel"] = { at: new Date().toISOString(), cleared, note };
+    const at = new Date().toISOString();
+    if (kind === "tsim") st.tsim_cancel = { at, cleared, note };
+    else {
+      const sent = st.last_update_sent || {};
+      const urls = [];
+      for (const u of [sent.url, sent.sms_url, ...cancelledUrls]) if (u && !urls.includes(u)) urls.push(u);
+      const token = fwTokenFromUrl(sent.sms_url) || fwTokenFromUrl(sent.url) || (FW_TOKEN_RE.test(String(sent.asset_id || "")) ? String(sent.asset_id).toLowerCase() : "");
+      st.heltec_cancel = { at, cleared, note, url: sent.url || "", sms_url: sent.sms_url || sent.url || "", token, urls, ids: cancelledIds };
+    }
     await putJson(env, `state:${id}`, st);
-    await logActivity(env, id, { type: "action", msg: `${kind === "tsim" ? "T-SIM" : "Radio"} update cancelled by user (${cleared ? "queued command removed" : "device may finish current step"})` });
+    await logActivity(env, id, { type: "action", msg: kind === "heltec" ? "Update cancelled" : `T-SIM update cancelled by user (${cleared ? "queued command removed" : "device may finish current step"})` });
     return json({ cancelled: true, cleared, note });
   }
   if (action === "tsim-check" || action === "tsim-update") {
@@ -2478,8 +2702,20 @@ async function deviceApi(request, env, dev, action) {
     const retry = await bodyRetry(request);
     const d = await dupeCheck(env, id, "heltec", retry); if (d) return json({ sent: false, error: d, duplicate: true }, 409);
     const prevSent = ((await kvJson(env, `state:${id}`)) || {}).last_update_sent;
-    if (retry && prevSent && prevSent.url) rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via, asset_id: prevSent.asset_id };
-    else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
+    if (retry && prevSent && prevSent.url) {
+      if (isUploadSent(prevSent)) {
+        const uploads = await fwList(env, id);
+        const tokens = new Set();
+        const t0 = fwTokenFromUrl(prevSent.url) || (FW_TOKEN_RE.test(String(prevSent.asset_id || "")) ? String(prevSent.asset_id).toLowerCase() : "");
+        if (t0) tokens.add(t0);
+        for (const it of uploads) if (it && it.token) tokens.add(it.token);
+        const have = new Set();
+        for (const t of tokens) if (await env.STATE.get(`fwblob:${t}`)) have.add(t);
+        const resolved = resolveUploadRetry(prevSent, uploads, (t) => have.has(t));
+        if (!resolved.ok) return json({ sent: false, error: resolved.error }, resolved.status || 409);
+        rel = resolved.rel;
+      } else rel = { url: prevSent.url, asset_name: prevSent.asset_name, tag: prevSent.tag, merged: !!prevSent.merged, size: prevSent.size, via: prevSent.via, asset_id: prevSent.asset_id };
+    } else try { ({ rel } = await resolveTarget(env, id)); } catch (e) { return json({ sent: false, error: e.message }, 502); }
     if (rel.skipped) return json({ sent: false, error: rel.skipped }, 404);
     const merged = rel.merged === true || MERGED_NAME_RE.test(rel.asset_name || "");
     if (merged) {
@@ -2491,15 +2727,21 @@ async function deviceApi(request, env, dev, action) {
     if (risk) { await logActivity(env, id, { type: "action", msg: risk }); return json({ sent: false, error: risk, blocked: true }, 409); }
     if (!(retry && prevSent && prevSent.url)) await putJson(env, `release:${id}`, { ...rel, checked_at: new Date().toISOString() });
     const sms = await smsUpdateUrl(env, new URL(request.url).origin, rel);
+    const smsUrl = (String(sms).match(/^UPDATE (\S+)/) || [])[1];
+    const qUrl = smsUrl ? smsUrl.replace(/%5F/gi, "_") : rel.url;
     const [o, c] = await manualSend(env, dev, sms, `UPDATE ${retry ? "retry " : ""}${merged ? "FULL ERASE " : ""}${rel.via === "upload" ? "uploaded " : ""}${rel.asset_name}`, async (st) => {
-      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
+      delete st.heltec_cancel;  // v1.7.11: a new Update/Retry clears the cancel marker
+      st.last_update_sent = { at: new Date().toISOString(), asset_name: rel.asset_name, tag: rel.tag, url: rel.url, sms_url: qUrl, asset_id: rel.asset_id, retry, ...(merged ? { merged: true } : {}), ...(rel.via === "upload" ? { via: "upload", size: rel.size, sha256: rel.sha256, md5: rel.md5 } : {}) };
     });
     // v1.7.2 backup: same URL the text used (short /gh/<id> when the direct URL does not fit in 160).
+    // v1.7.11: do not queue a backup of a URL the user just cancelled.
     let wdq = null;
     if (c !== 429 && c !== 400 && fwAtLeast(tfw, WDCMD_FW)) {
-      const list = (await kvJson(env, `cmds:${id}`)) || [];
-      const smsUrl = (String(sms).match(/^UPDATE (\S+)/) || [])[1];
-      wdq = queueWdUpdate(list, smsUrl ? smsUrl.replace(/%5F/gi, "_") : rel.url); await putJson(env, `cmds:${id}`, list);
+      const stNow = await loadState(env, id);
+      if (!heltecCancelActive(stNow, qUrl)) {
+        const list = (await kvJson(env, `cmds:${id}`)) || [];
+        wdq = queueWdUpdate(list, qUrl); await putJson(env, `cmds:${id}`, list);
+      }
     }
     return json({ ...o, release: rel, ...(wdq ? { wd_backup: wdq.id } : {}) }, c);
   }
@@ -2885,6 +3127,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="pane" id="t-radio" hidden>
 <div class="acts">
 <button data-a="update-latest" class="w" data-c="Update the LoRa radio (repeater) to the latest firmware? It will be reflashed and restart.">Update radio firmware</button>
+<button type="button" id="hcancel" class="g" hidden>Cancel update</button>
 <button data-a="reboot" class="g" data-c="Restart the LoRa radio (repeater)?">Reboot radio</button>
 <button data-a="check" data-c="" class="g">Check for updates</button>
 </div>
@@ -3087,6 +3330,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <script>${COMMON_JS}
 const ID=${JSON.stringify(dev.id)},API="/api/d/"+encodeURIComponent(ID)+"/";
 const WAKE={0:"Power-on / reset",2:"Text message",3:"GPIO6",4:"Timer",7:"USB / other"};
+${smsDiagLine.toString()}
 const RST={1:"Power-on",3:"Software restart",4:"Panic / crash",5:"Watchdog (interrupt)",6:"Watchdog (task)",7:"Watchdog",8:"Deep-sleep wake",9:"Brownout"},RST_BAD={4:1,5:1,6:1,7:1,9:1};
 const up=s=>s==null?null:(s>=86400?Math.floor(s/86400)+"d ":"")+(s>=3600?Math.floor(s%86400/3600)+"h ":"")+Math.floor(s%3600/60)+"m";
 const POLL_FAST_MS=${POLL_FAST_MS},POLL_IDLE_MS=${POLL_IDLE_MS},POLL_UPDATE_MS=${POLL_UPDATE_MS},POLL_FAST_FOR_MS=${POLL_FAST_FOR_MS};
@@ -3141,7 +3385,7 @@ async function load(){
  const CI=(d.watchdog&&d.watchdog.checkin)||{},off=!!CI.offline;
  $("seen").textContent=seen?(off?"Offline · last seen ":stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale||off?" stale":"");
  const ow=$("offwarn");ow.hidden=!off;if(off)ow.textContent="⚠ The T-SIM has missed "+CI.missed+" expected check-ins (expected every "+hrs(CI.expected_s/60)+" by its "+(CI.by==="schedule"?"scheduled check":"watchdog")+"; last seen "+ago(L.received_at)+", "+t(L.received_at)+" ET). Its modem may be off the network: texts won't reach it until it reconnects. The watchdog retries on its own; if it stays silent, power-cycle it on site.";
- $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],["Last reset",L.rr==null?null:{h:(RST_BAD[L.rr]?'<span class="err">':"<span>")+e(RST[L.rr]||String(L.rr))+"</span>"}],["Uptime",L.uptime==null?null:up(L.uptime)],...(L.edrx==null?[]:[["eDRX",L.edrx?"on, asked "+(L.edrx_req||"?")+", network "+(L.edrx_nw==="rej"?"rejected":L.edrx_nw&&L.edrx_nw!=="none"?L.edrx_nw:"not granted"):"off"]]),...(L.psm==null?[]:[["PSM",L.psm?"on, requested TAU "+(L.psm_tau||"?")+" / active "+(L.psm_act||"?")+" (grant unknown)":"off"]]),...(L.awake_ms>0?[["Previous wake",L.awake_ms>=1000?(L.awake_ms/1000).toFixed(1)+" s":L.awake_ms+" ms"]]:[])]);
+ $("c-tsim").innerHTML=kv([["Firmware",L.fw],["Last seen",L.received_at?{h:(off?'<span class="err">':"<span>")+e(ago(L.received_at))+"</span>"}:null],["Last report",t(L.received_at)],["Expected check-in",CI.expected_s?"every "+hrs(CI.expected_s/60)+" ("+(CI.by==="schedule"?"scheduled check":"watchdog")+")":"none (wakes only when texted)"],["Chip temperature",L.chip_temp_c==null?null:(imp()?(L.chip_temp_c*9/5+32).toFixed(0)+" °F":L.chip_temp_c.toFixed(0)+" °C")],["Woke by",L.wake==null?null:(WAKE[L.wake]||L.wake)],...(function(){var s=smsDiagLine(L.sms_diag);return s?[["Texts",s]]:[]})(),["Last reset",L.rr==null?null:{h:(RST_BAD[L.rr]?'<span class="err">':"<span>")+e(RST[L.rr]||String(L.rr))+"</span>"}],["Uptime",L.uptime==null?null:up(L.uptime)],...(L.edrx==null?[]:[["eDRX",L.edrx?"on, asked "+(L.edrx_req||"?")+", network "+(L.edrx_nw==="rej"?"rejected":L.edrx_nw&&L.edrx_nw!=="none"?L.edrx_nw:"not granted"):"off"]]),...(L.psm==null?[]:[["PSM",L.psm?"on, requested TAU "+(L.psm_tau||"?")+" / active "+(L.psm_act||"?")+" (grant unknown)":"off"]]),...(L.awake_ms>0?[["Previous wake",L.awake_ms>=1000?(L.awake_ms/1000).toFixed(1)+" s":L.awake_ms+" ms"]]:[])]);
  $("c-power").innerHTML=kv([["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V ("+L.battery_pct+"%)"],["Battery (LTE on)",L.battery_load_v==null?null:L.battery_load_v.toFixed(2)+" V"],["Solar",L.solar_v==null?null:L.solar_v.toFixed(2)+" V"],["Battery protection",L.lb_state==null?null:(L.lb_state?"Repeat OFF (low battery)":"normal")],["Free memory",L.heap==null?null:Math.round(L.heap/1024)+" KB"],["Storage free",L.fs_free==null?null:Math.round(L.fs_free/1024)+" KB"]]);
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
@@ -3446,7 +3690,8 @@ function setUpd(a,kind,p,pend){const s=pend&&(!p||p.state==="idle"||p.state==="d
  document.querySelectorAll('button[data-a="'+a+'"]').forEach(b=>{if(b.dataset.busy)return;b.dataset.mode=mode;
   b.textContent=mode==="cancel"?"Cancel "+(kind==="tsim"?"T-SIM":"radio")+" update":mode==="retry"?"Retry "+(kind==="tsim"?"T-SIM":"radio")+" update":ULBL[a];
   b.className=mode==="cancel"?"g":"w";
-  if(a==="update-latest"&&mode==="update")b.dataset.c=radioUpdateConfirm(RADCUR)})}
+  if(a==="update-latest"&&mode==="update")b.dataset.c=radioUpdateConfirm(RADCUR)});
+ const hc=$("hcancel");if(hc&&a==="update-latest")hc.hidden=!(s==="running"||s==="timeout"||s==="failed")}
 async function updClick(b,a){const kind=UKIND[a],mode=b.dataset.mode||"update";
  if(mode==="cancel"){if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return null;
   const r=await post("update-cancel",{kind});const j=await rj(r);if(r.ok){delete pending[kind];toast(j.note,"ok")}else toast(friendly(j,r.status),"bad");return true}
@@ -3470,6 +3715,12 @@ document.querySelectorAll("button[data-a]").forEach(b=>b.onclick=async()=>{
  }catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
  delete b.dataset.busy;b.textContent=old;b.disabled=false;load();
 });
+$("hcancel").onclick=async()=>{const b=$("hcancel");if(!b||b.dataset.busy)return;
+ if(!confirm("Cancel this update? No text is sent. If the device already started it may finish the current step."))return;
+ b.dataset.busy=1;b.disabled=true;const old=b.textContent;b.textContent="Working…";
+ try{const r=await post("update-cancel",{kind:"heltec"});const j=await rj(r);if(r.ok){delete pending.heltec;toast(j.note||"Update cancelled","ok")}else toast(friendly(j,r.status),"bad")}
+ catch(x){toast("Couldn't reach the dashboard. Check your internet connection and try again.","bad")}
+ delete b.dataset.busy;b.textContent=old;b.disabled=false;load()};
 /* ---- firmware upload ---- */
 let FWU={items:[],selected:"",max:4194304,per_device:3},TGTM=false;
 const kb=n=>n>=1048576?(n/1048576).toFixed(2)+" MB":Math.round(n/1024)+" KB";
@@ -3664,6 +3915,7 @@ export default {
       }
       if (parts[0] === "ingest" && parts.length === 2 && m === "POST") return await handleIngest(request, env, parts[1]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "commands" && m === "GET") return await handleDeviceCommands(request, env, parts[2]);
+      if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "updok" && m === "GET") return await handleUpdateOk(request, env, parts[2]);
       if (parts[0] === "api" && parts[1] === "dev" && parts.length === 4 && parts[3] === "cfglist" && m === "GET") return await handleCfgList(request, env, parts[2]);
       if (parts[0] === "admin" && (parts[1] === "devices" || parts[1] === "accounts")) return await handleAdmin(request, env, parts.slice(1));
       if (url.pathname === "/" && m === "GET") {

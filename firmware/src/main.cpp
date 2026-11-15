@@ -20,6 +20,7 @@
 #include "tsim_frame.h" // v1.7.7 @TSIM frame parser (host-tested)
 #include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras; v1.7.10 late +CMTI window (host-tested)
 #include "lp_power.h"   // v1.7.9 eDRX / PSM parsing (host-tested)
+#include "sms_diag.h"   // v1.7.11 text-timing diagnostic + SMS UPDATE allow check (host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -76,6 +77,7 @@ static int s_log_head = 0;
 static int s_log_count = 0;
 static char s_last_result[160] = "none";
 static esp_sleep_wakeup_cause_t s_wake_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
+static SmsDiag s_sms_diag;   // v1.7.11 text timing for this wake (no extra wait)
 // v1.7.9: text (ext0), GPIO6 (ext1) and timer wakes are in the field. A cold/USB power-on is not.
 static bool fieldWake() {
   return s_wake_cause == ESP_SLEEP_WAKEUP_EXT0
@@ -754,11 +756,11 @@ static bool ingestPostTls(const char *json) {
 static void markOtaValidIfPending(const char *why);
 // v1.7.0: every post carries a compact telemetry snapshot ("tl") so the dashboard's T-SIM card stays current.
 static size_t telemJson(char *out, size_t cap);
-static char s_post_buf[4096 + 1024];  // v1.7.9: telemJson grew (eDRX/PSM/awake_ms); keep room on a large post
+static char s_post_buf[4096 + 2048];  // v1.7.11: telemJson also carries the text-timing "sd" object
 static bool ingestSendRaw(const char *json) {
   size_t L = strlen(json);
-  // v1.7.9: reserve ~768 B so the tl block is not started and then dropped.
-  if (L > 1 && L + 768 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
+  // v1.7.11: reserve ~1400 B so the tl block (eDRX/PSM + sd) is not started and then dropped.
+  if (L > 1 && L + 1400 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
     memcpy(s_post_buf, json, L - 1); size_t o = L - 1;
     o += telemJson(s_post_buf + o, sizeof(s_post_buf) - o - 2);
     s_post_buf[o++] = '}'; s_post_buf[o] = 0; json = s_post_buf;
@@ -1011,7 +1013,10 @@ static void meshSnapshot(void) {
 }
 
 // HTTPS GET over ESP32 TLS (same path as firmware downloads). Body -> out (NUL-terminated). Returns HTTP status.
-static int httpsGetTls(const char *url, char *out, size_t cap) {
+// timeout_ms == 0 keeps the v1.7.10 waits (20 s status line, 10 s per header line, 15 s body).
+// A non-zero value is the budget for the status line, each header line, and the body (v1.7.11 updok).
+// The TLS connect itself has no separate timeout (the existing client).
+static int httpsGetTls(const char *url, char *out, size_t cap, uint32_t timeout_ms = 0) {
   out[0] = 0;
   UrlParts u;
   if (!parseUrl(url, u)) return -1;
@@ -1030,15 +1035,18 @@ static int httpsGetTls(const char *url, char *out, size_t cap) {
                u.path, u.host, g_device_key);
     ssl.flush();
     char line[200];
-    if (clientReadLine(ssl, line, sizeof(line), 20000) >= 0) sscanf(line, "HTTP/%*d.%*d %d", &st);
+    const uint32_t hdr_ms = timeout_ms ? timeout_ms : 20000;
+    const uint32_t mid_ms = timeout_ms ? timeout_ms : 10000;
+    const uint32_t body_ms = timeout_ms ? timeout_ms : 15000;
+    if (clientReadLine(ssl, line, sizeof(line), hdr_ms) >= 0) sscanf(line, "HTTP/%*d.%*d %d", &st);
     bool chunked = false; long clen = -1;
-    while (clientReadLine(ssl, line, sizeof(line), 10000) > 0) {
+    while (clientReadLine(ssl, line, sizeof(line), mid_ms) > 0) {
       if (strncasecmp(line, "Content-Length:", 15) == 0) clen = atol(line + 15);
       if (strncasecmp(line, "Transfer-Encoding:", 18) == 0 && strstr(line, "chunked")) chunked = true;
     }
     size_t n = 0;
     uint32_t t0 = millis();
-    while (millis() - t0 < 15000 && n + 1 < cap && (clen < 0 || (long)n < clen)) {
+    while (millis() - t0 < body_ms && n + 1 < cap && (clen < 0 || (long)n < clen)) {
       int c = ssl.available() ? ssl.read() : -1;
       if (c < 0) { if (!ssl.connected()) break; delay(5); continue; }
       out[n++] = (char)c;
@@ -2362,6 +2370,10 @@ static size_t telemJson(char *out, size_t cap) {
     o += snprintf(out + o, cap - o, ",\"hrp\":%u,\"hrpa\":%lld,\"hrps\":\"%s\"", (unsigned)s_hrp_n, ago, s_hrp_src);
     s_hrp_sent = s_hrp_n;
   }
+  if (o < cap) {  // v1.7.11: text timing. Writes nothing (and is omitted) when this wake recorded nothing.
+    size_t sd = smsDiagJson(&s_sms_diag, out + o, cap - o);
+    if (sd && o + sd < cap) o += sd;
+  }
   if (o < cap) o += snprintf(out + o, cap - o, "}");
   if (o >= cap) s_hrp_sent = 0;
   return o < cap ? o : 0;
@@ -3002,8 +3014,29 @@ static int upPoll(uint32_t *up_out) {
   return 1;
 }
 
+// v1.7.11: SMS-delivered UPDATE only. Fail-open on any check problem (old dashboard, no
+// route, timeout, TLS, tcp already busy). Queued watchdog UPDATE and USB UPDATE do not call this.
+// Returns true when the update should run.
+static bool smsUpdateAllowed(const char *fw_url) {
+  if (!fw_url || !fw_url[0]) return true;
+  if (s_tcp_busy) { logf("updok: tcp busy, running update"); return true; }
+  static char enc[700];
+  if (!urlQueryEncode(fw_url, enc, sizeof(enc)) || !enc[0]) { logf("updok: url encode failed, running update"); return true; }
+  static char url[900];
+  int n = snprintf(url, sizeof(url), "%s/api/dev/%s/updok?url=%s", g_worker_url, g_device_id, enc);
+  if (n < 0 || n >= (int)sizeof(url)) { logf("updok: request too long, running update"); return true; }
+  static char body[480];
+  int st = httpsGetTls(url, body, sizeof(body), 8000);
+  char why[80];
+  if (updokShouldRun(st, body, why, sizeof(why))) return true;
+  logf("updok: skip (%s)", why);
+  char em[140];
+  snprintf(em, sizeof(em), "UPDATE skipped: cancelled on dashboard (%.60s)", why);
+  ingestEvent("event", em);
+  return false;
+}
+
 static bool handleCommand(const char *from, const char *body) {
-  (void)from;
   strncpy(s_cmdbuf, body, sizeof(s_cmdbuf) - 1);
   s_cmdbuf[sizeof(s_cmdbuf) - 1] = 0;
   normalizeSmsBody(s_cmdbuf);
@@ -3050,6 +3083,8 @@ static bool handleCommand(const char *from, const char *body) {
     if (strchr(url, ' ')) return false;
     static char url_copy[URL_MAX];
     strncpy(url_copy, url, sizeof(url_copy) - 1); url_copy[sizeof(url_copy) - 1] = 0;
+    // USB serial skips the dashboard check. A text from the modem asks first (fail-open).
+    if (!(from && strcmp(from, "USB") == 0) && !smsUpdateAllowed(url_copy)) return true;
     doUpdate(url_copy, true);
     return true;
   }
@@ -3157,6 +3192,9 @@ static bool looksLikeCommand(const char *body) {
 }
 
 static void processSmsInbox(bool unread_only) {
+  // v1.7.11: one AT+CPMS? per inbox pass (read+unread count). No extra wait.
+  if (modemAT("AT+CPMS?", 3000)) smsDiagAddStore(&s_sms_diag, smsDiagParseCpms(s_at_resp));
+  else smsDiagAddStore(&s_sms_diag, -1);
   // Read with UCS2 so every char ('_', '@', '$', ...) arrives as unambiguous hex.
   modemAT("AT+CSCS=\"UCS2\"");
   bool all_mode = false;
@@ -3202,6 +3240,7 @@ static void processSmsInbox(bool unread_only) {
         }
       }
     }
+    if (!m.stale) smsDiagAddText(&s_sms_diag, m.idx, m.ts, (uint32_t)millis());
   }
   // Pass 2: delete every collected message first, so nothing can be replayed after a reboot.
   for (int i = 0; i < count; i++) {
@@ -3238,7 +3277,7 @@ static bool modemPollCmti() {
     if (c == '\r') continue;
     if (c == '\n') {
       line[n] = 0;
-      if (smsLateLineIsCmti(line)) { logf("v1.7.10: %s", line); saw = true; }
+      if (smsLateLineIsCmti(line)) { logf("v1.7.10: %s", line); saw = true; smsDiagAddCmti(&s_sms_diag, (uint32_t)millis()); }
       n = 0;
     } else if (n + 1 < sizeof(line)) line[n++] = c;
     else n = 0;
@@ -3468,6 +3507,7 @@ static bool modemSmsLight() {
 void setup() {
   deadlineArm(AWAKE_MAX_S);   // v1.7.2: first thing, so nothing after this can keep the T-SIM awake forever
   s_wake_cause = esp_sleep_get_wakeup_cause();   // v1.7.9: before the USB settle, so a field wake can skip it
+  smsDiagBegin(&s_sms_diag, (int)s_wake_cause);  // v1.7.11: timing only; does not add a wait
   bool fast = (s_wake_cause == ESP_SLEEP_WAKEUP_EXT0) || (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER);
   Serial.begin(115200);
   if (fieldWake()) Serial.setTxTimeoutMs(10);   // v1.7.9: an idle USB host must not stall each log line (default 100 ms)

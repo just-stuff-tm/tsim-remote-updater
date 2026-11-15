@@ -2156,3 +2156,208 @@ console.log("serial.ondemand tests OK");
   if (sentKeep == null) kv.delete("sent:tsim-1"); else kv.set("sent:tsim-1", sentKeep);
   console.log("v1.7.10 wdonly TTL and stall-message tests OK");
 }
+
+// ---------- v1.7.11: upload retry, cancel during retry, updok, text-timing line ----------
+{
+  const M = await import("../src/index.js");
+  const LINE = "Texts: store 1→2, read #3 sent 13:45:10 at 2.1 s, +CMTI at 9.8 s, wake=text";
+  const raw = { w: 2, st: [1, 2], tx: [[3, "26/11/15,13:45:10-20", 2100]], cm: [9800] };
+  assert.equal(M.smsDiagLine(raw), LINE);
+  assert.equal(M.smsDiagLine({ wake: 2, passes: [1, 2], tx: [{ idx: 3, scts: "26/11/15,13:45:10-20", read_ms: 2100 }], cmti: [9800] }), LINE);
+  assert.equal(M.smsDiagLine(null), "");
+  assert.equal(M.smsDiagLine({}), "");
+  const kept = M.smsDiagKeep(raw);
+  assert.equal(M.smsDiagLine(kept), LINE);
+  const tokA = "a".repeat(32), tokB = "b".repeat(32);
+  const itemA = { token: tokA, name: "a.bin", url: "https://w/fw/" + tokA, sha256: "sha-a", md5: "md5-a", size: 20000, merged: false, kind: "app" };
+  const itemB = { token: tokB, name: "b.bin", url: "https://w/fw/" + tokB, sha256: "sha-a", md5: "md5-b", size: 20000, merged: false, kind: "app" };
+  const prevA = { via: "upload", url: itemA.url, asset_id: tokA, asset_name: "a.bin", tag: "upload", sha256: "sha-a", md5: "md5-a", size: 20000 };
+  let rr = M.resolveUploadRetry(prevA, [itemA], () => true);
+  assert.equal(rr.ok, true); assert.equal(rr.replaced, false); assert.equal(rr.rel.url, itemA.url); assert.equal(rr.rel.asset_id, tokA);
+  rr = M.resolveUploadRetry(prevA, [itemB], (t) => t === tokB);
+  assert.equal(rr.ok, true); assert.equal(rr.replaced, true); assert.equal(rr.rel.url, itemB.url); assert.equal(rr.rel.asset_id, tokB); assert.equal(rr.rel.sha256, "sha-a"); assert.equal(rr.rel.md5, "md5-b");
+  rr = M.resolveUploadRetry(prevA, [], () => false);
+  assert.equal(rr.ok, false); assert.equal(rr.status, 409);
+  assert.equal(rr.error, "The uploaded file was deleted. Press Update radio firmware to send the current file.");
+  rr = M.resolveUploadRetry(prevA, [itemA], () => false);  // listed, blob gone, no other sha
+  assert.equal(rr.ok, false); assert.equal(rr.status, 409);
+  assert.equal(M.isUploadSent({ url: "https://github.com/x/a.bin" }), false);
+  assert.equal(M.isUploadSent({ via: "upload", url: "https://example.com/a.bin" }), true);
+  assert.equal(M.isUploadSent({ url: "https://w/fw/" + tokA }), true);
+  const T0 = "2026-11-15T12:00:00.000Z", t0 = Date.parse(T0);
+  const note = "Cancel requested. The update text was already delivered, so the T-SIM may still run it when it wakes.";
+  let p = M.computeProgress("heltec", [{ type: "update", msg: "FAIL: download", received_at: new Date(t0 + 2000).toISOString() }],
+    { last_update_sent: { at: T0, url: itemA.url, asset_name: "a.bin" }, heltec_cancel: { at: new Date(t0 + 3000).toISOString(), note } }, t0 + 5000);
+  assert.equal(p.state, "cancelled"); assert.equal(p.reason, note);
+  p = M.computeProgress("heltec", [], { last_update_sent: { at: T0, url: itemA.url, asset_name: "a.bin" }, heltec_cancel: { at: new Date(t0 + 11 * 60e3).toISOString(), note: "n" } }, t0 + 11 * 60e3 + 1000);
+  assert.equal(p.state, "cancelled");
+  p = M.computeProgress("heltec", [{ type: "update", msg: "SUCCESS: a.bin", received_at: new Date(t0 + 2000).toISOString() }],
+    { last_update_sent: { at: T0, asset_name: "a.bin" }, heltec_cancel: { at: new Date(t0 + 3000).toISOString(), note: "n" } }, t0 + 5000);
+  assert.equal(p.state, "done");
+  p = M.computeProgress("tsim", [{ type: "update", msg: "TSIM OTA FAIL: download", received_at: new Date(t0 + 2000).toISOString() }],
+    { tsim_update_sent: { at: T0, asset_name: "firmware.bin", tag: "v1.7.11" }, tsim_cancel: { at: new Date(t0 + 3000).toISOString(), note: "Nothing will be installed." } }, t0 + 5000);
+  assert.equal(p.state, "failed");
+  const mkApp = (n, seed) => { const b = new Uint8Array(n); b[0] = 0xE9; b[1] = 5; b[12] = 9; for (let i = 24; i < n; i++) b[i] = (i * seed) & 0xff; return b; };
+  await admin("/admin/devices", "POST", { id: "up-1", name: "Up", hologram_device_id: "1234567" });
+  await admin("/admin/devices/up-1/reset-password", "POST", { password: "up-device-password" });
+  const uc = (await login("up-1", "up-device-password", "11.7.11.1")).headers.get("Set-Cookie").split(";")[0];
+  const U = (a, b) => call("/api/d/up-1/" + a, { method: "POST", headers: { Cookie: uc, "Content-Type": "application/json" }, body: b === undefined ? undefined : JSON.stringify(b) });
+  const UP = (bytes, name) => call("/api/d/up-1/fw-upload", { method: "POST", headers: { Cookie: uc, "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(name) }, body: bytes });
+  const key = JSON.parse(kv.get("device:up-1")).ingest_key;
+  const ing = (o) => call("/ingest/up-1", { method: "POST", headers: { "X-Device-Key": key }, body: JSON.stringify(o) });
+  const tel = async () => (await call("/api/d/up-1/telemetry", { headers: { Cookie: uc } })).json();
+  const age = () => {
+    const back = new Date(Date.now() - 11 * 60e3).toISOString();
+    const ts = Date.now() - 11 * 60e3;
+    for (const k of ["state:up-1", "sent:up-1"]) {
+      const s = JSON.parse(kv.get(k) || "{}");
+      s.last_send_ts = ts;
+      if (s.last_update_sent) s.last_update_sent.at = back;
+      kv.set(k, JSON.stringify(s));
+    }
+  };
+  await ing({ type: "status", fw: "tsim-updater 1.7.11", msg: "STATUS" });
+  const app = mkApp(20000, 3);
+  let r = await UP(app, "radio-a.bin"); assert.equal(r.status, 201); const it = (await r.json()).item;
+  assert.equal((await U("source", { upload: it.token })).status, 200);
+  r = await U("update-latest"); let j = await r.json(); assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.body, "UPDATE " + it.url + " ");
+  age(); const hSame = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.body, "UPDATE " + it.url + " "); assert.equal(holo, hSame + 1);
+  assert.equal(JSON.parse(kv.get("state:up-1")).last_update_sent.asset_id, it.token);
+  assert.equal(JSON.parse(kv.get("state:up-1")).last_update_sent.sha256, it.sha256);
+  age();
+  kv.set("cmds:up-1", JSON.stringify([{ id: "tw", cmd: "UPDATE " + it.url, sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() }]));
+  assert.equal((await tel()).progress.heltec.state, "timeout");
+  r = await U("update-cancel", { kind: "heltec" }); j = await r.json();
+  assert.equal(j.cancelled, true, JSON.stringify(j));
+  assert.equal((await tel()).progress.heltec.state, "cancelled");
+  assert.equal(JSON.parse(kv.get("cmds:up-1")).find((c) => c.id === "tw").error, "update cancelled");
+  assert.equal((await U("update-cancel", { kind: "heltec" })).status, 409);
+  age();
+  kv.set("cmds:up-1", JSON.stringify([
+    { id: "n1", cmd: "UPDATE " + it.url, sys: true, status: "queued", queued_at: new Date().toISOString() },
+    { id: "w1", cmd: "UPDATE " + it.url, sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() },
+    { id: "other", cmd: "UPDATE https://w/fw/" + "c".repeat(32), sys: true, status: "queued", queued_at: new Date().toISOString() },
+    { id: "keep", cmd: "get name", status: "queued", queued_at: new Date().toISOString() },
+  ]));
+  r = await U("fw-delete", { token: it.token }); assert.equal(r.status, 200, JSON.stringify(await r.clone().json()));
+  const cmdsDel = JSON.parse(kv.get("cmds:up-1"));
+  assert.equal(cmdsDel.find((c) => c.id === "n1").status, "cancelled");
+  assert.equal(cmdsDel.find((c) => c.id === "n1").error, "the uploaded file was deleted");
+  assert.equal(cmdsDel.find((c) => c.id === "w1").status, "cancelled");
+  assert.equal(cmdsDel.find((c) => c.id === "w1").error, "the uploaded file was deleted");
+  assert.equal(cmdsDel.find((c) => c.id === "other").status, "queued");
+  assert.equal(cmdsDel.find((c) => c.id === "keep").status, "queued");
+  const histDel = JSON.parse(kv.get("telem:up-1:history"));
+  assert.ok(histDel.some((h) => h.msg === "Cancelled 2 queued update(s) for the deleted file"));
+  r = await UP(app, "radio-a-again.bin"); assert.equal(r.status, 201); const it2 = (await r.json()).item;
+  assert.notEqual(it2.token, it.token); assert.equal(it2.sha256, it.sha256);
+  age(); const hNew = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.body, "UPDATE " + it2.url + " "); assert.equal(holo, hNew + 1);
+  assert.equal(JSON.parse(kv.get("state:up-1")).last_update_sent.url, it2.url);
+  assert.equal(JSON.parse(kv.get("state:up-1")).last_update_sent.asset_id, it2.token);
+  assert.equal(JSON.parse(kv.get("state:up-1")).last_update_sent.sha256, it2.sha256);
+  age();
+  assert.equal((await U("fw-delete", { token: it2.token })).status, 200);
+  const hGone = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 409); assert.equal(j.error, "The uploaded file was deleted. Press Update radio firmware to send the current file.");
+  assert.equal(holo, hGone);
+  const appC = mkApp(18000, 9);
+  r = await UP(appC, "radio-c.bin"); assert.equal(r.status, 201); const itC = (await r.json()).item;
+  assert.equal((await U("source", { upload: itC.token })).status, 200);
+  age();
+  r = await U("update-latest"); j = await r.json(); assert.equal(j.sent, true, JSON.stringify(j)); assert.equal(j.body, "UPDATE " + itC.url + " ");
+  age();
+  kv.delete("fwblob:" + itC.token);
+  const hBlob = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 409); assert.equal(j.error, "The uploaded file was deleted. Press Update radio firmware to send the current file.");
+  assert.equal(holo, hBlob);
+  assert.equal((await U("fw-delete", { token: itC.token })).status, 200);
+  const appD = mkApp(19000, 11);
+  r = await UP(appD, "radio-d.bin"); assert.equal(r.status, 201); const itD = (await r.json()).item;
+  assert.equal((await U("source", { upload: itD.token })).status, 200);
+  age();
+  r = await U("update-latest"); j = await r.json(); assert.equal(j.sent, true, JSON.stringify(j));
+  await ing({ type: "update", msg: "FAIL: download", fw: "tsim-updater 1.7.11" });
+  let tp = await tel(); assert.equal(tp.progress.heltec.state, "failed");
+  kv.set("cmds:up-1", JSON.stringify([
+    { id: "fn", cmd: "UPDATE " + itD.url, sys: true, status: "queued", queued_at: new Date().toISOString() },
+    { id: "fw", cmd: "UPDATE " + itD.url, sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() },
+    { id: "fk", cmd: "get ver", status: "queued", queued_at: new Date().toISOString() },
+  ]));
+  r = await U("update-cancel", { kind: "heltec" }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.cancelled, true);
+  const cmdsC = JSON.parse(kv.get("cmds:up-1"));
+  assert.equal(cmdsC.find((c) => c.id === "fn").status, "cancelled"); assert.equal(cmdsC.find((c) => c.id === "fn").error, "update cancelled");
+  assert.equal(cmdsC.find((c) => c.id === "fw").status, "cancelled"); assert.equal(cmdsC.find((c) => c.id === "fw").error, "update cancelled");
+  assert.equal(cmdsC.find((c) => c.id === "fk").status, "queued");
+  const stC = JSON.parse(kv.get("state:up-1"));
+  assert.ok(stC.heltec_cancel && stC.heltec_cancel.at); assert.equal(stC.heltec_cancel.url, itD.url);
+  tp = await tel(); assert.equal(tp.progress.heltec.state, "cancelled");
+  assert.notEqual(tp.progress.heltec.state, "failed"); assert.notEqual(tp.progress.heltec.state, "timeout");
+  assert.ok(JSON.parse(kv.get("telem:up-1:history")).some((h) => h.msg === "Update cancelled"));
+  const served = await (await call("/api/dev/up-1/commands?wd=1", { headers: { "X-Device-Key": key } })).text();
+  assert.equal(served, "");
+  kv.set("cmds:up-1", JSON.stringify([{ id: "late", cmd: "UPDATE " + itD.url, sys: true, wdonly: true, status: "queued", queued_at: new Date().toISOString() }]));
+  const served2 = await (await call("/api/dev/up-1/commands?wd=1", { headers: { "X-Device-Key": key } })).text();
+  assert.equal(served2, "");
+  assert.equal(JSON.parse(kv.get("cmds:up-1")).find((c) => c.id === "late").status, "cancelled");
+  assert.equal(JSON.parse(kv.get("cmds:up-1")).find((c) => c.id === "late").error, "update cancelled");
+  const oldFail = new Date(Date.now() - 11 * 60e3).toISOString();
+  const histF = JSON.parse(kv.get("telem:up-1:history"));
+  for (const h of histF) if (h.msg === "FAIL: download") h.received_at = oldFail;
+  kv.set("telem:up-1:history", JSON.stringify(histF));
+  const stFix = JSON.parse(kv.get("state:up-1"));
+  if (stFix.last_update_result && stFix.last_update_result.msg === "FAIL: download") stFix.last_update_result.at = oldFail;
+  kv.set("state:up-1", JSON.stringify(stFix));
+  age(); const hRetry = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.sent, true); assert.equal(j.body, "UPDATE " + itD.url + " "); assert.equal(holo, hRetry + 1);
+  const stR = JSON.parse(kv.get("state:up-1"));
+  assert.equal(stR.heltec_cancel, undefined);
+  tp = await tel(); assert.equal(tp.progress.heltec.state, "running");
+  const wd = JSON.parse(kv.get("cmds:up-1")).find((c) => c.wdonly && c.status === "queued");
+  assert.ok(wd && wd.cmd === "UPDATE " + itD.url);
+  const up = (url) => call("/api/dev/up-1/updok?url=" + encodeURIComponent(url || ""), { headers: { "X-Device-Key": key } });
+  assert.equal((await call("/api/dev/up-1/updok?url=" + encodeURIComponent(itD.url))).status, 401);
+  assert.equal((await call("/api/dev/up-1/updok?url=https://w/x", { headers: { "X-Device-Key": "nope" } })).status, 401);
+  r = await up(itD.url); j = await r.json(); assert.equal(r.status, 200); assert.equal(j.ok, true);
+  const sentNow = JSON.parse(kv.get("state:up-1"));
+  sentNow.heltec_cancel = { at: new Date(Date.parse(sentNow.last_update_sent.at) + 1000).toISOString(), url: itD.url, sms_url: itD.url, token: itD.token, urls: [itD.url], note: note };
+  kv.set("state:up-1", JSON.stringify(sentNow));
+  r = await up(itD.url); j = await r.json(); assert.equal(j.ok, false); assert.equal(j.reason, "cancelled on the dashboard");
+  sentNow.last_update_sent = { ...sentNow.last_update_sent, at: new Date(Date.parse(sentNow.heltec_cancel.at) + 1000).toISOString(), url: itD.url, sms_url: itD.url };
+  kv.set("state:up-1", JSON.stringify(sentNow));
+  const sentKey = JSON.parse(kv.get("sent:up-1") || "{}");
+  sentKey.last_update_sent = sentNow.last_update_sent; kv.set("sent:up-1", JSON.stringify(sentKey));
+  r = await up(itD.url); j = await r.json(); assert.equal(j.ok, true, JSON.stringify(j));
+  kv.delete("fwblob:" + itD.token);
+  const gone = JSON.parse(kv.get("state:up-1")); delete gone.heltec_cancel; kv.set("state:up-1", JSON.stringify(gone));
+  r = await up(itD.url); j = await r.json(); assert.equal(j.ok, false); assert.equal(j.reason, "uploaded file was deleted");
+  r = await up("https://w/gh/201"); j = await r.json(); assert.equal(j.ok, true, JSON.stringify(j));
+  r = await up(""); j = await r.json(); assert.equal(r.status, 400); assert.equal(j.ok, false);
+  const ghAt = new Date(Date.now() - 11 * 60e3).toISOString();
+  const ghSent = { at: ghAt, url: "https://github.com/x/a.bin", asset_name: "a.bin", tag: "v1", asset_id: "9" };
+  const ghSt = JSON.parse(kv.get("state:up-1")); ghSt.last_update_sent = ghSent; ghSt.last_send_ts = Date.now() - 11 * 60e3; delete ghSt.heltec_cancel; kv.set("state:up-1", JSON.stringify(ghSt));
+  kv.set("sent:up-1", JSON.stringify({ ...(JSON.parse(kv.get("sent:up-1") || {})), last_update_sent: ghSent, last_send_ts: ghSt.last_send_ts }));
+  const hGh = holo;
+  r = await U("update-latest", { retry: true }); j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j)); assert.equal(j.body, "UPDATE https://github.com/x/a.bin "); assert.equal(holo, hGh + 1);
+  const before = JSON.parse(kv.get("telem:up-1:history")).filter((h) => h.msg === LINE).length;
+  await ing({ type: "status", fw: "tsim-updater 1.7.11", msg: "STATUS", tl: { fw: "tsim-updater 1.7.11", wake: 2, sd: raw } });
+  const latest = JSON.parse(kv.get("telem:up-1:latest"));
+  assert.deepEqual(latest.sms_diag, raw);
+  assert.equal(JSON.parse(kv.get("telem:up-1:history")).filter((h) => h.msg === LINE).length, before + 1);
+  await ing({ type: "event", fw: "tsim-updater 1.7.11", msg: "ping", tl: { fw: "tsim-updater 1.7.11", wake: 2, sd: raw } });
+  assert.equal(JSON.parse(kv.get("telem:up-1:history")).filter((h) => h.msg === LINE).length, before + 1);
+  const page = await (await call("/d/up-1", { headers: { Cookie: uc } })).text();
+  assert.ok(page.includes("Cancel update"));
+  assert.ok(page.includes("function smsDiagLine"));
+  assert.ok(page.includes("id=\"hcancel\""));
+  for (const mm of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(mm[1]);
+  console.log("v1.7.11 upload retry, cancel, updok, and text-timing tests OK");
+}

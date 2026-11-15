@@ -3,6 +3,7 @@
 #include "lp_power.h"
 #include "tsim_frame.h"
 #include "wake_path.h"
+#include "sms_diag.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -223,5 +224,49 @@ int main() {
   assert(!smsCatchupBeforeSleep(true, true, false));
   assert(!smsCatchupBeforeSleep(true, false, true));
   printf("v1.7.10 host tests OK (SMS late window, +CMTI recheck cap)\n");
+
+  // 14) v1.7.11: text-timing diagnostic + SMS UPDATE allow/skip decision.
+  assert(smsDiagParseCpms("+CPMS: \"SM\",3,50,\"SM\",3,50,\"SM\",3,50") == 3);
+  assert(smsDiagParseCpms("+CPMS: \"ME\",1,10,\"SM\",4,50") == 4);  // SM inbox, not ME
+  assert(smsDiagParseCpms("OK") == -1);
+  assert(smsDiagParseCpms(nullptr) == -1);
+  assert(smsDiagParseCpms("+CPMS: \"SM\",used,50") == -1);
+  SmsDiag d;
+  smsDiagBegin(&d, 2);
+  for (int i = 0; i < 5; i++) smsDiagAddStore(&d, i == 0 ? -1 : 10 + i);
+  assert(d.npass == 4);
+  for (int i = 0; i < 5; i++) smsDiagAddText(&d, i + 1, "26/11/15,13:45:10-20", 1000u * (uint32_t)i);
+  assert(d.ntx == 4);
+  assert(strcmp(d.tx[0].scts, "26/11/15,13:45:10-20") == 0);
+  smsDiagAddText(&d, 9, "bad <script>", 1);  // cap already full; also the whitelist drops other chars
+  for (int i = 0; i < 5; i++) smsDiagAddCmti(&d, 100u * (uint32_t)i);
+  assert(d.ncmti == 4);
+  char js[512];
+  size_t jn = smsDiagJson(&d, js, sizeof(js));
+  assert(jn > 0);
+  assert(strstr(js, ",\"sd\":{"));
+  assert(strstr(js, "\"w\":2"));
+  assert(strstr(js, "\"st\":["));
+  assert(strstr(js, "\"tx\":["));
+  assert(strstr(js, "\"cm\":["));
+  assert(!strstr(js, "-1"));  // unparsed store count is omitted
+  SmsDiag empty;
+  smsDiagBegin(&empty, 2);
+  assert(smsDiagJson(&empty, js, sizeof(js)) == 0);
+  char qenc[64];
+  assert(urlQueryEncode("https://w/fw/abc", qenc, sizeof(qenc)) > 0);
+  assert(strcmp(qenc, "https%3A%2F%2Fw%2Ffw%2Fabc") == 0);
+  assert(urlQueryEncode("x y", qenc, 4) == 0 && qenc[0] == 0);  // "x%20" needs 5 with NUL
+  char why[80];
+  assert(updokShouldRun(-1, "", why, sizeof(why)));
+  assert(updokShouldRun(404, "not found", why, sizeof(why)));
+  assert(updokShouldRun(200, "{\"ok\":true}", why, sizeof(why)));
+  assert(updokShouldRun(200, "garbage", why, sizeof(why)));
+  assert(updokShouldRun(200, "", why, sizeof(why)));
+  assert(!updokShouldRun(200, "{\"ok\":false,\"reason\":\"uploaded file was deleted\"}", why, sizeof(why)));
+  assert(strcmp(why, "uploaded file was deleted") == 0);
+  assert(!updokShouldRun(200, "{\"ok\": false}", why, sizeof(why)));
+  assert(strcmp(why, "cancelled") == 0);
+  printf("v1.7.11 host tests OK (sms diag, updok fail-open)\n");
   return 0;
 }
