@@ -21,6 +21,7 @@
 #include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras; v1.7.10 late +CMTI window (host-tested)
 #include "lp_power.h"   // v1.7.9 eDRX / PSM parsing (host-tested)
 #include "sms_diag.h"   // v1.7.11 text-timing diagnostic + SMS UPDATE allow check (host-tested)
+#include "tcfg.h"       // v1.8.0 unified check-ins (TCFG parse, scheduler, dedupe; host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -248,6 +249,45 @@ RTC_DATA_ATTR static uint8_t s_lp_sent_psm = 0;
 RTC_DATA_ATTR static char s_lp_sent_v[5] = "";
 RTC_DATA_ATTR static LpTel s_lp_tel = {};
 RTC_DATA_ATTR static uint32_t s_prev_awake_ms = 0;  // millis() at the previous esp_deep_sleep_start, reported next wake
+// v1.8.0 unified check-ins
+static Tcfg s_tcfg;
+RTC_DATA_ATTR static int64_t s_qc_due = 0;
+#define CID_MAGIC 0xC1D18E00UL
+RTC_DATA_ATTR static TcfgIdRing s_cid;
+RTC_DATA_ATTR static uint32_t s_cid_magic = 0;
+static void tcfgSave();
+static void tcfgApplyCfg(const char *args, char *out, size_t cap);
+static void cidSave();
+static void cidLoad();
+static void tcfgSave() {
+  Preferences p; p.begin("tsimci", false);
+  p.putUChar("v", 1);
+  p.putUInt("ci", s_tcfg.ci);
+  p.putString("do", s_tcfg.do_);
+  p.putUInt("cs", s_tcfg.cs);
+  p.putUInt("qc", s_tcfg.qc);
+  p.putString("q", s_tcfg.q_);
+  p.putUInt("usol", s_tcfg.usol);
+  p.putUInt("gto", s_tcfg.gto);
+  p.putLong64("at", s_tcfg.at);
+  p.end();
+}
+static void cidSave() {
+  Preferences p; p.begin("tsimci", false);
+  p.putBytes("ids", &s_cid, sizeof(s_cid));
+  p.end();
+}
+static void cidLoad() {
+  if (s_cid_magic == CID_MAGIC) return;
+  Preferences p; p.begin("tsimci", true);
+  size_t n = p.getBytes("ids", &s_cid, sizeof(s_cid));
+  p.end();
+  if (n != sizeof(s_cid)) tcfgIdClear(&s_cid);
+  s_cid_magic = CID_MAGIC;
+}
+static void tcfgApplyCfg(const char *args, char *out, size_t cap);
+static void tcfgLoad();
+static void tcfgSyncLegacy();
 static int s_edrx = 0, s_psm = 0;                    // defaults OFF: v1.7.8 behavior until WDCFG says otherwise
 static char s_edrxv[5] = LP_EDRX_DEFAULT;
 // v1.7.6: the self-reset guard no longer depends on the RTC clock alone. The awake monitor's state carries a
@@ -756,14 +796,24 @@ static bool ingestPostTls(const char *json) {
 static void markOtaValidIfPending(const char *why);
 // v1.7.0: every post carries a compact telemetry snapshot ("tl") so the dashboard's T-SIM card stays current.
 static size_t telemJson(char *out, size_t cap);
-static char s_post_buf[4096 + 2048];  // v1.7.11: telemJson also carries the text-timing "sd" object
+static char s_post_buf[4096 + 2048 + 512];  // v1.8.0: tl + tcfg on every post
 static bool ingestSendRaw(const char *json) {
   size_t L = strlen(json);
-  // v1.7.11: reserve ~1400 B so the tl block (eDRX/PSM + sd) is not started and then dropped.
-  if (L > 1 && L + 1400 < sizeof(s_post_buf) && json[L - 1] == '}' && !strstr(json, "\"tl\":{")) {
-    memcpy(s_post_buf, json, L - 1); size_t o = L - 1;
-    o += telemJson(s_post_buf + o, sizeof(s_post_buf) - o - 2);
-    s_post_buf[o++] = '}'; s_post_buf[o] = 0; json = s_post_buf;
+  // v1.7.11: reserve room so the tl block is not started and then dropped.
+  // v1.8.0: every status, heartbeat and cmd-result also carries "tcfg".
+  if (L > 1 && L + 1600 < sizeof(s_post_buf) && json[L - 1] == '}') {
+    bool has_tcfg = strstr(json, "\"tcfg\":{") != nullptr;
+    bool has_tl = strstr(json, "\"tl\":{") != nullptr;
+    if (!has_tcfg || !has_tl) {
+      memcpy(s_post_buf, json, L - 1); size_t o = L - 1;
+      if (!has_tcfg) {
+        s_post_buf[o++] = ',';
+        int n = tcfgJson(&s_tcfg, s_post_buf + o, sizeof(s_post_buf) - o - 4);
+        if (n > 0) o += (size_t)n;
+      }
+      if (!has_tl) o += telemJson(s_post_buf + o, sizeof(s_post_buf) - o - 2);
+      s_post_buf[o++] = '}'; s_post_buf[o] = 0; json = s_post_buf;
+    }
   }
   if (modemHttpPost(g_ingest_url, "application/json", g_key_hdr, json)) return true;
   logf("ingest: modem HTTPS failed, trying ESP32 TLS");
@@ -1084,39 +1134,70 @@ static bool doUpdate(const char *url, bool flash_too);
 // empty_out: set when the fetch body had no command lines (nothing pending).
 static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty_out = nullptr) {
   if (empty_out) *empty_out = true;
-  // wd (v1.7.2): watchdog wake. "?wd=1" also returns a queued Heltec UPDATE (the Worker keeps those for watchdog
-  // wakes only, since a text wake gets the UPDATE text itself); console commands get a shorter time budget.
+  // wd (v1.7.2): watchdog/check-in wake. "?wd=1" also returns a queued Heltec UPDATE (the Worker keeps those for
+  // watchdog/check-in wakes only, since a text wake gets the UPDATE text itself); console commands get a shorter budget.
   static char cmd_url[240]; snprintf(cmd_url, sizeof(cmd_url), "%s/api/dev/%s/commands%s", g_worker_url, g_device_id, wd ? "?wd=1" : sys_only ? "?sys=1" : "");
   const uint32_t budget = wd ? WD_CMD_BUDGET_MS : CMD_BUDGET_MS;
   int st = httpsGetTls(cmd_url, s_cmd_list, sizeof(s_cmd_list));
   if (st != 200) { char m[60]; snprintf(m, sizeof(m), "CMD: command fetch failed (%d)", st); ingestEvent("event", m); return 0; }
   int ran = 0, noreply = 0; uint32_t b0 = millis();
   char *save = nullptr;
-  for (char *line = strtok_r(s_cmd_list, "\n", &save); line && ran < CMD_MAX_RUN; line = strtok_r(nullptr, "\n", &save)) {
+  char *ids[CMD_MAX_RUN];
+  char *cmds[CMD_MAX_RUN];
+  int kinds[CMD_MAX_RUN];
+  bool super[CMD_MAX_RUN];
+  int nlines = 0;
+  for (char *line = strtok_r(s_cmd_list, "\n", &save); line && nlines < CMD_MAX_RUN; line = strtok_r(nullptr, "\n", &save)) {
     char *tab = strchr(line, '\t');
     if (!tab) continue;
     if (empty_out) *empty_out = false;   // at least one command was pending
     *tab = 0;
-    char id[20]; strncpy(id, line, sizeof(id) - 1); id[sizeof(id) - 1] = 0;
-    static char cmd[480]; strncpy(cmd, tab + 1, sizeof(cmd) - 1); cmd[sizeof(cmd) - 1] = 0;
-    trimInPlace(cmd);
+    trimInPlace(tab + 1);
+    ids[nlines] = line;
+    cmds[nlines] = tab + 1;
+    kinds[nlines] = tcfgCmdKind(tab + 1);
+    nlines++;
+  }
+  tcfgMarkSuperseded(kinds, nlines, super);
+  bool ring_dirty = false;
+  auto remember = [&](const char *id) { tcfgIdPush(&s_cid, id); ring_dirty = true; };
+  for (int i = 0; i < nlines && ran < CMD_MAX_RUN; i++) {
+    const char *id = ids[i];
+    char *cmd = cmds[i];
     bool clean = cmd[0] != 0;
     for (char *q = cmd; *q; q++) if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e) clean = false;
     bool ok = false;
     static char ec[960], ei[40];
+    jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+    if (clean && tcfgIdSeen(&s_cid, id)) {
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"duplicate id skipped\"}", FW_VERSION, ei, ec);
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
+    }
+    if (clean && super[i]) {
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"\",\"error\":\"superseded by a newer %s in the same batch\"}",
+               FW_VERSION, ei, ec, tcfgKindName(kinds[i]));
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
+    }
     // Over budget, or the Heltec stopped answering: report the rest as skipped so the Worker doesn't wait on them.
     const char *skip = (millis() - b0 > budget) ? "skipped: wake time limit reached" : (noreply >= CMD_NOREPLY_STOP ? "no reply from Heltec (skipped after repeated no-replies)" : nullptr);
-    if (skip && clean && strncasecmp(cmd, "TSIMUPDATE ", 11) != 0 && strncasecmp(cmd, "PWRCFG ", 7) != 0 && strncasecmp(cmd, "GPS", 3) != 0 && strncasecmp(cmd, "CFGSNAP ", 8) != 0 && strncasecmp(cmd, "WDCFG ", 6) != 0 && strncasecmp(cmd, "UPDATE ", 7) != 0) {
-      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+    if (skip && clean && !tcfgIsSysCmd(cmd)) {
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"\",\"error\":\"%s\"}", FW_VERSION, ei, ec, skip);
-      ingestSendBig(s_mesh_body); ran++; continue;
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
+    }
+    if (clean && (strcasecmp(cmd, "TCFG") == 0 || strncasecmp(cmd, "TCFG ", 5) == 0)) {  // v1.8.0 unified check-in config
+      const char *a = (cmd[4] == 0) ? "" : cmd + 5;
+      while (*a == ' ') a++;
+      static char to[360]; tcfgApplyCfg(a, to, sizeof(to));
+      static char te[480]; jsonEsc(te, sizeof(te), to);
+      snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, te);
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
     }
     if (clean && strncasecmp(cmd, "TSIMUPDATE ", 11) == 0) {  // T-SIM self-update (Worker system command, not a Heltec CLI command)
-      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"T-SIM OTA starting\"}", FW_VERSION, ei, ec);
       ingestSendBig(s_mesh_body);
       heltecCliEnd();
       static char a[480]; strncpy(a, cmd + 11, sizeof(a) - 1); a[sizeof(a) - 1] = 0;
+      remember(id); cidSave();
       doTsimUpdate(a);  // reboots on success
       ran++;
       continue;
@@ -1124,51 +1205,52 @@ static int doConsoleCommands(bool sys_only = false, bool wd = false, bool *empty
     if (clean && strncasecmp(cmd, "UPDATE ", 7) == 0) {  // v1.7.2 queued Heltec update (Worker system command, watchdog wakes)
       const char *u = cmd + 7; while (*u == ' ') u++;
       bool okurl = (strncmp(u, "https://", 8) == 0 || strncmp(u, "http://", 7) == 0) && !strchr(u, ' ');
-      jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"%s}", FW_VERSION, ei, ec,
                okurl ? "Heltec update starting (from the queue)" : "", okurl ? "" : ",\"error\":\"bad update URL\"");
       ingestSendBig(s_mesh_body);
+      remember(id); cidSave();
       if (okurl) { heltecCliEnd(); static char uc[URL_MAX]; strncpy(uc, u, sizeof(uc) - 1); uc[sizeof(uc) - 1] = 0; doUpdate(uc, true); }
       ran++; continue;
     }
     if (clean && strncasecmp(cmd, "PWRCFG ", 7) == 0) {  // power/calibration config (Worker system command)
       static char po[400]; pwrApplyCfg(cmd + 7, po, sizeof(po));
-      static char pe[600]; jsonEsc(pe, sizeof(pe), po); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      static char pe[600]; jsonEsc(pe, sizeof(pe), po);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, pe);
       ingestSendBig(s_mesh_body);
-      ran++;
+      remember(id); ran++;
       continue;
     }
     if (clean && strncasecmp(cmd, "CFGSNAP ", 8) == 0) {  // v1.7.0 settings cache config (Worker system command)
       static char co[200]; csApplyCfg(cmd + 8, co, sizeof(co));
-      static char ce[300]; jsonEsc(ce, sizeof(ce), co); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      static char ce[300]; jsonEsc(ce, sizeof(ce), co);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, ce);
-      ingestSendBig(s_mesh_body); ran++; continue;
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
     }
     if (clean && strncasecmp(cmd, "WDCFG ", 6) == 0) {  // v1.7.1 modem watchdog config (Worker system command)
       static char wo[400]; wdApplyCfg(cmd + 6, wo, sizeof(wo));  // v1.7.9: reply also carries edrx=/psm=
-      static char we[480]; jsonEsc(we, sizeof(we), wo); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      static char we[480]; jsonEsc(we, sizeof(we), wo);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, we);
-      ingestSendBig(s_mesh_body); ran++; continue;
+      ingestSendBig(s_mesh_body); remember(id); ran++; continue;
     }
     if (clean && (strcasecmp(cmd, "GPSFIX") == 0 || strncasecmp(cmd, "GPSCFG ", 7) == 0)) {  // v1.6.7 GNSS (Worker system commands)
       static char go[300];
       if (cmd[3] == 'F' || cmd[3] == 'f') { heltecCliEnd(); gpsReport("cmd", go, sizeof(go)); } else gpsApplyCfg(cmd + 7, go, sizeof(go));
-      static char ge[400]; jsonEsc(ge, sizeof(ge), go); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+      static char ge[400]; jsonEsc(ge, sizeof(ge), go);
       snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"sys\":true,\"output\":\"%s\"}", FW_VERSION, ei, ec, ge);
       ingestSendBig(s_mesh_body);
-      ran++;
+      remember(id); ran++;
       continue;
     }
     if (clean) { ok = heltecCli(cmd, s_cli_out, sizeof(s_cli_out), 8000); noreply = ok ? 0 : noreply + 1; }
     else strcpy(s_cli_out, "");
     static char eo[CLI_OUT_MAX * 2];
-    jsonEsc(eo, sizeof(eo), s_cli_out); jsonEsc(ec, sizeof(ec), cmd); jsonEsc(ei, sizeof(ei), id);
+    jsonEsc(eo, sizeof(eo), s_cli_out);
     snprintf(s_mesh_body, sizeof(s_mesh_body), "{\"type\":\"cmd\",\"fw\":\"%s\",\"cmd_id\":\"%s\",\"cmd\":\"%s\",\"output\":\"%s\"%s}",
              FW_VERSION, ei, ec, eo, !clean ? ",\"error\":\"rejected by T-SIM\"" : (ok ? "" : ",\"error\":\"no reply from Heltec\""));
     ingestSendBig(s_mesh_body);
-    ran++;
+    remember(id); ran++;
   }
+  if (ring_dirty) cidSave();
   heltecCliEnd();
   logf("CMD: ran %d command(s)", ran);
   return ran;
@@ -2025,15 +2107,16 @@ static void pwrApplyCfg(const char *args, char *out, size_t cap) {
   char buf[300]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
   char *save = nullptr; int n = 0;
   float lo = s_lb_off, hi = s_lb_on; bool thr = false;
+  bool saw_en = false, saw_int = false;
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
     if (!strcmp(k, "scale")) { float f = atof(v); if (f > 0.5f && f < 1.5f) { s_cal_scale = f; p.putFloat("scale", f); n++; } }
     else if (!strcmp(k, "off")) { float f = atof(v); if (f > -0.5f && f < 0.5f) { s_cal_off = f; p.putFloat("off", f); n++; } }
-    else if (!strcmp(k, "en")) { s_lb_en = atoi(v) != 0; p.putBool("en", s_lb_en); n++; }
+    else if (!strcmp(k, "en")) { s_lb_en = atoi(v) != 0; p.putBool("en", s_lb_en); n++; saw_en = true; }
     else if (!strcmp(k, "imm")) { s_lb_imm = atoi(v) != 0; p.putBool("imm", s_lb_imm); n++; }
     else if (!strcmp(k, "lo")) { lo = atof(v); thr = true; }
     else if (!strcmp(k, "hi")) { hi = atof(v); thr = true; }
-    else if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m >= 5 && m <= 1440) { s_lb_int_min = m; p.putUInt("int", m); n++; } }
+    else if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m >= 5 && m <= 1440) { s_lb_int_min = m; p.putUInt("int", m); n++; saw_int = true; } }
   }
   bool rej = false;
   if (thr) { if (hi >= lo * LB_MIN_RATIO - 0.005f && lo >= 3.0f && hi <= 4.3f) { s_lb_off = lo; s_lb_on = hi; p.putFloat("lo", lo); p.putFloat("hi", hi); n++; } else rej = true; }
@@ -2041,6 +2124,12 @@ static void pwrApplyCfg(const char *args, char *out, size_t cap) {
     if (heltecSetRepeat(true)) { s_lb_state = 0; p.putUChar("state", 0); }
   }
   p.end();
+  if (saw_en || saw_int) {
+    tcfgMapPwr(&s_tcfg, saw_en, s_lb_en ? 1 : 0, saw_int, s_lb_int_min);
+    s_tcfg.at = rtcNow();
+    tcfgSave();
+    s_qc_due = 0;
+  }
   s_bat_idle = batCal(s_bat_raw_idle);
   snprintf(out, cap, "PWRCFG applied %d%s: scale=%.4f off=%.3f en=%d lo=%.2f hi=%.2f int=%u imm=%d state=%s bat=%.2f",
            n, rej ? " (thresholds REJECTED: ON must be >= OFF x1.10)" : "", s_cal_scale, s_cal_off, (int)s_lb_en, s_lb_off, s_lb_on, (unsigned)s_lb_int_min, (int)s_lb_imm,
@@ -2079,12 +2168,14 @@ static void gpsApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimgps", false);
   char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
   char *save = nullptr; int n = 0;
+  bool mapped = false;
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
-    if (!strcmp(k, "auto")) { s_gps_auto = atoi(v) != 0; p.putBool("auto", s_gps_auto); n++; }
-    else if (!strcmp(k, "to")) { uint32_t s = (uint32_t)atoi(v); if (s >= 30 && s <= 600) { s_gps_to = s; p.putUInt("to", s); n++; } }
+    if (!strcmp(k, "auto")) { s_gps_auto = atoi(v) != 0; p.putBool("auto", s_gps_auto); n++; tcfgMapGpsAuto(&s_tcfg, s_gps_auto ? 1 : 0); mapped = true; }
+    else if (!strcmp(k, "to")) { uint32_t s = (uint32_t)atoi(v); if (s >= 30 && s <= 600) { s_gps_to = s; p.putUInt("to", s); n++; s_tcfg.gto = s; mapped = true; } }
   }
   p.end();
+  if (mapped) { s_tcfg.at = rtcNow(); tcfgSave(); }
   snprintf(out, cap, "GPSCFG applied %d: auto=%d to=%u", n, (int)s_gps_auto, (unsigned)s_gps_to);
   logf("%s", out);
 }
@@ -2517,18 +2608,20 @@ static void csLoad() {
   s_cs_en = p.getBool("en", false); s_cs_int_h = p.getUInt("int", 24); s_cs_last = p.getLong64("last", 0);
   s_cs_hash = p.getUInt("hash", 0); s_cs_have = p.getBool("have", false);   // v1.7.9
   p.end();
-  if (s_cs_int_h < 1 || s_cs_int_h > 168) s_cs_int_h = 24;
+  if (s_cs_int_h != 0 && (s_cs_int_h < 1 || s_cs_int_h > 168)) s_cs_int_h = 24;  // v1.8.0: 0 = every check-in
 }
 static void csApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimcs", false);
   char buf[120]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0; char *save = nullptr; int n = 0;
+  bool mapped = false;
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
-    if (!strcmp(k, "en")) { s_cs_en = atoi(v) != 0; p.putBool("en", s_cs_en); n++; }
-    else if (!strcmp(k, "int")) { uint32_t h = (uint32_t)atoi(v); if (h >= 1 && h <= 168) { s_cs_int_h = h; p.putUInt("int", h); n++; } }
+    if (!strcmp(k, "en")) { s_cs_en = atoi(v) != 0; p.putBool("en", s_cs_en); n++; tcfgMapCsEn(&s_tcfg, s_cs_en ? 1 : 0); mapped = true; }
+    else if (!strcmp(k, "int")) { uint32_t h = (uint32_t)atoi(v); if (h >= 1 && h <= 168) { s_cs_int_h = h; p.putUInt("int", h); n++; s_tcfg.cs = tcfgSnapCs(h); mapped = true; } }
     else if (!strcmp(k, "now")) { s_cs_now = atoi(v) != 0; n++; }
   }
   p.end();
+  if (mapped) { s_tcfg.at = rtcNow(); tcfgSave(); }
   snprintf(out, cap, "CFGSNAP applied %d: en=%d int=%uh%s", n, (int)s_cs_en, (unsigned)s_cs_int_h, s_cs_now ? " (refresh this wake)" : "");
   logf("%s", out);
 }
@@ -2572,7 +2665,8 @@ static void cfgSnapshot() {
   csFlush();   // v1.7.9: retry queue first. A later hash match does not touch it.
   int64_t now = rtcNow();
   bool refresh = s_cs_now;
-  bool interval_due = s_cs_en && (s_cs_last <= 0 || (now >= s_cs_last && now - s_cs_last >= (int64_t)s_cs_int_h * 3600));
+  uint32_t cs_h = tcfgDoHas(&s_tcfg, 's') ? s_tcfg.cs : s_cs_int_h;  // v1.8.0: honor unified cs (0 = every check-in)
+  bool interval_due = s_cs_en && (cs_h == 0 || s_cs_last <= 0 || (now >= s_cs_last && now - s_cs_last >= (int64_t)cs_h * 3600));
   bool clock_back = s_cs_en && s_cs_last > 0 && now < s_cs_last;
   // v1.7.9: low battery still blocks unless the dashboard asked (s_cs_now).
   if (!cfgsnapShouldCollect(refresh, s_cs_en, s_lb_state == 1, interval_due, clock_back)) return;
@@ -2664,6 +2758,76 @@ static void wdLoad() {
   if (s_wd_int_min == 0) s_wd_int_min = WD_MAX_MIN;   // v1.7.2: the watchdog can no longer be turned off; 0 = every 24 h
   if (s_wd_int_min < WD_MIN_MIN || s_wd_int_min > WD_MAX_MIN) s_wd_int_min = WD_DEFAULT_MIN;
 }
+static void tcfgSyncLegacy() {
+  s_wd_int_min = tcfgLegacyIntFromCi(s_tcfg.ci);
+  s_wd_hb = tcfgDoHas(&s_tcfg, 'h');
+  s_wd_cmd = tcfgDoHas(&s_tcfg, 'c');
+  s_wd_sms = tcfgDoHas(&s_tcfg, 't');
+  s_smesh = tcfgDoHas(&s_tcfg, 'm');
+  s_cs_en = tcfgDoHas(&s_tcfg, 's');
+  s_cs_int_h = s_tcfg.cs;
+  s_gps_auto = tcfgDoHas(&s_tcfg, 'g');
+  s_gps_to = s_tcfg.gto;
+  s_up_sol = s_tcfg.usol;
+  s_lb_en = tcfgQHas(&s_tcfg, 'b');
+  s_up_min = tcfgQHas(&s_tcfg, 'u') ? s_tcfg.qc : 0;
+  if (s_lb_en && s_tcfg.qc) s_lb_int_min = s_tcfg.qc;
+  Preferences w; w.begin("tsimwd", false);
+  w.putUInt("int", s_wd_int_min);
+  w.putBool("hb", s_wd_hb);
+  w.putBool("cmd", s_wd_cmd);
+  w.putBool("sms", s_wd_sms);
+  w.putUChar("smesh", s_smesh ? 1 : 0);
+  w.putUInt("upm", s_up_min);
+  w.putUInt("usol", s_up_sol);
+  w.end();
+  Preferences pw; pw.begin("tsimpwr", false);
+  pw.putBool("en", s_lb_en);
+  if (s_lb_en && s_tcfg.qc) pw.putUInt("int", s_tcfg.qc);
+  pw.end();
+  Preferences c; c.begin("tsimcs", false);
+  c.putBool("en", s_cs_en);
+  c.putUInt("int", s_cs_int_h);
+  c.end();
+  Preferences g; g.begin("tsimgps", false);
+  g.putBool("auto", s_gps_auto);
+  g.putUInt("to", s_gps_to);
+  g.end();
+}
+static void tcfgLoad() {
+  tcfgInit(&s_tcfg);
+  Preferences p; p.begin("tsimci", true);
+  bool have = p.getUChar("v", 0) == 1;
+  if (have) {
+    s_tcfg.ci = p.getUInt("ci", 360);
+    { String d = p.getString("do", "hc"); tcfgCanonDo(d.c_str(), s_tcfg.do_); }
+    s_tcfg.cs = p.getUInt("cs", 0);
+    s_tcfg.qc = p.getUInt("qc", 30);
+    { String q = p.getString("q", "u"); tcfgCanonQ(q.c_str(), s_tcfg.q_); }
+    s_tcfg.usol = p.getUInt("usol", 2000);
+    s_tcfg.gto = p.getUInt("gto", 180);
+    s_tcfg.at = p.getLong64("at", 0);
+    p.end();
+    if (!tcfgCiOk(s_tcfg.ci)) s_tcfg.ci = 180;
+    if (!tcfgCsOk(s_tcfg.cs)) s_tcfg.cs = tcfgSnapCs(s_tcfg.cs);
+    if (!tcfgQcOk(s_tcfg.qc)) s_tcfg.qc = tcfgClampQc(s_tcfg.qc);
+    if (!tcfgUsolOk(s_tcfg.usol)) s_tcfg.usol = 2000;
+    if (!tcfgGtoOk(s_tcfg.gto)) s_tcfg.gto = 180;
+    logf("v1.8.0: tcfg ci=%u do=%s cs=%u qc=%u q=%s", (unsigned)s_tcfg.ci, tcfgPrintDo(&s_tcfg), (unsigned)s_tcfg.cs, (unsigned)s_tcfg.qc, tcfgPrintQ(&s_tcfg));
+    return;
+  }
+  p.end();
+  TcfgLegacy L = {
+    s_wd_int_min, s_wd_hb ? 1 : 0, s_wd_cmd ? 1 : 0, s_wd_sms ? 1 : 0, s_smesh ? 1 : 0,
+    s_up_min, s_up_sol, s_lb_en ? 1 : 0, s_lb_int_min, s_cs_en ? 1 : 0, s_cs_int_h,
+    s_gps_auto ? 1 : 0, s_gps_to
+  };
+  tcfgSeedFromLegacy(&s_tcfg, &L);
+  tcfgSave();
+  logf("v1.8.0: tsimci seeded ci=%u do=%s cs=%u qc=%u q=%s usol=%u gto=%u",
+       (unsigned)s_tcfg.ci, tcfgPrintDo(&s_tcfg), (unsigned)s_tcfg.cs, (unsigned)s_tcfg.qc, tcfgPrintQ(&s_tcfg),
+       (unsigned)s_tcfg.usol, (unsigned)s_tcfg.gto);
+}
 // Newest first, at most 6 entries: "<rtc s>,<stage>,<result>,<secs>"
 static void wdAddEvent(const char *stage, const char *result, uint32_t secs) {
   char tmp[sizeof(s_wd_ev)];
@@ -2679,12 +2843,8 @@ static void wdAddEvent(const char *stage, const char *result, uint32_t secs) {
   logf("WD event: %s %s %us", stage, result, (unsigned)secs);
 }
 static void wdSchedule(bool ok) {
-  if (!s_wd_int_min) s_wd_int_min = WD_MAX_MIN;   // v1.7.2: never unscheduled
-  int64_t secs = (int64_t)s_wd_int_min * 60;
-  if (!ok) {  // retry sooner after a failure: 30, 60, 120 min ... capped at the interval
-    int64_t b = 1800LL << (s_wd_fails > 1 ? (s_wd_fails - 1 > 4 ? 4 : s_wd_fails - 1) : 0);
-    if (b < secs) secs = b;
-  }
+  s_wd_int_min = tcfgLegacyIntFromCi(s_tcfg.ci);   // v1.8.0: 1440 when ci=0; never unscheduled
+  int64_t secs = tcfgBackoffSecs(ok ? 0 : s_wd_fails, s_tcfg.ci);
   s_wd_due = rtcNow() + secs;
 }
 // WDCFG int=<30..1440 min, 0 = 1440> hb=<0|1> sms=<0|1> cmd=<0|1>  (system command from the Worker; cmd since 1.7.2)
@@ -2693,19 +2853,25 @@ static void wdApplyCfg(const char *args, char *out, size_t cap) {
   Preferences p; p.begin("tsimwd", false);
   char buf[180]; strncpy(buf, args, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;  // v1.7.9: room for edrx/edrxv/psm/smesh
   char *save = nullptr; int n = 0; bool rej = false;
+  bool saw_int = false, saw_hb = false, saw_sms = false, saw_cmd = false, saw_upoll = false, saw_usol = false, saw_smesh = false;
+  uint32_t int_sent = 0;
   LpCfg lp; lp.edrx = s_edrx ? 1 : 0; lp.psm = s_psm ? 1 : 0; memcpy(lp.edrxv, s_edrxv, 5);
   for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
     char *eq = strchr(t, '='); if (!eq) continue; *eq = 0; const char *k = t, *v = eq + 1;
-    if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m == 0) m = WD_MAX_MIN; if (m >= WD_MIN_MIN && m <= WD_MAX_MIN) { s_wd_int_min = m; p.putUInt("int", m); n++; } else rej = true; }
-    else if (!strcmp(k, "hb")) { s_wd_hb = atoi(v) != 0; p.putBool("hb", s_wd_hb); n++; }
-    else if (!strcmp(k, "sms")) { s_wd_sms = atoi(v) != 0; p.putBool("sms", s_wd_sms); n++; }
-    else if (!strcmp(k, "cmd")) { s_wd_cmd = atoi(v) != 0; p.putBool("cmd", s_wd_cmd); n++; }
-    else if (!strcmp(k, "upoll")) { uint32_t m = (uint32_t)atoi(v); if (m == 0 || (m >= UP_MIN_MIN && m <= WD_MAX_MIN)) { s_up_min = m; p.putUInt("upm", m); s_up_due = 0; n++; } else rej = true; }   // v1.7.5
-    else if (!strcmp(k, "usol")) { uint32_t mv = (uint32_t)atoi(v); if (mv <= 20000) { s_up_sol = mv; p.putUInt("usol", mv); n++; } else rej = true; }
+    if (!strcmp(k, "int")) {
+      uint32_t raw = (uint32_t)atoi(v); uint32_t m = raw == 0 ? WD_MAX_MIN : raw;
+      if (m >= WD_MIN_MIN && m <= WD_MAX_MIN) { s_wd_int_min = m; p.putUInt("int", m); n++; saw_int = true; int_sent = raw; }
+      else rej = true;
+    }
+    else if (!strcmp(k, "hb")) { s_wd_hb = atoi(v) != 0; p.putBool("hb", s_wd_hb); n++; saw_hb = true; }
+    else if (!strcmp(k, "sms")) { s_wd_sms = atoi(v) != 0; p.putBool("sms", s_wd_sms); n++; saw_sms = true; }
+    else if (!strcmp(k, "cmd")) { s_wd_cmd = atoi(v) != 0; p.putBool("cmd", s_wd_cmd); n++; saw_cmd = true; }
+    else if (!strcmp(k, "upoll")) { uint32_t m = (uint32_t)atoi(v); if (m == 0 || (m >= UP_MIN_MIN && m <= WD_MAX_MIN)) { s_up_min = m; p.putUInt("upm", m); s_up_due = 0; n++; saw_upoll = true; } else rej = true; }   // v1.7.5
+    else if (!strcmp(k, "usol")) { uint32_t mv = (uint32_t)atoi(v); if (mv <= 20000) { s_up_sol = mv; p.putUInt("usol", mv); n++; saw_usol = true; } else rej = true; }
     else if (!strcmp(k, "hwake")) { s_hw_en = atoi(v) != 0; s_hw_auto = false; s_hw_spur = 0; p.putBool("hwake", s_hw_en); p.putBool("hwauto", false); p.putUInt("hwsp", 0); n++; }
     else if (!strcmp(k, "smesh")) {   // v1.7.9: 0 skips the mesh snapshot on scheduled STATUS only
       if (strcmp(v, "0") && strcmp(v, "1")) rej = true;
-      else { s_smesh = v[0] == '1'; p.putUChar("smesh", s_smesh ? 1 : 0); n++; }
+      else { s_smesh = v[0] == '1'; p.putUChar("smesh", s_smesh ? 1 : 0); n++; saw_smesh = true; }
     }
     else {  // v1.7.9: unknown keys stay ignored. A bad edrx/edrxv/psm value is rejected, not stored.
       int r = lpCfgToken(&lp, k, v);
@@ -2718,6 +2884,14 @@ static void wdApplyCfg(const char *args, char *out, size_t cap) {
     }
   }
   p.end();
+  if (saw_int) s_tcfg.ci = tcfgMapWdIntToCi(int_sent);
+  if (saw_hb) tcfgMapWdHb(&s_tcfg, s_wd_hb ? 1 : 0);
+  if (saw_cmd) tcfgMapWdCmd(&s_tcfg, s_wd_cmd ? 1 : 0);
+  if (saw_sms) tcfgMapWdSms(&s_tcfg, s_wd_sms ? 1 : 0);
+  if (saw_smesh) tcfgMapWdSmesh(&s_tcfg, s_smesh ? 1 : 0);
+  if (saw_upoll) { tcfgMapUpoll(&s_tcfg, s_up_min); s_qc_due = 0; }
+  if (saw_usol) s_tcfg.usol = s_up_sol;
+  if (saw_int || saw_hb || saw_cmd || saw_sms || saw_smesh || saw_upoll || saw_usol) { s_tcfg.at = rtcNow(); tcfgSave(); }
   s_wd_fails = 0; wdSchedule(true);
   char frag[40]; lpAppliedFragment(frag, sizeof(frag), s_edrx, s_edrxv, s_psm);
   snprintf(out, cap, "WDCFG applied %d%s: int=%u hb=%d sms=%d cmd=%d hwake=%d upoll=%u usol=%u %s smesh=%d", n,
@@ -2725,6 +2899,17 @@ static void wdApplyCfg(const char *args, char *out, size_t cap) {
            (unsigned)s_wd_int_min, (int)s_wd_hb, (int)s_wd_sms, (int)s_wd_cmd, (int)s_hw_en, (unsigned)s_up_min, (unsigned)s_up_sol, frag, s_smesh ? 1 : 0);
   logf("%s", out);
   lpApply();  // v1.7.9: push before this reply is posted, so its telemetry matches the new settings
+}
+static void tcfgApplyCfg(const char *args, char *out, size_t cap) {
+  bool rej = false;
+  int n = tcfgApply(&s_tcfg, args, &rej);
+  s_tcfg.at = rtcNow();
+  tcfgSave();
+  tcfgSyncLegacy();
+  s_wd_fails = 0; wdSchedule(true);
+  s_qc_due = 0;
+  tcfgFormatApplied(out, cap, n, rej, &s_tcfg);
+  logf("%s", out);
 }
 static int wdRegStat(const char *tag) {
   const char *p = strstr(s_at_resp, tag); if (!p) return -1;
@@ -2850,10 +3035,65 @@ static bool wdHeartbeat(const char *stage, int sms) {
   snprintf(hb + o, sizeof(hb) - o, "}");
   return ingestSend(hb);
 }
-// Runs on a watchdog timer wake. Returns true when the modem ends up healthy.
+static bool ciBudgetOk(uint32_t t0) {
+  if (millis() - t0 > WD_BUDGET_MS) return false;
+  if (millis() >= (uint32_t)(AWAKE_MAX_S > 20 ? (AWAKE_MAX_S - 20) : 1) * 1000UL) return false;
+  return true;
+}
+// v1.8.0: extras on a timed check-in, in spec order, within WD_BUDGET_MS / the awake deadline.
+static void ciRunExtras(bool ok, bool lowbat, bool recovered, const char *stage, int sms, uint32_t t0) {
+  bool pending = s_wd_pend || s_hrp_n || s_lb_pending[0];
+  bool want = tcfgCiWantsData(&s_tcfg, recovered, pending);
+  if (lowbat) want = pending;
+  if (!ok) want = pending;
+  if (want && ok) {
+    if (!s_pdp_up && !modemOpenData() && strcmp(stage, "ok") == 0 && millis() - t0 < WD_BUDGET_MS) {
+      s_wd_soft++;
+      ok = wdSoft();
+      wdAddEvent("soft-pdp", ok ? "ok" : "fail", (millis() - t0) / 1000);
+      if (ok) { modemConfigureSms(); s_wd_pend = true; pending = true; }
+    }
+    if (ok) {
+      lpApply();
+      if (sms < 0) sms = wdSmsStored();
+      if (s_lb_pending[0]) pwrReportPending();
+      bool silent = s_tcfg.ci == 0;
+      bool extras = !lowbat && !silent;
+      auto skip_rest = [&](const char *what) { logf("v1.8.0: check-in extra %s skipped (budget)", what); };
+      if (tcfgDoHas(&s_tcfg, 'h') || pending || recovered) {
+        if (ciBudgetOk(t0)) { if (wdHeartbeat(stage, sms)) s_wd_pend = false; }
+        else skip_rest("h");
+      }
+      if (extras && tcfgDoHas(&s_tcfg, 'c')) {
+        if (ciBudgetOk(t0)) { s_wd_cmdn++; wdSave(); doConsoleCommands(false, true); }
+        else skip_rest("c");
+      }
+      if (extras && tcfgDoHas(&s_tcfg, 't')) {
+        if (ciBudgetOk(t0)) processSmsInbox();
+        else skip_rest("t");
+      }
+      if (extras && tcfgDoHas(&s_tcfg, 'm')) {
+        if (ciBudgetOk(t0)) meshSnapshot();
+        else skip_rest("m");
+      }
+      if (extras && tcfgDoHas(&s_tcfg, 's')) {
+        if (ciBudgetOk(t0)) cfgSnapshot();
+        else skip_rest("s");
+      }
+      if (extras && tcfgDoHas(&s_tcfg, 'g') && !s_gps_done) {
+        if (ciBudgetOk(t0)) { static char go[300]; gpsReport("auto", go, sizeof(go)); }
+        else skip_rest("g");
+      }
+    }
+  } else if (ok && !lowbat) {
+    lpApply();
+  }
+}
+// Runs on a watchdog / check-in timer wake. Returns true when the modem ends up healthy.
 // force (v1.7.3, Heltec-reboot wake): recover even when the check passes (CFUN reset, then power-cycle if that fails)
 // and always post a heartbeat.
-static bool wdRun(bool force = false) {
+// checkin (v1.8.0): run selected TCFG extras (h,c,t,m,s,g) after the modem check, with silent-Off and budgets.
+static bool wdRun(bool force = false, bool checkin = false) {
   uint32_t t0 = millis();
   s_wd_chk++;
   pinMode(MODEM_DTR_PIN, OUTPUT); digitalWrite(MODEM_DTR_PIN, LOW);   // DTR low: modem leaves CSCLK sleep (no reset)
@@ -2884,22 +3124,25 @@ static bool wdRun(bool force = false) {
     if (ok) { modemConfigureSms(); s_wd_pend = true; }  // CNMI/CMGF are lost after CFUN/reset: re-arm the SMS ring
   }
   // Data check: bring up PDP only when a heartbeat is going out; a PDP failure gets one soft recovery.
+  // v1.8.0 check-in path defers data + extras to ciRunExtras (silent Off, budgets, selected letters).
   int sms = -1;
-  if (ok && !lowbat && (s_wd_hb || s_wd_pend)) {
-    if (!modemOpenData() && strcmp(stage, "ok") == 0 && millis() - t0 < WD_BUDGET_MS) {
-      s_wd_soft++; stage = "soft";
-      ok = wdSoft();
-      wdAddEvent("soft-pdp", ok ? "ok" : "fail", (millis() - t0) / 1000);
-      if (ok) { modemConfigureSms(); s_wd_pend = true; }
+  if (!checkin) {
+    if (ok && !lowbat && (s_wd_hb || s_wd_pend)) {
+      if (!modemOpenData() && strcmp(stage, "ok") == 0 && millis() - t0 < WD_BUDGET_MS) {
+        s_wd_soft++; stage = "soft";
+        ok = wdSoft();
+        wdAddEvent("soft-pdp", ok ? "ok" : "fail", (millis() - t0) / 1000);
+        if (ok) { modemConfigureSms(); s_wd_pend = true; }
+      }
+      if (ok) {
+        lpApply();   // v1.7.9: before the heartbeat, so this post's tl is the read-back. One try, no loop.
+        sms = wdSmsStored();
+        if (s_lb_pending[0]) pwrReportPending();
+        if (wdHeartbeat(stage, sms)) s_wd_pend = false;
+      }
+    } else if (ok && !lowbat) {
+      lpApply();   // v1.7.9: still apply when no heartbeat is posted. Skipped on low battery (no extra AT).
     }
-    if (ok) {
-      lpApply();   // v1.7.9: before the heartbeat, so this post's tl is the read-back. One try, no loop.
-      sms = wdSmsStored();
-      if (s_lb_pending[0]) pwrReportPending();
-      if (wdHeartbeat(stage, sms)) s_wd_pend = false;
-    }
-  } else if (ok && !lowbat) {
-    lpApply();   // v1.7.9: still apply when no heartbeat is posted. Skipped on low battery (no extra AT).
   }
   if (ok) { if (strcmp(stage, "ok") == 0) s_wd_ok++; s_wd_fails = 0; }
   else if (strcmp(stage, "lowbat") != 0) { s_wd_fail++; if (s_wd_fails < 255) s_wd_fails++; s_wd_pend = true; if (!hard_tried) wdAddEvent("check", "fail", (millis() - t0) / 1000); }
@@ -2914,12 +3157,17 @@ static bool wdRun(bool force = false) {
   }
   wdSave();
   logf("WD: done stage=%s ok=%d in %lus, next check in %lld s", stage, (int)ok, (unsigned long)((millis() - t0) / 1000), (long long)(s_wd_due - rtcNow()));
-  if (ok && s_wd_sms) processSmsInbox();   // optional (default off): run texts already stored on the modem
-  // v1.7.2: fetch and run queued dashboard commands (console, system commands, TSIMUPDATE, queued Heltec UPDATE), so
-  // they get through even when texts don't. One fetch per wake, no retry; skipped on low battery.
-  if (ok && !lowbat && s_wd_cmd) {
-    s_wd_cmdn++; wdSave();
-    doConsoleCommands(false, true);
+  if (checkin) {
+    bool recovered = strcmp(stage, "ok") != 0 && strcmp(stage, "lowbat") != 0;
+    ciRunExtras(ok, lowbat, recovered, stage, sms, t0);
+  } else {
+    if (ok && s_wd_sms) processSmsInbox();   // optional (default off): run texts already stored on the modem
+    // v1.7.2: fetch and run queued dashboard commands (console, system commands, TSIMUPDATE, queued Heltec UPDATE), so
+    // they get through even when texts don't. One fetch per wake, no retry; skipped on low battery.
+    if (ok && !lowbat && s_wd_cmd) {
+      s_wd_cmdn++; wdSave();
+      doConsoleCommands(false, true);
+    }
   }
   return ok;
 }
@@ -3285,17 +3533,16 @@ static bool modemPollCmti() {
   return saw;
 }
 
-// v1.7.1: one timer for every reason to wake (battery check, GNSS warm window end, modem watchdog). 0 = none.
+// v1.8.0: one timer for every reason to wake (check-in, quick local, GNSS warm window end, failure backoff).
+// Always 5 s .. 24 h. ext0-failed path stays 60 s.
 static uint64_t sleepTimerSecs() {
   if (s_ext0_failed) return 60;
-  int64_t best = -1;
-  auto take = [&](int64_t secs) { if (secs < 5) secs = 5; if (best < 0 || secs < best) best = secs; };
-  if (s_lb_en) take((int64_t)s_lb_int_min * 60);
-  if (s_gnss_on) take(s_gnss_off_at - rtcNow());
-  if (s_wd_int_min) { if (s_wd_due <= 0) wdSchedule(true); take(s_wd_due - rtcNow()); }
-  if (s_up_min) { if (s_up_due <= 0) s_up_due = rtcNow() + (int64_t)s_up_min * 60; take(s_up_due - rtcNow()); }   // v1.7.5
-  if (best < 0 || best > (int64_t)WD_MAX_MIN * 60) best = (int64_t)WD_MAX_MIN * 60;   // v1.7.2: there is ALWAYS a timer (<= 24 h)
-  return (uint64_t)best;
+  if (s_wd_due <= 0) wdSchedule(true);
+  if (tcfgQcEnabled(&s_tcfg) && s_qc_due <= 0) s_qc_due = rtcNow() + (int64_t)s_tcfg.qc * 60;
+  return (uint64_t)tcfgSleepTimerSecs(false, rtcNow(),
+                                      s_wd_due, tcfgCiSchedMin(s_tcfg.ci),
+                                      tcfgQcEnabled(&s_tcfg), s_qc_due, s_tcfg.qc,
+                                      s_gnss_on, s_gnss_off_at);
 }
 // v1.7.3: arm the optional Heltec-reboot wake (GPIO6, ext1 any-low; ext0 stays on the modem RI pin). Not armed when it's
 // off (WDCFG hwake=0, or auto-off after spurious wakes) or when GPIO6 isn't steadily high right before sleep (wire missing
@@ -3332,8 +3579,8 @@ static void armWakeups() {
   if (!secs) secs = (uint64_t)WD_MAX_MIN * 60;
   esp_sleep_enable_timer_wakeup(secs * 1000000ULL);
   deadlineStopForSleep();
-  logf("sleep: SMS ring wake %s, GPIO6 wake %s, timer %llus (battery %s, GNSS %s, watchdog %s)", s_ext0_failed ? "FAILED" : "armed", hw,
-       (unsigned long long)secs, s_lb_en ? "on" : "off", s_gnss_on ? "warm" : "off", s_wd_int_min ? "on" : "off");
+  logf("sleep: SMS ring wake %s, GPIO6 wake %s, timer %llus (ci %u min, qc %s, GNSS %s)", s_ext0_failed ? "FAILED" : "armed", hw,
+       (unsigned long long)secs, (unsigned)tcfgCiSchedMin(s_tcfg.ci), tcfgQcEnabled(&s_tcfg) ? "on" : "off", s_gnss_on ? "warm" : "off");
 }
 
 // Timer-wake path: the modem was never woken, so skip AT+CSCLK; just re-arm wakeups and sleep.
@@ -3421,7 +3668,7 @@ static void handleUsbLine(char *line) {
   if (strcasecmp(line, "LASTLOG") == 0) { printLastLog(); return; }
   if (strcasecmp(line, "STATUS") == 0) { doStatusReport(); return; }
   if (strcasecmp(line, "MESH") == 0) { meshSnapshot(); return; }
-  if (strcasecmp(line, "WDCHECK") == 0) { wdRun(); return; }   // v1.7.1 run one watchdog check now (bench test)
+  if (strcasecmp(line, "WDCHECK") == 0) { wdRun(false, true); return; }   // v1.8.0 run one check-in now (bench test)
   if (strcasecmp(line, "CMD") == 0) {
     bool empty = true; doConsoleCommands(false, false, &empty); finishCmdWake(empty); return;   // v1.7.8
   }
@@ -3526,6 +3773,7 @@ void setup() {
   analogSetPinAttenuation(BOARD_SOLAR_ADC_PIN, ADC_11db);
   pwrLoad();
   gpsLoad(); csLoad(); wdLoad();
+  tcfgLoad(); cidLoad();   // v1.8.0: unified check-ins (seed tsimci from legacy keys on first boot)
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.7.1 watchdog timer wake. The RTC clock drifts, so a wake up to 10% early still counts; with battery checks off
   // the watchdog is the only timer left (GNSS warm-window wakes and OTA verification keep the full boot path).
@@ -3565,48 +3813,45 @@ void setup() {
       sleepQuick(); return;
     }
   }
-  bool wd_wake = false;
-  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_wd_int_min && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
-    int64_t tol = (int64_t)s_wd_int_min * 6; if (tol < 60) tol = 60;
-    wd_wake = !s_lb_en || s_wd_due <= 0 || rtcNow() >= s_wd_due - tol;
-  }
-  if (wd_wake) {
-    logf("Watchdog wake (every %u min)", (unsigned)s_wd_int_min);
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
-    heltecPinsRelease();
-    heltecMonStart();   // v1.7.4 awake reboot detection
-    if (!LittleFS.begin(true)) logf("LittleFS mount failed");
-    if (s_lb_en) pwrCheck("timer");   // battery check due at the same time: no extra wake
-    uint32_t up = 0;
-    if (s_up_min && upPoll(&up) == 1) { hwHandleReboot("uptime", false); s_up_last = up; s_up_last_t = rtcNow(); }   // v1.7.5
-    else wdRun();
-    goToSleep(); return;
-  }
-  // v1.7.5 uptime-poll timer wake: serial only, the modem stays asleep (DTR held) unless a reboot is found.
-  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_up_min && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
-    int64_t tol = (int64_t)s_up_min * 6; if (tol < 60) tol = 60;
-    if (s_up_due <= 0 || rtcNow() >= s_up_due - tol) {
-      gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
-      heltecPinsRelease();
-      logf("Uptime poll wake (every %u min)", (unsigned)s_up_min);
+  // v1.8.0: two cadences. When both are due, run the quick local check then the LTE check-in on this wake.
+  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
+    int64_t now = rtcNow();
+    bool ci_due = tcfgIsDue(now, s_wd_due, tcfgCiSchedMin(s_tcfg.ci));
+    bool qc_due = tcfgQcEnabled(&s_tcfg) && tcfgIsDue(now, s_qc_due, s_tcfg.qc);
+    if (ci_due || qc_due) {
+      bool qc_reboot = false;
       uint32_t up = 0;
-      if (upPoll(&up) == 1) {
+      if (qc_due) {
+        logf("v1.8.0: quick check (qc=%u q=%s)", (unsigned)s_tcfg.qc, tcfgPrintQ(&s_tcfg));
+        gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
+        heltecPinsRelease();
+        if (tcfgQHas(&s_tcfg, 'b')) pwrCheck("timer");
+        if (tcfgQHas(&s_tcfg, 'u') && upPoll(&up) == 1) qc_reboot = true;
+        s_qc_due = rtcNow() + (int64_t)s_tcfg.qc * 60;
+      }
+      if (qc_reboot) {
         if (!LittleFS.begin(true)) logf("LittleFS mount failed");
         hwHandleReboot("uptime", false);
         s_up_last = up; s_up_last_t = rtcNow();
         goToSleep(); return;
       }
-      if (!s_lb_en) { sleepQuick(); return; }
+      if (ci_due) {
+        logf("v1.8.0: check-in (ci=%u do=%s)", (unsigned)s_tcfg.ci, tcfgPrintDo(&s_tcfg));
+        gpio_deep_sleep_hold_dis();
+        gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
+        heltecPinsRelease();
+        heltecMonStart();   // v1.7.4 awake reboot detection
+        if (!LittleFS.begin(true)) logf("LittleFS mount failed");
+        wdRun(false, true);
+        goToSleep(); return;
+      }
+      bool imm = s_lb_pending[0] && s_lb_imm;
+      if (!imm) {
+        logf(s_lb_pending[0] ? "battery check: change saved, reported at next wake" : "v1.8.0: quick check done");
+        sleepQuick(); return;
+      }
+      logf("battery change - reporting now (immediate report on)");
     }
-  }
-  // v1.6.5 battery-check timer wake: modem stays asleep (DTR stays held), no LTE.
-  if (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER && s_lb_en && !s_gnss_on && !s_ext0_failed && !otaPendingVerify()) {
-    gpio_deep_sleep_hold_dis();          // release Heltec UART/RST/BOOT pads; DTR keeps its own pad hold
-    heltecPinsRelease();
-    bool changed = pwrCheck("timer");
-    if (!(changed && s_lb_imm)) { logf(s_lb_pending[0] ? "battery check: change saved, reported at next wake" : "battery check: no change"); sleepQuick(); return; }
-    logf("battery change - reporting now (immediate report on)");
   }
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)MODEM_DTR_PIN);
