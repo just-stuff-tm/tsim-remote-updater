@@ -1106,25 +1106,39 @@ export const RPT_SETTINGS = [
   { cat: "Identity", items: [
     { k: "name", label: "Node name", type: "text", max: 31, help: "Shown in adverts. Up to 23 bytes when location is shared, 31 otherwise." },
     { k: "owner.info", label: "Owner info", type: "text", max: 90, help: "Free text; | becomes a new line. Firmware 1.12+." },
-    { k: "role", label: "Role", ro: true }, { k: "board", label: "Hardware", ro: true, get: "board" }, { k: "ver", label: "Firmware", ro: true, get: "ver" }, { k: "public.key", label: "Public key", ro: true, mono: true } ] },
-  { cat: "Location", note: "Coordinates in adverts are public. The Repeater location card can copy the T-SIM's GPS position here.", items: [
+    { k: "role", label: "Role", ro: true },
+    { k: "board", label: "Hardware", ro: true, get: "board" },
+    { k: "ver", label: "Firmware", ro: true, get: "ver" },
+    { k: "public.key", label: "Public key", ro: true, mono: true } ] },
+  { cat: "Location", note: "Coordinates in adverts are public: anyone on the mesh can see them. You can type them here, or copy the T-SIM GPS position from the Location card on the T-SIM tab.", items: [
     { k: "lat", label: "Latitude", type: "num", min: -90, max: 90, step: 0.000001, unit: "°" },
-    { k: "lon", label: "Longitude", type: "num", min: -180, max: 180, step: 0.000001, unit: "°" } ] },
+    { k: "lon", label: "Longitude", type: "num", min: -180, max: 180, step: 0.000001, unit: "°" },
+    { k: "gps", label: "GPS receiver", type: "sel", opts: ONOFF, get: "gps", set: "gps ", first: true, help: "Only on repeaters built with GPS support; others answer \"not supported\"." },
+    { k: "gps.advert", label: "Share location in adverts", type: "sel", opts: [["none", "Don't share"], ["share", "Live GPS position"], ["prefs", "Saved lat/lon"]], get: "gps advert", set: "gps advert " } ] },
   { cat: "Radio", risk: true, note: "Wrong radio settings take the repeater off your mesh, and you may then only be able to fix it here or over USB. Radio changes apply after the radio restarts (Reboot radio at the top of this tab).", items: [
     { k: "radio", label: "Frequency / bandwidth / SF / CR", type: "radio", risk: true },
     { k: "tx", label: "Transmit power", type: "num", min: 1, max: 22, step: 1, unit: "dBm", risk: true, help: "LoRa chip power only; boards with an amplifier transmit more. Stay within your local legal limit." },
-    { k: "radio.rxgain", label: "RX boosted gain", type: "sel", opts: ONOFF, help: "SX12xx/LR1110, firmware 1.14.1+." },
-    { k: "radio.fem.rxgain", label: "Front-end RX gain (LNA)", type: "sel", opts: ONOFF, help: "Only on boards with an external front end." },
-    { k: "radio.fem.txgain", label: "Front-end TX gain", type: "sel", opts: ONOFF, risk: true, help: "Only on boards with an external front end (e.g. Station G3)." } ] },
-  { cat: "Repeating & routing", items: [
-    { k: "repeat", label: "Repeat packets", type: "sel", opts: ONOFF, risk: true, help: "Off = the node stops relaying for the mesh." },
-    { k: "path.hash.mode", label: "Advert path hash size", type: "sel", opts: [["0", "1 byte (max 64 hops)"], ["1", "2 bytes (max 32 hops)"], ["2", "3 bytes (max 21 hops)"]], risk: true, help: "Firmware 1.14+. Nodes on 1.13 or older drop 2-3 byte paths." },
+    { k: "radio.rxgain", label: "RX boosted gain", type: "sel", opts: ONOFF, help: "SX12xx/LR1110, firmware 1.14.1+.", adv: true },
+    { k: "radio.fem.rxgain", label: "Front-end RX gain (LNA)", type: "sel", opts: ONOFF, help: "Only on boards with an external front end.", adv: true },
+    { k: "radio.fem.txgain", label: "Front-end TX gain", type: "sel", opts: ONOFF, risk: true, help: "Only on boards with an external front end (e.g. Station G3).", adv: true } ] },
+  { cat: "Repeating", items: [
+    { k: "repeat", label: "Relay packets for the mesh", type: "sel", opts: ONOFF, risk: true, help: "Off = the node stops relaying for the mesh. If low-battery protection is on (T-SIM tab), the T-SIM turns this off below its cutoff and back on when the battery recovers." },
+    { k: "flood.max", label: "How far floods travel (max hops)", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
     { k: "loop.detect", label: "Loop detection", type: "sel", opts: [["off", "Off"], ["minimal", "Minimal"], ["moderate", "Moderate"], ["strict", "Strict"]] },
-    { k: "flood.max", label: "Max flood hops", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
-    { k: "flood.max.unscoped", label: "Max hops, unscoped floods", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
-    { k: "flood.max.advert", label: "Max hops, advert floods", type: "num", min: 0, max: 64, step: 1, unit: "hops" },
-    { k: "multi.acks", label: "Multi-acks", type: "sel", opts: [["1", "On"], ["0", "Off"]] } ] },
-  { cat: "Timing & airtime", items: [
+    { k: "flood.max.unscoped", label: "Max hops for unscoped floods", type: "num", min: 0, max: 64, step: 1, unit: "hops", adv: true },
+    { k: "flood.max.advert", label: "Max hops for advert floods", type: "num", min: 0, max: 64, step: 1, unit: "hops", adv: true },
+    { k: "path.hash.mode", label: "Advert path hash size", type: "sel", opts: [["0", "1 byte (max 64 hops)"], ["1", "2 bytes (max 32 hops)"], ["2", "3 bytes (max 21 hops)"]], risk: true, help: "Firmware 1.14+. Nodes on 1.13 or older drop 2-3 byte paths.", adv: true },
+    { k: "multi.acks", label: "Multi-acks", type: "sel", opts: [["1", "On"], ["0", "Off"]], adv: true } ] },
+  { cat: "Adverts", items: [
+    { k: "advert.interval", label: "Announce to nearby nodes every", type: "num", min: 0, max: 240, step: 2, unit: "min", help: "Zero-hop advert: 60–240 minutes, or 0 for off." },
+    { k: "flood.advert.interval", label: "Announce across the whole mesh every", type: "num", min: 3, max: 168, step: 1, unit: "h", help: "Flood advert: 3–168 hours." } ] },
+  { cat: "Power saving", items: [
+    { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, get: "powersaving", set: "powersaving ", help: "On = the repeater sleeps between transmissions (ESP32: after about 2 minutes). Stock firmware then stops answering this dashboard's console; firmware with Serial on demand keeps answering. Not available on bridge builds." },
+    { k: "serial.ondemand", label: "Serial on demand", type: "sel", opts: ONOFF, riskVals: ["off"], warn: "Serial on demand OFF: with power saving on, the T-SIM may no longer reach the Heltec's CLI (console, settings and serial reads stop until power saving is turned off over the mesh or USB)", help: "Keeps the Heltec's serial port reachable during power saving so the T-SIM can still send commands; off = stock power saving. Requires MeshCore + power saving + serial firmware (just-stuff-tm/MeshCore)." },
+    { k: "radio.rxps", label: "RX duty cycle (RXPS)", type: "sel", opts: RXPS_OPTS, riskVals: ["level 9", "level 10"], warn: "RX duty cycle overdrive / riskyWorkingMax runs outside the radio datasheet timing and can miss packets", help: "Receiver sleeps between preamble checks to save power. Higher level = more saving, shorter preamble margin. on = level 3. Custom rx/sleep timings can only be set in the console (set radio.rxps <rx_us> <sleep_us>). Power-saving firmware (EasySkyMesh or just-stuff-tm/MeshCore)." },
+    { k: "reboot.interval", label: "Scheduled reboot every", type: "num", min: 0, max: 255, step: 1, unit: "h", help: "0 = off. Power-saving firmware (EasySkyMesh or just-stuff-tm/MeshCore)." },
+    { k: "adc.multiplier", label: "Battery reading correction", ro: true, help: "The repeater's own battery reading multiplier (adc.multiplier). Calibrate it from a multimeter reading in Repeater battery calibration." } ] },
+  { sub: "Advanced", cat: "Timing & airtime", items: [
     { k: "txdelay", label: "Flood retransmit delay factor", type: "num", min: 0, max: 2, step: 0.1, unit: "×" },
     { k: "direct.txdelay", label: "Direct retransmit delay factor", type: "num", min: 0, max: 2, step: 0.1, unit: "×" },
     { k: "rxdelay", label: "Receive delay base (experimental)", type: "num", min: 0, max: 20, step: 0.1 },
@@ -1132,19 +1146,7 @@ export const RPT_SETTINGS = [
     { k: "int.thresh", label: "Interference threshold", type: "num", min: 0, max: 100, step: 1 },
     { k: "cad", label: "Channel activity detection", type: "sel", opts: ONOFF },
     { k: "agc.reset.interval", label: "AGC reset interval", type: "num", min: 0, max: 1020, step: 4, unit: "s", help: "0 = off; rounded down to a multiple of 4." } ] },
-  { cat: "Adverts", items: [
-    { k: "flood.advert.interval", label: "Flood advert every", type: "num", min: 3, max: 168, step: 1, unit: "h" },
-    { k: "advert.interval", label: "Zero-hop advert every", type: "num", min: 0, max: 240, step: 2, unit: "min", help: "60–240, or 0 for off." } ] },
-  { cat: "Power & battery", items: [
-    { k: "powersaving", label: "Power saving", type: "sel", opts: ONOFF, risk: true, get: "powersaving", set: "powersaving ", help: "On = the repeater sleeps between transmissions (ESP32: after about 2 minutes). Stock firmware then stops answering this dashboard's console; firmware with Serial on demand keeps answering. Not available on bridge builds." },
-    { k: "serial.ondemand", label: "Serial on demand", type: "sel", opts: ONOFF, riskVals: ["off"], warn: "Serial on demand OFF: with power saving on, the T-SIM may no longer reach the Heltec's CLI (console, settings and serial reads stop until power saving is turned off over the mesh or USB)", help: "Keeps the Heltec's serial port reachable during power saving so the T-SIM can still send commands; off = stock power saving. Requires MeshCore + power saving + serial firmware (just-stuff-tm/MeshCore)." },
-    { k: "radio.rxps", label: "RX duty cycle (RXPS)", type: "sel", opts: RXPS_OPTS, riskVals: ["level 9", "level 10"], warn: "RX duty cycle overdrive / riskyWorkingMax runs outside the radio datasheet timing and can miss packets", help: "Receiver sleeps between preamble checks to save power. Higher level = more saving, shorter preamble margin. on = level 3. Custom rx/sleep timings can only be set in the console (set radio.rxps <rx_us> <sleep_us>). Power-saving firmware (EasySkyMesh or just-stuff-tm/MeshCore)." },
-    { k: "reboot.interval", label: "Scheduled reboot every", type: "num", min: 0, max: 255, step: 1, unit: "h", help: "0 = off. Power-saving firmware (EasySkyMesh or just-stuff-tm/MeshCore)." },
-    { k: "adc.multiplier", label: "Battery multiplier", ro: true, help: "Calibrate it from a multimeter reading in Repeater battery calibration." } ] },
-  { cat: "GPS", note: "Only on repeaters built with GPS support; others answer \"not supported\".", items: [
-    { k: "gps", label: "GPS receiver", type: "sel", opts: ONOFF, get: "gps", set: "gps ", first: true },
-    { k: "gps.advert", label: "Location in adverts", type: "sel", opts: [["none", "Don't share"], ["share", "Live GPS position"], ["prefs", "Saved lat/lon"]], get: "gps advert", set: "gps advert " } ] },
-  { cat: "Bridge", dep: "bridge.type", note: "Only on repeaters built with a bridge (RS-232 or ESP-NOW). Hidden when the repeater doesn't report one.", items: [
+  { sub: "Advanced", cat: "Bridge", dep: "bridge.type", note: "Only on repeaters built with a bridge (RS-232 or ESP-NOW). Hidden when the repeater doesn't report one.", items: [
     { k: "bridge.type", label: "Bridge type", ro: true },
     { k: "bridge.enabled", label: "Bridge enabled", type: "sel", opts: ONOFF, dep: "bridge.type" },
     { k: "bridge.delay", label: "Bridge delay", type: "num", min: 0, max: 10000, step: 10, unit: "ms", dep: "bridge.type" },
@@ -1152,11 +1154,15 @@ export const RPT_SETTINGS = [
     { k: "bridge.baud", label: "RS-232 speed", type: "sel", opts: ["9600", "19200", "38400", "57600", "115200"].map((x) => [x, x + " baud"]), dep: "bridge.type" },
     { k: "bridge.channel", label: "ESP-NOW channel", type: "num", min: 1, max: 14, step: 1, dep: "bridge.type" },
     { k: "bridge.secret", label: "ESP-NOW secret", type: "secret", max: 15, risk: true, dep: "bridge.type" } ] },
-  { cat: "Diagnostics", noAll: true, note: "Read-only. Power-management values exist only on nRF52 boards; others answer \"not supported\".", items: [
-    { k: "pwrmgt.support", label: "Power management", ro: true }, { k: "pwrmgt.source", label: "Power source", ro: true },
-    { k: "pwrmgt.bootreason", label: "Boot / shutdown reason", ro: true }, { k: "pwrmgt.bootmv", label: "Boot voltage", ro: true },
-    { k: "bootloader.ver", label: "Bootloader", ro: true }, { k: "powerlog", label: "Reset reason (powerlog)", ro: true, get: "powerlog", help: "Power-saving firmware only." }, { k: "eth.status", label: "Ethernet", ro: true, get: "eth.status" } ] },
-  { cat: "Passwords", risk: true, note: "Anyone who knows these can log in to the repeater over the mesh. Passwords are sent over SMS/LTE to the T-SIM and stored in this dashboard's command history.", items: [
+  { sub: "Advanced", cat: "Diagnostics", noAll: true, note: "Read-only. Power-management values exist only on nRF52 boards; others answer \"not supported\".", items: [
+    { k: "pwrmgt.support", label: "Power management", ro: true },
+    { k: "pwrmgt.source", label: "Power source", ro: true },
+    { k: "pwrmgt.bootreason", label: "Boot / shutdown reason", ro: true },
+    { k: "pwrmgt.bootmv", label: "Boot voltage", ro: true },
+    { k: "bootloader.ver", label: "Bootloader", ro: true },
+    { k: "powerlog", label: "Reset reason (powerlog)", ro: true, get: "powerlog", help: "Power-saving firmware only." },
+    { k: "eth.status", label: "Ethernet", ro: true, get: "eth.status" } ] },
+  { sub: "Advanced", cat: "Passwords", risk: true, note: "Anyone who knows these can log in to the repeater over the mesh. Passwords are sent over SMS/LTE to the T-SIM and stored in this dashboard's command history.", items: [
     { k: "guest.password", label: "Guest password", type: "secret", max: 60, risk: true },
     { k: "password", label: "Admin password (change only)", type: "secret", max: 60, wo: true, risk: true, typed: "CHANGE", help: "Can't be read back. Default on new nodes: password." } ] },
 ];
@@ -1165,7 +1171,10 @@ export const rptGetCmd = (k) => (RPT_INDEX[k] && RPT_INDEX[k].get) || (k === "po
 const rptSetPrefix = (i) => i.set || (i.k === "powersaving" ? "powersaving " : i.k === "password" ? "password " : "set " + i.k + " ");
 export const RPT_READ_KEYS = Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => i.k);
 // "Read all": everything except diagnostics, and bridge settings only once the repeater reported a bridge type.
-export const rptReadAllKeys = (vals = {}) => Object.values(RPT_INDEX).filter((i) => !i.wo && !i.noAll && (!i.dep || depOk(vals[i.dep]))).map((i) => i.k);
+// v1.8.0: the display groups changed, but reads keep the original order (the first wake still reads identity and radio).
+const RPT_READ_ORDER = ["name","owner.info","role","board","ver","public.key","lat","lon","radio","tx","radio.rxgain","radio.fem.rxgain","radio.fem.txgain","repeat","path.hash.mode","loop.detect","flood.max","flood.max.unscoped","flood.max.advert","multi.acks","txdelay","direct.txdelay","rxdelay","dutycycle","int.thresh","cad","agc.reset.interval","flood.advert.interval","advert.interval","powersaving","serial.ondemand","radio.rxps","reboot.interval","adc.multiplier","gps","gps.advert","bridge.type","bridge.enabled","bridge.delay","bridge.source","bridge.baud","bridge.channel","bridge.secret","pwrmgt.support","pwrmgt.source","pwrmgt.bootreason","pwrmgt.bootmv","bootloader.ver","powerlog","eth.status","guest.password","password"];
+const rptOrd = (k) => { const i = RPT_READ_ORDER.indexOf(k); return i < 0 ? 999 : i; };
+export const rptReadAllKeys = (vals = {}) => Object.values(RPT_INDEX).filter((i) => !i.wo && !i.noAll && (!i.dep || depOk(vals[i.dep]))).map((i) => i.k).sort((x, y) => rptOrd(x) - rptOrd(y));
 export function depOk(v) { return !!(v && v.value != null && !/^(none|no|off|-|n\/a)?$/i.test(String(v.value).trim())); }
 const RPT_GETMAP = Object.fromEntries(Object.values(RPT_INDEX).filter((i) => !i.wo).map((i) => [rptGetCmd(i.k).toLowerCase(), i.k]));
 const RPT_SETS = Object.values(RPT_INDEX).filter((i) => !i.ro).map((i) => [rptSetPrefix(i).toLowerCase(), i.k]).sort((a, b) => b[0].length - a[0].length);
@@ -3668,10 +3677,10 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
 </div></section>
 <section><h2>Modem watchdog <small class="mut small" id="wdsum"></small></h2><div class="card">
-<p class="small mut" style="margin-top:0">Self-recovery (T-SIM firmware 1.7.1+). The T-SIM normally sleeps until a text rings its modem. If the modem drops off the network while it sleeps, texts can't reach it, so the watchdog also wakes it on a timer. It checks the modem (answers AT, SIM ready, registered, data attached). If that fails it resets the modem's radio (<code>AT+CFUN=0/1</code>), then power-cycles the modem, and goes back to sleep with text wake-up re-armed. A healthy check takes a few seconds. A heartbeat to this dashboard adds about 10–20 s of LTE (a few KB). It never sends texts and never fetches queued console commands.</p>
+<p class="small mut" style="margin-top:0">Self-recovery (T-SIM firmware 1.7.1+). The T-SIM normally sleeps until a text rings its modem. If the modem drops off the network while it sleeps, texts can't reach it, so the watchdog also wakes it on a timer. It checks the modem (answers AT, SIM ready, registered, data attached). If that fails it resets the modem's radio (<code>AT+CFUN=0/1</code>), then power-cycles the modem, and goes back to sleep with text wake-up re-armed. A healthy check takes a few seconds. A heartbeat to this dashboard adds about 10–20 s of LTE (a few KB). It never sends texts. From T-SIM 1.7.2 it also picks up commands and settings waiting in the queue (including a backup copy of a radio update). How often it runs and what it does are now set in Automatic check-ins.</p>
 <div id="wdinfo"></div><div id="wdev" class="small"></div><div id="wddel" class="small"></div>
 <p class="small mut" id="wdnote" hidden>Needs T-SIM firmware 1.7.1 or newer. Update the T-SIM firmware first. Until then the T-SIM has no timer wake and can't recover by itself.</p>
-<form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (1.7.2+: every 24 h, it can't be turned off)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
+<form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (T-SIM 1.7.2–1.7.x: still every 24 h; 1.8.0+: a silent daily safety check)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
 <label class="tog"><input type="checkbox" name="sms"> On watchdog wakes, also run texts already waiting on the modem (off: they run at the next text or wake)</label>
 <label class="tog"><input type="checkbox" name="hwake"> GPIO6 wake (on by default): from T-SIM 1.7.7 a pulse is the repeater's tsim wake command, not a Heltec reboot, and it does not reset the modem. The same switch still allows the while-awake reboot check (1.7.4). Turns itself off if GPIO6 stays low; tick again to re-enable</label>

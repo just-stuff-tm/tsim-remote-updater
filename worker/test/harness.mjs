@@ -1373,7 +1373,7 @@ console.log("serial.ondemand tests OK");
 {
   const m = await import("../src/index.js");
   const I = m.RPT_INDEX;
-  assert.equal(I["serial.ondemand"].cat, "Power & battery"); assert.equal(I["radio.rxps"].cat, "Power & battery"); assert.equal(I["reboot.interval"].cat, "Power & battery");
+  assert.equal(I["serial.ondemand"].cat, "Power saving"); assert.equal(I["radio.rxps"].cat, "Power saving"); assert.equal(I["reboot.interval"].cat, "Power saving");
   assert.match(I["serial.ondemand"].help, /^Keeps the Heltec's serial port reachable during power saving so the T-SIM can still send commands; off = stock power saving\. Requires MeshCore \+ power saving \+ serial firmware \(just-stuff-tm\/MeshCore\)\.$/);
   // get commands (exact firmware syntax)
   assert.equal(m.rptGetCmd("serial.ondemand"), "get serial.ondemand"); assert.equal(m.rptGetCmd("powersaving"), "powersaving");
