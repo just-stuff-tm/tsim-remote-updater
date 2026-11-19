@@ -458,6 +458,9 @@ async function recordSend(env, id, st, label, ok, err, at = new Date().toISOStri
   await putJson(env, `sent:${id}`, sent);
 }
 
+// v1.8.0: firmware updates and reboots are never held back by the unanswered-text check.
+export const WAKE_SUPPRESS_EXEMPT = /^(T-SIM firmware|UPDATE|REBOOT)/;
+export const suppressMsg = (mins) => `A wake text was sent ${mins} min ago and the T-SIM hasn't answered yet, so no new text was sent. Your change is queued and goes with that wake. Use "Send another text anyway" to force.`;
 async function manualSend(env, dev, body, label, onSuccess) {
   const stKey = `state:${dev.id}`;
   const st = await loadState(env, dev.id);
@@ -465,6 +468,14 @@ async function manualSend(env, dev, body, label, onSuccess) {
   if (st.last_send_ts && now - st.last_send_ts < SEND_GAP_MS) {
     const wait = Math.ceil((SEND_GAP_MS - (now - st.last_send_ts)) / 1000);
     return [{ sent: false, body, hologram_response_summary: null, error: `rate limited, try again in ${wait}s` }, 429];
+  }
+  if (!dev.force_text && !WAKE_SUPPRESS_EXEMPT.test(label) && st.last_action && st.last_action.sent) {
+    const lat = (await kvJson(env, `telem:${dev.id}:latest`)) || {};
+    const sup = st.last_send_ts ? wakeSuppressed(new Date(st.last_send_ts).toISOString(), lat.received_at, now) : null;
+    if (sup) {
+      await logActivity(env, dev.id, { type: "action", msg: `${label}: no text sent (a wake text from ${sup.mins} min ago is still unanswered)` });
+      return [{ sent: false, body, suppressed: true, queued: true, message: suppressMsg(sup.mins), hologram_response_summary: null }, 202];
+    }
   }
   if (body.length > 160) return [{ sent: false, body, hologram_response_summary: null, error: `text is ${body.length} chars (max 160)` }, 400]; // final text, after any /gh/ shorten
   st.last_send_ts = now;
@@ -486,6 +497,28 @@ async function manualSend(env, dev, body, label, onSuccess) {
     await logActivity(env, dev.id, { received_at: at, type: "action", msg: `${label} text FAILED: ${e.message}` });
     return [{ sent: false, body, hologram_response_summary: { success: false, error: e.message } }, 502];
   }
+}
+
+// v1.8.0: double-submit protection. A POST with an Idempotency-Key gets the stored first response on a repeat
+// (10 min), and a second identical action while the first is still running gets 429. Old clients (no key) are unaffected.
+const IDEM_TTL_S = 600, LOCK_MS = 5000;
+async function idemWrap(request, env, dev, action, run) {
+  const key = request.method === "POST" ? String(request.headers.get("Idempotency-Key") || "") : "";
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(key)) return run();
+  const ik = `idem:${dev.id}:${key}`, lk = `lock:${dev.id}:${action}`;
+  const prev = await kvJson(env, ik);
+  if (prev && prev.done) return new Response(prev.body, { status: prev.status, headers: { "Content-Type": "application/json", "Idempotent-Replay": "1" } });
+  const lock = await kvJson(env, lk);
+  if (lock && Date.now() - lock.at < LOCK_MS) return json({ error: "Already working on that, one moment." }, 429);
+  await env.STATE.put(lk, JSON.stringify({ at: Date.now() }), { expirationTtl: 60 });
+  try {
+    const res = await run();
+    if (res.status < 500 && (res.headers.get("Content-Type") || "").includes("json")) {
+      const body = await res.clone().text();
+      await env.STATE.put(ik, JSON.stringify({ done: true, status: res.status, body }), { expirationTtl: IDEM_TTL_S });
+    }
+    return res;
+  } finally { await env.STATE.delete(lk); }
 }
 
 // ---------- update progress (built from the telemetry events the firmware already posts) ----------
@@ -536,13 +569,13 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
       else if (/OTA: downloaded/.test(m)) { step = Math.max(step, 3); times[1] ||= h.received_at; times[2] = times[3] = h.received_at; }
       else if (/OTA: written/.test(m)) { step = Math.max(step, 4); times[4] = h.received_at; }
       else if (/booted new firmware/.test(m)) { step = Math.max(step, 4); }
-      else if (/OTA OK/.test(m)) { step = 5; times[5] = h.received_at; state = "done"; finished = h.received_at; }
+      else if (/OTA OK/.test(m)) { step = 5; times[5] = h.received_at; state = "done"; finished = h.received_at; reason = null; }   // v1.8.0: a later success clears an earlier failure
       else if (/OTA FAIL/.test(m)) { state = "failed"; reason = friendlyFail(m); finished = h.received_at; }
     } else {
-      if (/^(UPDATE )?start/i.test(m) || /^UPDATE start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; }
+      if (/^(UPDATE )?start/i.test(m) || /^UPDATE start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; if (state === "failed") { state = "running"; reason = null; finished = null; } }   // v1.8.0: a new attempt starts clean
       else if (/^Download done/.test(m)) { step = Math.max(step, 3); times[1] ||= h.received_at; times[2] = times[3] = h.received_at; }
       else if (/^Flashing:/.test(m)) { step = Math.max(step, 3); flash = { ...flash, ...parseFlashInfo(m) }; }
-      else if (/^SUCCESS/.test(m)) { flash = { ...flash, ...parseFlashInfo(m) }; step = 5; times[4] = times[5] = h.received_at; state = "done"; finished = h.received_at; }
+      else if (/^SUCCESS/.test(m)) { flash = { ...flash, ...parseFlashInfo(m) }; step = 5; times[4] = times[5] = h.received_at; state = "done"; finished = h.received_at; reason = null; }   // v1.8.0
       else if (/FAIL/.test(m)) { const fi = parseFlashInfo(m); if (fi) flash = { ...flash, ...fi }; state = "failed"; reason = friendlyFail(m.split(" | ")[0]); finished = h.received_at; }
     }
   }
@@ -801,6 +834,20 @@ export function radioDebugReport(input) {
     })),
   };
 }
+// v1.8.0: after a T-SIM moves to 1.8.0, settings saved here with the check-ins card (tcfg:<id>) are sent once as a
+// TCFG line if the T-SIM reports something different. Only an explicitly saved plan is pushed, and at most every 6 h.
+export const tcfgSame = (a, b) => !!a && !!b && ["ci", "cs", "qc", "usol", "gto"].every((k) => +a[k] === +b[k]) && tcfgCanon(a.do, TCFG_DO) === tcfgCanon(b.do, TCFG_DO) && tcfgCanon(a.q, TCFG_Q) === tcfgCanon(b.q, TCFG_Q);
+async function tcfgAutoSync(env, id, echo, at) {
+  const tc = await kvJson(env, `tcfg:${id}`);
+  if (!tc || tcfgSame(validateTcfg(tc, {}), echo)) return;
+  if (tc.sync_at && Date.parse(at) - Date.parse(tc.sync_at) < 6 * 3600e3) return;
+  const list = (await kvJson(env, `cmds:${id}`)) || [];
+  if (list.some((c) => (c.status === "queued" || c.status === "sent") && /^tcfg\s/i.test(c.cmd || ""))) return;
+  list.unshift({ id: randomHex(4), cmd: tcfgCmd(validateTcfg(tc, {})), sys: true, status: "queued", queued_at: at, auto: true });
+  await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+  await putJson(env, `tcfg:${id}`, { ...tc, sync_at: at, applied_at: null });
+  await logActivity(env, id, { type: "action", msg: "Check-in settings saved here differ from the T-SIM's; queued them for its next check-in" });
+}
 async function handleIngest(request, env, id) {
   const dev = await getDevice(env, id);
   const key = request.headers.get("X-Device-Key") || "";
@@ -812,12 +859,15 @@ async function handleIngest(request, env, id) {
   const entry = { ...sanitizeTelemetry(t), received_at: new Date().toISOString() };
   if (t.test === true) entry.test = true;
   const tlf = tlFields(t.tl);
+  const tce = tcfgEcho(t.tcfg);   // v1.8.0: the T-SIM's effective check-in settings, on every post
+  if (tce) tlf.tcfg = { ...tce, at: entry.received_at };
   if (Object.keys(tlf).length) {  // v1.7.0: every post refreshes the T-SIM card
     const prev0 = (await kvJson(env, `telem:${id}:latest`)) || {};
     const diagLine = tlf.sms_diag ? smsDiagLine(tlf.sms_diag) : "";
     const prevDiag = smsDiagLine(prev0.sms_diag);
     await putJson(env, `telem:${id}:latest`, { ...prev0, ...tlf, tl_at: entry.received_at, received_at: entry.received_at });
     if (diagLine && diagLine !== prevDiag) await logActivity(env, id, { type: "event", msg: diagLine });  // v1.7.11
+    if (tce) await tcfgAutoSync(env, id, tce, entry.received_at);   // v1.8.0
   }
   const hrp = hrpInfo(t.tl, entry.received_at);  // v1.7.4: Heltec reboots the T-SIM couldn't report when they happened
   if (hrp) {
@@ -908,7 +958,9 @@ async function handleIngest(request, env, id) {
     }
     // System (non-user) commands: T-SIM self-update, firmware-tagged sys, or anything the user never queued.
     const sys = t.sys === true || (c && c.sys) || !c || isSysCmd(c ? c.cmd : t.cmd);
-    if (c) { if (sys) c.sys = true; c.status = t.error ? "error" : "done"; c.output = out; c.done_at = entry.received_at; if (t.error) c.error = String(t.error).slice(0, 120); }
+    const dup = fwDupResult(t.error);   // v1.8.0: a re-served id the T-SIM already ran, or a config replaced in the same batch
+    if (c && dup) { if (sys) c.sys = true; c.status = dup.status; c.done_at = entry.received_at; if (dup.status === "done") c.note = dup.note; else c.error = dup.note; }
+    else if (c) { if (sys) c.sys = true; c.status = t.error ? "error" : "done"; c.output = out; c.done_at = entry.received_at; if (t.error) c.error = String(t.error).slice(0, 120); }
     else list.unshift({ id: cmdId || randomHex(4), cmd: String(t.cmd || "?").slice(0, CMD_MAX_LEN), status: "done", output: out, done_at: entry.received_at, unsolicited: true, sys: true });
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     const ran = (c ? c.cmd : String(t.cmd || "")).trim().toLowerCase();
@@ -916,6 +968,10 @@ async function handleIngest(request, env, id) {
     if (/^pwrcfg /.test(ran)) {
       const p = (await kvJson(env, `power:${id}`)) || {};
       if (c && c.cmd === (p.last_cmd || pwrCfgCmd({ ...DEFAULT_POWER, ...p }))) { p.applied_at = entry.received_at; p.applied_output = out.slice(0, 300); p.wake = null; await putJson(env, `power:${id}`, p); }
+    }
+    if (/^tcfg /.test(ran) && c && !dup) {   // v1.8.0
+      const tc = (await kvJson(env, `tcfg:${id}`)) || null;
+      if (tc && c.cmd === tcfgCmd(tc)) { tc.applied_at = entry.received_at; tc.applied_output = out.slice(0, 300); await putJson(env, `tcfg:${id}`, tc); }
     }
     if (/^wdcfg /.test(ran) && c) {
       const w = (await kvJson(env, `wdcfg:${id}`)) || {};
@@ -958,7 +1014,7 @@ async function handleIngest(request, env, id) {
     return json({ ok: true });
   }
   const prev = (await kvJson(env, `telem:${id}:latest`)) || {};
-  await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type });
+  await putJson(env, `telem:${id}:latest`, { ...prev, ...entry, last_type: entry.type, ...(typeof entry.lb_en === "boolean" ? { pwr_at: entry.received_at } : {}) });
   if (entry.type === "update") { const s2 = (await kvJson(env, `state:${id}`)) || {}; s2.last_checkin_ts = Date.now(); await putJson(env, `state:${id}`, s2); }
   await logActivity(env, id, entry);
   if (entry.fw || (entry.type === "mesh" && t.ver)) {
@@ -1222,7 +1278,7 @@ export function calcAdcMultiplier(cur, meterV, reportedV) {
   if (!(v > 0)) throw new Error("That works out to 0, which would mean \"board default\". Check the readings.");
   return v;
 }
-export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg|cfgsnap|wdcfg)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
+export const isSysCmd = (cmd) => /^(tsimupdate|pwrcfg|cfgsnap|wdcfg|tcfg)\s/i.test(String(cmd || "").trim()) || /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
 // ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
 export const LB_RATIO = 1.10;
@@ -1677,6 +1733,196 @@ export function tlFields(tl) {
 export const DEFAULT_GPS = { auto: false, timeout_s: 180 };
 const isGpsCmd = (cmd) => /^gps(fix|cfg)\b/i.test(String(cmd || "").trim());
 export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}`;
+// ---------- v1.8.0: unified check-ins (TCFG), device-confirmed state, queue safeguards ----------
+// One LTE check-in timer + one no-LTE quick-check cadence. Firmware 1.8.0 takes a single TCFG line; older firmware
+// gets the equivalent legacy WDCFG/PWRCFG/CFGSNAP/GPSCFG lines, queued together so they go in one wake.
+export const TCFG_FW = "1.8.0";
+export const TCFG_DO = "hcmsgt", TCFG_Q = "bu";
+export const DEFAULT_TCFG = { ci: 360, do: "hc", cs: 0, qc: 30, q: "u", usol: 2000, gto: 180, txt_h: 0 };
+export const TCFG_CI_CHOICES = [0, 60, 120, 180, 360, 720, 1440], TCFG_QC_CHOICES = [0, 15, 30, 60, 120], TCFG_CS_CHOICES = [0, 24, 168];
+export const tcfgCanon = (s, all) => [...all].filter((c) => String(s || "").includes(c)).join("");
+const tcfgCiOk = (v) => v === 0 || (Number.isInteger(v) && v >= 30 && v <= 1440);
+const tcfgQcOk = (v) => v === 0 || (Number.isInteger(v) && v >= 15 && v <= 240);
+const clampQc = (v) => (v <= 0 ? 0 : Math.min(240, Math.max(15, Math.round(v))));
+const snapCs = (h) => (!(h > 0) ? 0 : h <= 1 ? 1 : h <= 72 ? 24 : 168);
+// Migration: the unified settings an existing device already runs, from the per-feature KV records.
+// Nothing stored at all -> new-device defaults. Otherwise each feature keeps today's per-key defaults.
+export function tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings } = {}) {
+  if (!wdcfg && !power && !cachecfg && !gpscfg && !(settings && settings.schedule_hours)) return { ...DEFAULT_TCFG };
+  const w = { ...DEFAULT_WD, ...(wdcfg || {}) }, p = { ...DEFAULT_POWER, ...(power || {}) }, c = { ...DEFAULT_CACHE, ...(cachecfg || {}) }, g = { ...DEFAULT_GPS, ...(gpscfg || {}) };
+  const im = Number(w.int_min);
+  const ci = im === 0 ? 0 : tcfgCiOk(im) ? im : DEFAULT_WD.int_min;
+  let d = "";
+  if (w.hb !== false) d += "h";
+  if (w.cmd !== false) d += "c";
+  if (w.smesh === true) d += "m";
+  if (c.en) d += "s";
+  if (g.auto) d += "g";
+  if (w.sms === true) d += "t";
+  const up = w.upoll === undefined ? DEFAULT_UP.upoll : Number(w.upoll);
+  let q = "", qs = [];
+  if (p.lb_en) { q += "b"; qs.push(Number(p.lb_int) || DEFAULT_POWER.lb_int); }
+  if (up > 0) { q += "u"; qs.push(up); }
+  const qc = qs.length ? clampQc(Math.min(...qs)) : DEFAULT_TCFG.qc;
+  return { ci, do: tcfgCanon(d, TCFG_DO), cs: c.en ? snapCs(Number(c.int_h)) : 0, qc: q ? qc : 0, q: tcfgCanon(q, TCFG_Q),
+    usol: Number.isInteger(Number(w.usol)) ? Number(w.usol) : DEFAULT_UP.usol, gto: Number(g.timeout_s) || 180, txt_h: Number(settings && settings.schedule_hours) || 0 };
+}
+export function validateTcfg(cur, b = {}) {
+  const t = { ...DEFAULT_TCFG, ...(cur || {}) };
+  if (b.ci !== undefined) { const v = Number(b.ci); if (!TCFG_CI_CHOICES.includes(v)) throw new Error("Pick how often to check in: off, or every 1 to 24 hours."); t.ci = v; }
+  if (b.do !== undefined) t.do = tcfgCanon(b.do, TCFG_DO);
+  if (b.cs !== undefined) { const v = Number(b.cs); if (![0, 1, 24, 168].includes(v)) throw new Error("Pick how often to refresh the saved repeater settings."); t.cs = v; }
+  if (b.qc !== undefined) { const v = Number(b.qc); if (!TCFG_QC_CHOICES.includes(v)) throw new Error("Pick how often to run quick checks: off, or every 15 minutes to 2 hours."); t.qc = v; }
+  if (b.q !== undefined) t.q = tcfgCanon(b.q, TCFG_Q);
+  if (b.usol !== undefined) { const v = Number(b.usol); if (!Number.isInteger(v) || v < 0 || v > 20000) throw new Error("Daylight threshold must be 0 to 20 V."); t.usol = v; }
+  if (b.gto !== undefined) { const v = Number(b.gto); if (!Number.isInteger(v) || v < 30 || v > 600) throw new Error("GPS timeout must be 30 to 600 seconds."); t.gto = v; }
+  if (b.txt_h !== undefined) { const v = Number(b.txt_h); if (!SCHEDULE_CHOICES.includes(v)) throw new Error("Pick how often to wake by text: off, 6 h, 12 h, a day or a week."); t.txt_h = v; }
+  if (t.q && !t.qc) t.qc = DEFAULT_TCFG.qc;
+  return { ci: t.ci, do: t.do, cs: t.cs, qc: t.qc, q: t.q, usol: t.usol, gto: t.gto, txt_h: t.txt_h };
+}
+export const tcfgCmd = (t) => `TCFG ci=${t.ci} do=${tcfgCanon(t.do, TCFG_DO) || "-"} cs=${t.cs} qc=${t.qc} q=${tcfgCanon(t.q, TCFG_Q) || "-"} usol=${t.usol} gto=${t.gto}`;
+// fw < 1.8.0: the legacy lines for t. Only kinds whose string differs from the current one are returned.
+// cur = { wdcfg, power, cachecfg, gpscfg } as stored. Returns { cmds: [{kind, cmd}], store: {wdcfg, power, cachecfg, gpscfg} }.
+export function tcfgLegacyCmds(t, cur = {}) {
+  const has = (s, c) => String(s || "").includes(c);
+  const w0 = { ...DEFAULT_WD, ...(cur.wdcfg || {}) }, p0 = { ...DEFAULT_POWER, ...(cur.power || {}) }, c0 = { ...DEFAULT_CACHE, ...(cur.cachecfg || {}) }, g0 = { ...DEFAULT_GPS, ...(cur.gpscfg || {}) };
+  const strip = (o) => { const x = { ...o }; delete x.applied_at; delete x.applied_output; delete x.updated_at; delete x.last_cmd; delete x.wake; return x; };
+  const w = strip(w0); w.int_min = t.ci; w.hb = has(t.do, "h"); w.sms = has(t.do, "t");
+  if (w.smesh !== undefined || has(t.do, "m")) w.smesh = has(t.do, "m");
+  const upoll = has(t.q, "u") ? t.qc : 0;
+  if (w.upoll !== undefined || upoll !== DEFAULT_UP.upoll || t.usol !== DEFAULT_UP.usol) { w.upoll = upoll; w.usol = t.usol; }
+  const p = strip(p0); p.lb_en = has(t.q, "b"); if (p.lb_en) p.lb_int = t.qc;
+  const c = strip(c0); c.en = has(t.do, "s"); if (t.cs) c.int_h = t.cs;
+  const g = strip(g0); g.auto = has(t.do, "g"); g.timeout_s = t.gto;
+  const cmds = [];
+  const add = (kind, a, b) => { if (a !== b) cmds.push({ kind, cmd: a }); };
+  add("wdcfg", wdCfgCmd(w), wdCfgCmd(w0));
+  add("pwrcfg", pwrCfgCmd(p), pwrCfgCmd(p0));
+  add("cfgsnap", cacheCmd(c), cacheCmd(c0));
+  add("gpscfg", gpsCfgCmd(g), gpsCfgCmd(g0));
+  return { cmds, store: { wdcfg: w, power: p, cachecfg: c, gpscfg: g } };
+}
+export function parseTcfgApplied(out) {
+  const m = /TCFG applied \d+[^:]*:\s*ci=(\d+) do=([a-z-]*) cs=(\d+) qc=(\d+) q=([a-z-]*) usol=(\d+) gto=(\d+)/.exec(String(out || ""));
+  if (!m) return null;
+  return { ci: +m[1], do: m[2] === "-" ? "" : m[2], cs: +m[3], qc: +m[4], q: m[5] === "-" ? "" : m[5], usol: +m[6], gto: +m[7] };
+}
+export function tcfgEcho(x) {
+  if (!x || typeof x !== "object" || !Number.isFinite(x.ci)) return null;
+  const n = (v, d) => (Number.isFinite(v) ? v : d);
+  return { ci: x.ci, do: tcfgCanon(x.do, TCFG_DO), cs: n(x.cs, 0), qc: n(x.qc, 0), q: tcfgCanon(x.q, TCFG_Q), usol: n(x.usol, 2000), gto: n(x.gto, 180) };
+}
+// Legacy applied lines -> the values the T-SIM confirmed.
+export function parseLegacyApplied(out) {
+  const s = String(out || ""), kv = (re) => { const o = {}; for (const m of s.matchAll(re)) o[m[1]] = m[2]; return o; };
+  if (/^PWRCFG applied/.test(s)) { const o = kv(/(\w+)=(\S+)/g); return { kind: "power", v: { cal_scale: +o.scale, cal_off: +o.off, lb_en: o.en === "1", lb_lo: +o.lo, lb_hi: +o.hi, lb_int: +o.int, lb_imm: o.imm === "1" } }; }
+  if (/^WDCFG applied/.test(s)) { const o = kv(/(\w+)=(\S+)/g); const v = { int_min: +o.int, hb: o.hb === "1", sms: o.sms === "1", cmd: o.cmd !== "0" };
+    if (o.hwake !== undefined) v.hwake = o.hwake === "1"; if (o.upoll !== undefined) v.upoll = +o.upoll; if (o.usol !== undefined) v.usol = +o.usol; if (o.smesh !== undefined) v.smesh = o.smesh === "1";
+    if (o.edrx !== undefined) v.edrx = o.edrx === "1"; if (o.psm !== undefined) v.psm = o.psm === "1"; return { kind: "watchdog", v }; }
+  if (/^CFGSNAP applied/.test(s)) { const m = /en=(\d) int=(\d+)h/.exec(s); return m ? { kind: "cache", v: { en: m[1] === "1", int_h: +m[2] } } : null; }
+  if (/^GPSCFG applied/.test(s)) { const m = /auto=(\d) to=(\d+)/.exec(s); return m ? { kind: "gps", v: { auto: m[1] === "1", timeout_s: +m[2] } } : null; }
+  const t = parseTcfgApplied(s); return t ? { kind: "checkins", v: t } : null;
+}
+// What the T-SIM last confirmed for one settings kind, the value saved here, and whether we are waiting on the T-SIM.
+// kind: checkins | power | watchdog | cache | gps. latest = telem:<id>:latest (received_at, fields incl. tcfg),
+// wd = wd:<id> heartbeat record (received_at, int, hb, sms, cmd...), cmds = command history, saved = the value saved here.
+// Source of truth = the NEWEST of (a done command's applied output, telemetry), by timestamp.
+export const SAME_WAKE_MS = 120 * 1000;
+const KIND_OF = { tcfg: "checkins", pwrcfg: "power", wdcfg: "watchdog", cfgsnap: "cache", gpscfg: "gps" };
+export function deviceState(kind, { latest = null, wd = null, cmds = [], saved = null } = {}) {
+  // Same-wake grace: a report up to SAME_WAKE_MS after an applied line was usually built before the change took
+  // effect (the stale-telemetry case), so within that window the applied line wins.
+  let best = null;
+  const take = (v, at, source) => {
+    const ms = Date.parse(at || 0); if (!v || !Number.isFinite(ms)) return;
+    if (!best) { best = { v, at, ms, source }; return; }
+    const win = source === "telemetry" && best.source === "applied" ? ms > best.ms + SAME_WAKE_MS : source === "applied" && best.source === "telemetry" ? ms >= best.ms - SAME_WAKE_MS : ms >= best.ms;
+    if (win) best = { v, at, ms, source };
+  };
+  for (const c of cmds || []) {
+    if (c.status !== "done" || !c.output) continue;
+    const k = KIND_OF[String(c.cmd || "").split(/\s/)[0].toLowerCase()];
+    const pa = parseLegacyApplied(c.output);
+    if (pa && pa.kind === kind && k === kind) take(pa.v, c.done_at || c.received_at || c.sent_at, "applied");
+  }
+  const L = latest || {};
+  if (kind === "checkins" && L.tcfg) take(tcfgEcho(L.tcfg), L.tcfg.at || L.received_at, "telemetry");
+  if (kind === "power" && typeof L.lb_en === "boolean") take({ cal_scale: L.cal_scale, cal_off: L.cal_off, lb_en: L.lb_en, lb_lo: L.lb_lo, lb_hi: L.lb_hi, lb_int: L.lb_int, lb_imm: L.lb_imm === true }, L.pwr_at || L.received_at, "telemetry");
+  if (kind === "watchdog" && wd && typeof wd.int_min === "number") take({ int_min: wd.int_min, hb: !!wd.hb, sms: !!wd.sms, ...(typeof wd.cmd === "boolean" ? { cmd: wd.cmd } : {}) }, wd.at || wd.received_at, "telemetry");
+  const device = best ? { ...best.v, at: best.at, source: best.source } : null;
+  const pending = (cmds || []).some((c) => (c.status === "queued" || c.status === "sent") && KIND_OF[String(c.cmd || "").split(/\s/)[0].toLowerCase()] === kind);
+  let differs = false;
+  // 1.7.2-1.7.x store a saved "off" (0) as every 24 h (1440): that is the same setting, not a difference.
+  const same = (k2, a, b) => String(a) === String(b) || ((k2 === "int_min" || k2 === "ci") && ((+a === 0 && +b === 1440 && !(best.source === "telemetry" && kind === "checkins")) || (+a === 1440 && +b === 0 && best.source !== "telemetry")));
+  if (saved && device) for (const [k2, v] of Object.entries(saved)) if (k2 in best.v && best.v[k2] !== undefined && v !== undefined && !same(k2, best.v[k2], v)) differs = true;
+  return { device, saved: saved || null, pending, differs, waiting: pending || (!!saved && !device) || differs };
+}
+// Rough battery cost of a check-in plan (per day). Embedded in the page with .toString().
+export function costEstimate(t) {
+  const has = (s, c) => String(s || "").indexOf(c) >= 0;
+  const ci = Number(t.ci) || 0, qc = Number(t.qc) || 0, txt = Number(t.txt_h) || 0;
+  const wakes = ci ? 1440 / ci : 0;
+  let per = 5;
+  if (has(t.do, "h") || has(t.do, "c")) per += 15;
+  if (has(t.do, "m")) per += 15;
+  if (has(t.do, "g")) per += Number(t.gto) || 180;
+  if (has(t.do, "t")) per += 5;
+  let cache = 0;
+  if (has(t.do, "s") && wakes) cache = 30 * (t.cs ? Math.min(wakes, 24 / t.cs) : wakes);
+  const texts = txt ? 24 / txt : 0;
+  return { lte_wakes_day: Math.round((wakes + texts) * 10) / 10, lte_secs_day: Math.round(wakes * per + cache + texts * 90),
+    quick_wakes_day: qc && t.q ? Math.round(1440 / qc) : 0, texts_day: Math.round(texts * 10) / 10 };
+}
+// Wake-text suppression: a text sent within windowMs that the T-SIM hasn't answered yet (no report since).
+export const WAKE_SUPPRESS_MS = 15 * 60 * 1000;
+export function wakeSuppressed(lastText, lastReport, now = Date.now(), windowMs = WAKE_SUPPRESS_MS) {
+  const t = Date.parse(lastText || 0), r = Date.parse(lastReport || 0);
+  if (!Number.isFinite(t) || !t || now - t > windowMs) return null;
+  if (Number.isFinite(r) && r >= t) return null;
+  return { mins: Math.max(1, Math.round((now - t) / 60000)) };
+}
+// Queue safeguards. Config kinds: a newer one replaces queued older ones. Other commands: an identical queued one is refused.
+export const CMD_EXPIRE_MS = 7 * 24 * 3600 * 1000;
+export function cmdKind(cmd) {
+  const s = String(cmd || "").trim(), w = s.split(/\s+/)[0].toLowerCase();
+  if (["tcfg", "wdcfg", "pwrcfg", "cfgsnap", "gpscfg"].includes(w)) return w;
+  const m = /^set\s+(\S+)\s/i.exec(s); if (m) return "set:" + m[1].toLowerCase();
+  if (/^powersaving\s+(on|off)$/i.test(s)) return "set:powersaving";
+  return null;
+}
+// Returns { refuse: message } or { superseded: n } after cancelling older queued entries of the same kind.
+export function queueGuard(list, cmd) {
+  const k = cmdKind(cmd), s = String(cmd || "").trim();
+  if (!k) { if ((list || []).some((c) => c.status === "queued" && String(c.cmd || "").trim() === s)) return { refuse: "That command is already waiting to be sent." }; return { superseded: 0 }; }
+  let n = 0;
+  for (const c of list || []) if (c.status === "queued" && cmdKind(c.cmd) === k) { c.status = "cancelled"; c.error = "replaced by a newer change"; n++; }
+  return { superseded: n };
+}
+export const queueFullMsg = (n) => `The queue is full (${n} waiting). Remove something or wait for the T-SIM to pick them up.`;
+export function expireQueued(list, now = Date.now(), ttl = CMD_EXPIRE_MS) {
+  let n = 0;
+  for (const c of list || []) if (c.status === "queued" && !c.wdonly && now - Date.parse(c.queued_at || 0) > ttl) { c.status = "cancelled"; c.error = "expired (not picked up within 7 days)"; n++; }
+  return n;
+}
+// The commands one fetch serves: each id once, and only the newest queued config of each kind (older ones cancelled).
+export function serveDedupe(pending) {
+  const seen = new Set(), newest = new Map(), out = [];
+  for (const c of pending) { const k = cmdKind(c.cmd); if (k && !k.startsWith("set:")) newest.set(k, c); }
+  for (const c of pending) {
+    if (seen.has(c.id)) continue; seen.add(c.id);
+    const k = cmdKind(c.cmd);
+    if (k && newest.has(k) && newest.get(k) !== c) { c.status = "cancelled"; c.error = "replaced by a newer change"; continue; }
+    out.push(c);
+  }
+  return out;
+}
+// Firmware 1.8.0 replies for re-served or batch-superseded ids.
+export function fwDupResult(err) {
+  const e = String(err || "");
+  if (e === "duplicate id skipped") return { status: "done", note: "already ran" };
+  if (/^superseded by a newer \w+ in the same batch$/.test(e)) return { status: "cancelled", note: e };
+  return null;
+}
 export function validateGps(cur, b) {
   const o = { ...DEFAULT_GPS, ...cur };
   if (b.auto !== undefined) o.auto = b.auto === true;
@@ -1782,7 +2028,7 @@ async function handleDeviceCommands(request, env, id) {
   const wdCfg = (await kvJson(env, `wdcfg:${id}`)) || {};
   // telem.wd_int > 0 wins (firmware 1440 after dashboard int=0); else wdcfg.int_min > 0; else 48 h.
   const wdInt = wdTtlIntervalMin(lat, wdCfg);
-  const expired = expireWdOnly(list, Date.now(), wdInt);
+  const expired = expireWdOnly(list, Date.now(), wdInt) + expireQueued(list, Date.now());   // v1.8.0: stale queued items expire after 7 days
   const stCmd = await loadState(env, id);
   let blocked = 0;
   for (const c of list) {  // v1.7.11: a dashboard cancel also drops a queued UPDATE (normal and wdonly)
@@ -1792,12 +2038,15 @@ async function handleDeviceCommands(request, env, id) {
   }
   const pwrOk = fwAtLeast(lat.fw, "1.6.5");  // older firmware would pass PWRCFG to the repeater CLI
   const gpsOk = fwAtLeast(lat.fw, GPS_FW);   // older firmware would pass GPSFIX/GPSCFG to the repeater CLI
-  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || "")) && wdOnlyOk(c, wdWake, lat.fw)).reverse().slice(0, cmdsPerWake(lat.fw));
+  const pending = list.filter((c) => c.status === "queued" && (c.sys || (!sysOnly && settings.console_enabled)) && (pwrOk || !/^pwrcfg\s/i.test(c.cmd || "")) && (gpsOk || !isGpsCmd(c.cmd)) && (fwAtLeast(lat.fw, CACHE_FW) || !/^cfgsnap\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, WD_FW) || !/^wdcfg\s/i.test(c.cmd || "")) && (fwAtLeast(lat.fw, TCFG_FW) || !/^tcfg\s/i.test(c.cmd || "")) && wdOnlyOk(c, wdWake, lat.fw)).reverse();
+  // v1.8.0: each id once, and only the newest queued config of each kind (older ones are cancelled as replaced)
+  const nServed = pending.length, served = serveDedupe(pending), superseded = nServed - served.length;
+  pending.length = 0; pending.push(...served.slice(0, cmdsPerWake(lat.fw)));
   // never let the reply overflow the T-SIM's fetch buffer (a cut line would run a truncated command)
   let bytes = 0; const fits = []; for (const c of pending) { bytes += `${c.id}\t${c.cmd}\n`.length; if (bytes > (fwAtLeast(lat.fw, BATCH_FW) ? CMD_FETCH_BYTES : 1700)) break; fits.push(c); }
   pending.length = 0; pending.push(...fits);
   for (const c of pending) { c.status = "sent"; c.sent_at = now; }
-  if (pending.length || expired || blocked) await putJson(env, `cmds:${id}`, list);
+  if (pending.length || expired || blocked || superseded) await putJson(env, `cmds:${id}`, list);
   const nowS = Math.floor(Date.now() / 1000) + 2;
   return new Response(pending.map((c) => `${c.id}\t${c.cmd.replace("{{now}}", String(nowS))}\n`).join(""), { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
 }
@@ -2374,7 +2623,31 @@ async function deviceApi(request, env, dev, action) {
       upoll_now: upollNow(wdSettings, wdLast), hwake_now: hwakeNow(wdSettings, wdLast), checkin: checkinInfo(latest || {}, wdLast, wdCfgS, settings.schedule_hours || 0) };
     const radio_debug = radioDebugReport({ history: history || [], mesh, latest });
     const stProg = { ...s, wd_int_min: wdUserInterval(wdCfgS, cmds) };
-    return json({ radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
+    // v1.8.0: unified check-ins, what the T-SIM confirmed vs what is saved here, and the waiting queue
+    const [tcStored, ccS, pwrS] = await Promise.all([kvJson(env, `tcfg:${id}`), kvJson(env, `cachecfg:${id}`), kvJson(env, `power:${id}`)]);
+    const tcSaved = tcStored ? validateTcfg(tcStored, {}) : tcfgFromLegacy({ wdcfg: wdCfgS, power: pwrS, cachecfg: ccS, gpscfg: gcfg, settings: settings.schedule_hours ? settings : null });
+    const dsA = { latest, wd: wdLast, cmds: cmds || [] }, pick = (o, ks) => Object.fromEntries(ks.filter((k) => o && o[k] !== undefined).map((k) => [k, o[k]]));
+    const device_state = {
+      watchdog: deviceState("watchdog", { ...dsA, saved: pick(wdSettings, ["int_min", "hb", "sms"]) }),
+      power: deviceState("power", { ...dsA, saved: pick(pwr, ["cal_scale", "cal_off", "lb_en", "lb_lo", "lb_hi", "lb_int", "lb_imm"]) }),
+      cache: deviceState("cache", { ...dsA, saved: pick({ ...DEFAULT_CACHE, ...(ccS || {}) }, ["en", "int_h"]) }),
+      gps: deviceState("gps", { ...dsA, saved: pick({ ...DEFAULT_GPS, ...(gcfg || {}) }, ["auto", "timeout_s"]) }),
+    };
+    device_state.checkins = deviceState("checkins", { ...dsA, saved: pick(tcSaved, ["ci", "do", "cs", "qc", "q", "usol", "gto"]) });
+    if (!device_state.checkins.device && device_state.watchdog.device) {   // 1.7.x: rebuild the plan from what the T-SIM confirmed per feature
+      const D = (k) => device_state[k].device;
+      const dv = tcfgFromLegacy({ wdcfg: { ...wdSettings, ...D("watchdog") }, power: { ...pwr, ...(D("power") || {}) }, cachecfg: D("cache") || ccS, gpscfg: D("gps") || gcfg });
+      const ats = ["watchdog", "power", "cache", "gps"].map((k) => D(k) && D(k).at).filter(Boolean).sort();
+      const sv = pick(tcSaved, ["ci", "do", "cs", "qc", "q", "usol", "gto"]);
+      const keys = ["ci", "do", "qc", "q"].filter((k) => k !== "do" || true);
+      const norm = (k, v) => (k === "ci" && +v === 1440 ? 0 : v);
+      const differs = keys.some((k) => k === "ci" ? String(norm(k, dv[k])) !== String(norm(k, sv[k])) : k === "do" ? tcfgCanon(dv.do, "hct") !== tcfgCanon(sv.do, "hct") : String(dv[k]) !== String(sv[k]));
+      device_state.checkins = { device: { ...dv, at: ats[ats.length - 1], source: "per-feature" }, saved: sv, pending: ["watchdog", "power", "cache", "gps"].some((k) => device_state[k].pending), differs };
+      device_state.checkins.waiting = device_state.checkins.pending || differs;
+    }
+    const checkins = { settings: tcSaved, stored: !!tcStored, applied_at: (tcStored && tcStored.applied_at) || null, supported: fwAtLeast(latest && latest.fw, WD_FW), v18: fwAtLeast(latest && latest.fw, TCFG_FW), cost: costEstimate(tcSaved), schedule: { hours: settings.schedule_hours || 0 } };
+    const queue = (cmds || []).filter((c) => c.status === "queued" || c.status === "sent").map((c) => ({ id: c.id, cmd: redactCmd(String(c.cmd || "")).replace(/^((?:set\s+)?(?:guest\.)?password|set bridge\.secret)\s+.*/i, "$1 ••••"), status: c.status, sys: !!c.sys, queued_at: c.queued_at, sent_at: c.sent_at || null }));
+    return json({ checkins, device_state, queue, radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
       heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
@@ -2483,7 +2756,9 @@ async function deviceApi(request, env, dev, action) {
     const cmd = String(b.cmd || "").trim();
     if (!cmd || cmd.length > CMD_MAX_LEN || !/^[\x20-\x7e]+$/.test(cmd)) return json({ error: `command must be 1-${CMD_MAX_LEN} printable ASCII chars` }, 400);
     if (RISKY_CMD_RE.test(cmd) && b.force !== true) return json({ error: "risky command: confirm required", risky: true }, 409);
-    if (list.filter((c) => c.status === "queued").length >= CMD_MAX_PENDING) return json({ error: `max ${CMD_MAX_PENDING} queued commands` }, 429);
+    const qg = queueGuard(list, cmd);   // v1.8.0: refuse an identical queued command; a newer setting replaces the older one
+    if (qg.refuse) return json({ error: qg.refuse, duplicate: true }, 409);
+    { const nq = list.filter((c) => c.status === "queued").length; if (nq >= CMD_MAX_PENDING) return json({ error: queueFullMsg(nq) }, 429); }
     const entry = { id: randomHex(4), cmd, status: "queued", queued_at: new Date().toISOString() };
     list.unshift(entry);
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
@@ -2695,6 +2970,60 @@ async function deviceApi(request, env, dev, action) {
     if (b.now === true) { const [o, cc] = await manualSend(env, dev, "CMD", "CMD (settings cache refresh)"); wake = { ...o, status: cc }; }
     await logActivity(env, id, { type: "action", msg: `Settings cache: ${c.en ? "ON every " + c.int_h + " h" : "off"}${b.now ? ", refresh now" : " (applied at next wake)"}` });
     return json({ saved: true, settings: c, queued: entry, wake });
+  }
+  // v1.8.0: one check-in timer + quick local checks. 1.8.0+ gets one TCFG line; older firmware the equivalent legacy
+  // lines (only the kinds that change), all queued together so they go in one wake.
+  if (action === "checkin-settings") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const [wdcfg, power, cachecfg, gpscfg, settings, stored, lat] = await Promise.all([kvJson(env, `wdcfg:${id}`), kvJson(env, `power:${id}`), kvJson(env, `cachecfg:${id}`), kvJson(env, `gpscfg:${id}`), getSettings(env, id), kvJson(env, `tcfg:${id}`), kvJson(env, `telem:${id}:latest`)]);
+    const L = lat || {};
+    const base = stored || tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings: settings.schedule_hours ? settings : null });
+    let t; try { t = validateTcfg(base, b); } catch (e) { return json({ error: e.message }, 400); }
+    const v18 = fwAtLeast(L.fw, TCFG_FW);
+    if (!v18 && !fwAtLeast(L.fw, WD_FW)) return json({ error: `Needs T-SIM firmware ${WD_FW} or newer. Update the T-SIM firmware first.` }, 409);
+    if (!v18) for (const c of "msg") if (t.do.includes(c) && !String(base.do || "").includes(c)) return json({ error: `That check-in option needs T-SIM firmware ${TCFG_FW} or newer.` }, 409);
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    const now = new Date().toISOString(), add = [];
+    if (v18) { if (!stored || !stored.applied_at || tcfgCmd(t) !== tcfgCmd(stored)) add.push({ kind: "tcfg", cmd: tcfgCmd(t) }); }
+    const leg = tcfgLegacyCmds(t, { wdcfg, power, cachecfg, gpscfg });
+    if (!v18) add.push(...leg.cmds);
+    const nq = list.filter((c) => c.status === "queued").length;
+    if (nq + add.length > CFG_MAX_QUEUE) return json({ error: queueFullMsg(nq) }, 429);
+    const queued = [];
+    for (const a of add) { queueGuard(list, a.cmd); const e = { id: randomHex(4), cmd: a.cmd, sys: true, status: "queued", queued_at: now }; list.unshift(e); queued.push(e); }
+    if (queued.length) await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
+    await putJson(env, `tcfg:${id}`, { ...t, updated_at: now, applied_at: v18 && !add.length && stored ? stored.applied_at : null });
+    // keep the per-feature records in step, so the older cards and a rollback show the same plan
+    const S = leg.store, pwrCmd = pwrCfgCmd({ ...DEFAULT_POWER, ...S.power });
+    if (!v18) {
+      if (leg.cmds.some((c) => c.kind === "wdcfg")) await putJson(env, `wdcfg:${id}`, { ...S.wdcfg, updated_at: now, applied_at: null });
+      if (leg.cmds.some((c) => c.kind === "pwrcfg")) await putJson(env, `power:${id}`, { ...S.power, last_cmd: pwrCmd, updated_at: now, applied_at: null });
+      if (leg.cmds.some((c) => c.kind === "cfgsnap")) await putJson(env, `cachecfg:${id}`, { en: S.cachecfg.en, int_h: S.cachecfg.int_h });
+      if (leg.cmds.some((c) => c.kind === "gpscfg")) await putJson(env, `gpscfg:${id}`, { auto: S.gpscfg.auto, timeout_s: S.gpscfg.timeout_s });
+    } else {
+      await putJson(env, `wdcfg:${id}`, { ...(wdcfg || {}), ...S.wdcfg });
+      await putJson(env, `power:${id}`, { ...(power || {}), ...S.power, last_cmd: pwrCmd });
+      await putJson(env, `cachecfg:${id}`, { en: S.cachecfg.en, int_h: S.cachecfg.int_h });
+      await putJson(env, `gpscfg:${id}`, { auto: S.gpscfg.auto, timeout_s: S.gpscfg.timeout_s });
+    }
+    if (t.txt_h !== (settings.schedule_hours || 0)) {
+      const st = (await kvJson(env, `state:${id}`)) || {}; st.last_sched_ts = Date.now(); await putJson(env, `state:${id}`, st);
+      await putJson(env, `settings:${id}`, { ...settings, schedule_hours: t.txt_h });
+    }
+    let wake = null;
+    if (b.send === true && queued.length) { const [o, cc] = await manualSend(env, dev, "STATUS", "Deliver check-in settings (STATUS)"); wake = { ...o, status: cc }; }
+    await logActivity(env, id, { type: "action", msg: `Check-ins: ${t.ci ? "every " + (t.ci / 60) + " h" : "off"}; quick checks ${t.qc && t.q ? "every " + t.qc + " min" : "off"}${queued.length ? "" : " (nothing to send)"}` });
+    return json({ saved: true, settings: t, queued, unchanged: !queued.length, wake, cost: costEstimate(t) });
+  }
+  if (action === "cmd-remove") {   // v1.8.0: remove one item that is still waiting to be sent
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const list = (await kvJson(env, `cmds:${id}`)) || [];
+    const c = list.find((x) => x.id === String(b.cmd_id || ""));
+    if (!c) return json({ error: "That item isn't in the queue any more." }, 404);
+    if (c.status !== "queued") return json({ error: "That item was already sent to the T-SIM, so it can't be removed." }, 409);
+    c.status = "cancelled"; c.error = "removed by you";
+    await putJson(env, `cmds:${id}`, list);
+    return json({ removed: c.id });
   }
   if (action === "watchdog-settings") {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -4023,7 +4352,8 @@ export default {
       if (parts[0] === "api" && parts[1] === "d" && parts.length === 4) {
         const dev = await requireSession(request, env, parts[2]);
         if (!dev) return json({ error: "login required" }, 401);
-        return await deviceApi(request, env, dev, parts[3]);
+        if (request.headers.get("X-Force-Text") === "1") dev.force_text = true;   // v1.8.0: "Send another text anyway"
+        return await idemWrap(request, env, dev, parts[3], () => deviceApi(request, env, dev, parts[3]));
       }
       return new Response("not found", { status: 404 });
     } catch (e) {
