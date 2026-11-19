@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - run: node test/harness.mjs
+      - run: node test/harness.mjs && node test/v180.mjs
         working-directory: worker
   firmware:
     runs-on: ubuntu-latest

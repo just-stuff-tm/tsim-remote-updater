@@ -1862,7 +1862,7 @@ export function deviceState(kind, { latest = null, wd = null, cmds = [], saved =
   const pending = (cmds || []).some((c) => (c.status === "queued" || c.status === "sent") && KIND_OF[String(c.cmd || "").split(/\s/)[0].toLowerCase()] === kind);
   let differs = false;
   // 1.7.2-1.7.x store a saved "off" (0) as every 24 h (1440): that is the same setting, not a difference.
-  const same = (k2, a, b) => String(a) === String(b) || ((k2 === "int_min" || k2 === "ci") && ((+a === 0 && +b === 1440 && !(best.source === "telemetry" && kind === "checkins")) || (+a === 1440 && +b === 0 && best.source !== "telemetry")));
+  const same = (k2, a, b) => String(a) === String(b) || ((k2 === "int_min" || k2 === "ci") && ((+a === 0 && +b === 1440 && !(best.source === "telemetry" && kind === "checkins")) || (+a === 1440 && +b === 0 && !(best.source === "telemetry" && kind === "checkins"))));
   if (saved && device) for (const [k2, v] of Object.entries(saved)) if (k2 in best.v && best.v[k2] !== undefined && v !== undefined && !same(k2, best.v[k2], v)) differs = true;
   return { device, saved: saved || null, pending, differs, waiting: pending || (!!saved && !device) || differs };
 }
@@ -2634,7 +2634,8 @@ async function deviceApi(request, env, dev, action) {
     const stProg = { ...s, wd_int_min: wdUserInterval(wdCfgS, cmds) };
     // v1.8.0: unified check-ins, what the T-SIM confirmed vs what is saved here, and the waiting queue
     const [tcStored, ccS, pwrS] = await Promise.all([kvJson(env, `tcfg:${id}`), kvJson(env, `cachecfg:${id}`), kvJson(env, `power:${id}`)]);
-    const tcSaved = tcStored ? validateTcfg(tcStored, {}) : tcfgFromLegacy({ wdcfg: wdCfgS, power: pwrS, cachecfg: ccS, gpscfg: gcfg, settings: settings.schedule_hours ? settings : null });
+    const tcSaved0 = tcStored ? validateTcfg(tcStored, {}) : tcfgFromLegacy({ wdcfg: wdCfgS, power: pwrS, cachecfg: ccS, gpscfg: gcfg, settings: settings.schedule_hours ? settings : null });
+    const tcSaved = { ...tcSaved0, txt_h: settings.schedule_hours || 0 };   // the text fallback lives in settings:<id>
     const dsA = { latest, wd: wdLast, cmds: cmds || [] }, pick = (o, ks) => Object.fromEntries(ks.filter((k) => o && o[k] !== undefined).map((k) => [k, o[k]]));
     const device_state = {
       watchdog: deviceState("watchdog", { ...dsA, saved: pick(wdSettings, ["int_min", "hb", "sms"]) }),
@@ -2811,11 +2812,13 @@ async function deviceApi(request, env, dev, action) {
       const seen = new Set(); add = add.filter((a) => (a.list ? (seen.has(a.cmd) ? false : seen.add(a.cmd)) : true));
       add = add.map((a) => ({ ...a, op: true }));
     }
-    if (list.filter((c) => c.status === "queued").length + add.length > CFG_MAX_QUEUE) return json({ error: `Too many queued commands (max ${CFG_MAX_QUEUE}). Wait for the current ones or cancel them in Repeater console.` }, 429);
+    if (action === "rpt-save") for (const a of add) queueGuard(list, a.cmd);   // v1.8.0: a newer value for the same setting replaces a queued older one
+    { const nq = list.filter((c) => c.status === "queued").length; if (nq + add.length > CFG_MAX_QUEUE) return json({ error: queueFullMsg(nq) }, 429); }
     const now = new Date().toISOString();
     for (const a of add) list.unshift({ id: randomHex(4), cmd: a.cmd, status: "queued", queued_at: now, cfg: true, ...(a.op ? { op: true } : {}), ...(a.list ? { list: a.list } : {}), ...(a.val !== undefined ? { val: a.val } : {}) });
     await putJson(env, `cmds:${id}`, list.slice(0, CMD_HISTORY));
     await logActivity(env, id, { type: "action", msg: action === "rpt-read" ? `Repeater settings: reading ${add.length} value(s)` : action === "rpt-save" ? `Repeater settings: ${add.map((a) => a.cmd.startsWith("password") || a.cmd.includes("guest.password") ? a.cmd.split(" ").slice(0, 2).join(" ") + " ••••" : a.cmd).join("; ").slice(0, 200)}` : `Repeater: ${add.map((a) => a.cmd.replace("{{now}}", "(now)")).join("; ").slice(0, 200)}` });
+    if (b.later === true) return json({ queued: add.length, later: true, wake: null });   // v1.8.0: "Apply at next check-in (no text)"
     const [o, c] = await manualSend(env, dev, "CMD", "CMD (repeater settings)");
     return json({ queued: add.length, wakes_needed: Math.ceil((list.filter((x) => x.status === "queued").length) / cmdsPerWake(((await kvJson(env, `telem:${id}:latest`)) || {}).fw)), wake: { ...o, status: c } });
   }
@@ -3015,7 +3018,7 @@ async function deviceApi(request, env, dev, action) {
       await putJson(env, `cachecfg:${id}`, { en: S.cachecfg.en, int_h: S.cachecfg.int_h });
       await putJson(env, `gpscfg:${id}`, { auto: S.gpscfg.auto, timeout_s: S.gpscfg.timeout_s });
     }
-    if (t.txt_h !== (settings.schedule_hours || 0)) {
+    if (b.txt_h !== undefined && t.txt_h !== (settings.schedule_hours || 0)) {
       const st = (await kvJson(env, `state:${id}`)) || {}; st.last_sched_ts = Date.now(); await putJson(env, `state:${id}`, st);
       await putJson(env, `settings:${id}`, { ...settings, schedule_hours: t.txt_h });
     }
@@ -3517,6 +3520,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <body><header><div class="t">${acc.kind === "a" ? '<a href="/fleet" class="back">‹ All</a>' : ""}<b>${esc(dev.name)}</b><span class="mut small">${esc(dev.id)}</span><span id="seen" class="badge">…</span><button type="button" id="unitsbtn" class="g sm" onclick="unitsToggle()" style="margin-left:6px">m · °C</button></div>
 <form method="post" action="/logout"><button class="g sm">Log out</button></form></header>
 <nav class="tabs" id="tabs"><button type="button" data-t="ov">Overview</button><button type="button" data-t="radio">LoRa radio</button><button type="button" data-t="tsim">T-SIM</button><button type="button" data-t="act">Activity</button></nav>
+<div class="danger" id="supbar" hidden style="margin:8px 0"><span id="supmsg"></span> <button type="button" id="supforce">Send another text anyway</button> <button type="button" id="supx">Dismiss</button></div>
 <main>
 <p class="psnote" id="offwarn" hidden style="margin:0 0 12px"></p>
 <div class="pane" id="t-ov">
@@ -3568,14 +3572,15 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small mut" style="margin-top:0">View and change the repeater's MeshCore settings. Values are read and changed through the repeater console (one text wakes the T-SIM; it runs up to 10 commands per wake, or 40 with T-SIM firmware 1.6.9+). Changed fields are highlighted; only changed values are sent. Prefer typing commands? Use Repeater console below.</p>
 <p class="psnote" id="rsps" hidden>Not available while the repeater is in power saving: its command line isn't answering. ${PS_HTML}</p>
 <p class="psnote" id="rscon" hidden>Turn on "Allow console commands" under Repeater console below to use repeater settings.</p>
-<div class="acts" style="margin-top:0"><button type="button" id="rsreadall">Read all</button><button type="button" id="rssave" class="w" disabled>Save changes</button>
+<div class="acts" style="margin-top:0"><button type="button" id="rsreadall">Read all</button><button type="button" id="rssave" class="w" disabled>Apply changes</button><button type="button" id="rslater" class="g" disabled title="Queue the changes; they go with the T-SIM's next check-in or text">Apply at next check-in (no text)</button>
 <button type="button" class="g" data-rsact="advert">Send flood advert</button><button type="button" class="g" data-rsact="advert.zerohop">Send zero-hop advert</button></div>
-<details class="small" id="cachebox" style="margin:6px 0"><summary><b>Settings cache on the T-SIM</b> <small id="cachesum" class="mut"></small></summary>
-<p class="small mut">With this on, the T-SIM re-reads these settings (plus regions and the access list) by itself on a wake it already makes, at most every N hours, so values here stay current without extra texts. Reads take about 30 s of serial time; skipped while battery protection has the repeater off or the repeater doesn't answer (power saving). Needs T-SIM firmware 1.7.0+.</p>
-<label class="tog"><input type="checkbox" id="cacheon"> Keep repeater settings cached</label>
+<details class="small" id="cachebox" style="margin:6px 0"><summary><b>Saved copy of these settings</b> <small id="cachesum" class="mut"></small></summary>
+<p class="small mut">The T-SIM can re-read these settings (plus regions and the access list) by itself on its automatic check-ins, so the values here stay current without extra texts. Turn that on with <b>Refresh the saved repeater settings</b> in <b>Automatic check-ins</b> on the T-SIM tab. Reading takes about 30 s of serial time and is skipped while low-battery protection has repeating turned off.</p>
+<span hidden><label class="tog"><input type="checkbox" id="cacheon"> Keep repeater settings cached</label>
 <label>Refresh at most every<select id="cacheint"><option value="6">6 hours</option><option value="12">12 hours</option><option value="24">24 hours</option><option value="48">2 days</option><option value="168">1 week</option></select></label>
-<button type="button" class="g sm" id="cachesave">Save</button> <button type="button" class="g sm" id="cachenow">Refresh cache now (1 text)</button> <span id="cachemsg" class="msg"></span></details>
+<button type="button" class="g sm" id="cachesave">Save</button></span> <button type="button" class="g sm" id="cachenow">Refresh now (1 text)</button> <span id="cachemsg" class="msg"></span><div id="cacheds"></div></details>
 <div id="rsq" class="small"></div><span id="rsmsg" class="msg"></span>
+<div id="qtray" class="small"></div>
 <div id="rsgrid"></div>
 <div id="rtools">
 <details class="card rscat"><summary><b>Regions &amp; scopes</b> <small id="rgst"></small></summary><div class="in">
@@ -3628,16 +3633,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label>Direct link (optional override, used when GitHub is off)<input name="direct_url" placeholder="https://..."></label>
 </div>
 <button type="submit">Save</button><span id="srcmsg" class="msg"></span></form></div></details>
-<details class="card" id="lbbox"><summary><b>Low-battery protection</b><small id="lbsum" class="mut"></small></summary><div class="in">
-<p class="small mut">The T-SIM checks its (calibrated, idle) battery on a timer without starting LTE. Below the OFF level it sends <code>set repeat off</code> to the repeater; when the battery recovers to the ON level it sends <code>set repeat on</code>. The ON level must be at least 10% higher than OFF. Settings reach the T-SIM at its next wake and are kept on the T-SIM, so it works offline. Needs T-SIM firmware 1.6.5+ and repeater firmware with the MeshCore CLI (no power saving).</p>
-<div id="lbinfo"></div><div id="lbdel" class="small"></div>
-<form id="lbf"><label class="tog"><input type="checkbox" name="en"> Enable low-battery protection</label>
-<label>Turn repeat OFF below (V) <small class="mut" id="lbopct"></small><input name="lo" type="number" step="0.01" min="3" max="4"></label>
-<label>Turn repeat ON at/above (V) <small class="mut" id="lbhpct"></small><input name="hi" type="number" step="0.01" min="3.3" max="4.3"></label>
-<label>Check the battery every (hours) <small class="mut" id="lbih"></small><input name="inth" type="number" step="0.25" min="0.25" max="24"></label>
-<label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
-<button type="submit">Save &amp; send now</button> <button type="button" class="g" id="lbsave2">Save without sending</button><span id="lbmsg" class="msg"></span>
-<p class="small mut">"Save &amp; send now" texts the T-SIM once so it wakes and applies the settings within a few minutes. "Save without sending" waits for its next wake (useful to batch several changes).</p></form></div></details>
+
 <details class="card" id="locbox"><summary><b>Repeater location</b><small id="locsum" class="mut"></small></summary><div class="in">
 <p class="small mut">Copies the T-SIM's GPS position to the repeater with the MeshCore commands <code>set lat</code> and <code>set lon</code>, so its adverts show where it is. This is never done automatically. Anyone on the mesh can then see the position.</p>
 <div id="locinfo"></div>
@@ -3676,9 +3672,40 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="card"><h3>Power</h3><div id="c-power"></div></div>
 <div class="card"><h3>Cellular</h3><div id="c-cell"></div></div>
 </div></section>
+<section><h2>Automatic check-ins <small class="mut small" id="cisum"></small></h2><div class="card">
+<p class="small mut" style="margin-top:0">The T-SIM sleeps to save battery. On a timer it wakes up by itself to <b>check in</b>: it checks its modem (and fixes it if it's stuck), and can report to this dashboard and pick up anything waiting in the queue, with no text needed. <b>Quick local checks</b> run more often and never start LTE.</p>
+<div id="cids"></div>
+<form id="cif">
+<label>Check in every<select name="ci"><option value="0">Off</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours</option><option value="360">6 hours (recommended)</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
+<p class="small mut" id="cioff"></p>
+<b class="small">On each check-in</b>
+<label class="tog"><input type="checkbox" checked disabled> Check the modem and fix it if it's stuck (always on)</label>
+<label class="tog"><input type="checkbox" name="do_h"> Report status to this dashboard (battery, signal; needed for the offline warning)</label>
+<label class="tog"><input type="checkbox" name="do_c"> Pick up queued commands and settings changes (also delivers a backup copy of a radio update)</label>
+<label class="tog"><input type="checkbox" name="do_m"> Also read the repeater's mesh stats (neighbors, packets) <small class="mut ci18">needs T-SIM 1.8.0</small></label>
+<label class="tog"><input type="checkbox" name="do_s"> Refresh the saved repeater settings <select name="cs"><option value="0">every check-in</option><option value="24">once a day</option><option value="168">once a week</option></select> <small class="mut ci18">needs T-SIM 1.8.0</small></label>
+<label class="tog"><input type="checkbox" name="do_g"> Update the GPS location, up to <input name="gto" type="number" min="30" max="600" step="10" style="width:5em"> s of GPS (uses noticeably more battery) <small class="mut ci18">needs T-SIM 1.8.0</small></label>
+<label class="tog"><input type="checkbox" name="do_t"> Run texts still waiting on the modem</label>
+<b class="small">Quick local checks (no LTE)</b>
+<label>Run every<select name="qc"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes (recommended)</option><option value="60">1 hour</option><option value="120">2 hours</option></select></label>
+<label class="tog"><input type="checkbox" name="q_b"> Low-battery protection (turn repeating off when the battery is low; levels in <b>Battery</b> below)</label>
+<label class="tog"><input type="checkbox" name="q_u"> Notice when the repeater reboots</label>
+<label class="tog"><input type="checkbox" name="usol_day"> …only in daylight (solar input at least 2 V)</label>
+<p class="small" id="cicost"></p>
+<button type="button" id="cisend">Save &amp; send now (1 text)</button> <button type="button" class="g" id="cisave">Save (applied at next check-in)</button><span id="cimsg" class="msg"></span>
+</form>
+<div id="qtray2" class="small"></div>
+<details class="card" id="schbox"><summary><b>Advanced: also wake by text</b><small id="schsum" class="mut"></small></summary><div class="in">
+<p class="small">A fallback for older T-SIM firmware or when you want the full status report on a schedule. When this is on, the dashboard also texts the T-SIM every few hours, so the battery, signal and mesh stats here stay fresh without you pressing <b>Request status</b>.</p>
+<p class="small mut">Cost: each check sends <b>one text</b> to the T-SIM (counts toward your SIM plan) and keeps it awake for a minute or two with LTE on (uses some battery). Nothing is sent while this is off.</p>
+<div id="schinfo"></div>
+<label class="tog"><input type="checkbox" id="schon"> Check automatically</label>
+<label>How often<select id="sch"><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Once a day</option><option value="168">Once a week</option></select></label>
+<button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
+</div></section>
 <section><h2>Modem watchdog <small class="mut small" id="wdsum"></small></h2><div class="card">
 <p class="small mut" style="margin-top:0">Self-recovery (T-SIM firmware 1.7.1+). The T-SIM normally sleeps until a text rings its modem. If the modem drops off the network while it sleeps, texts can't reach it, so the watchdog also wakes it on a timer. It checks the modem (answers AT, SIM ready, registered, data attached). If that fails it resets the modem's radio (<code>AT+CFUN=0/1</code>), then power-cycles the modem, and goes back to sleep with text wake-up re-armed. A healthy check takes a few seconds. A heartbeat to this dashboard adds about 10–20 s of LTE (a few KB). It never sends texts. From T-SIM 1.7.2 it also picks up commands and settings waiting in the queue (including a backup copy of a radio update). How often it runs and what it does are now set in Automatic check-ins.</p>
-<div id="wdinfo"></div><div id="wdev" class="small"></div><div id="wddel" class="small"></div>
+<div id="wdds"></div><div id="wdinfo"></div><div id="wdev" class="small"></div><div id="wddel" class="small"></div>
 <p class="small mut" id="wdnote" hidden>Needs T-SIM firmware 1.7.1 or newer. Update the T-SIM firmware first. Until then the T-SIM has no timer wake and can't recover by itself.</p>
 <form id="wdf" style="margin-top:8px"><label>Check the modem every<select name="int"><option value="0">Off (T-SIM 1.7.2–1.7.x: still every 24 h; 1.8.0+: a silent daily safety check)</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours (default)</option><option value="360">6 hours</option><option value="720">12 hours</option><option value="1440">24 hours</option></select></label>
 <label class="tog"><input type="checkbox" name="hb"> Check in with this dashboard after every check (needed for the offline warning; otherwise only after a recovery)</label>
@@ -3695,7 +3722,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <div class="acts" style="margin-top:0"><button type="button" id="gpsbtn" data-mode="get">Get location</button></div>
 <p class="small mut" id="gpsnote" hidden>Location needs T-SIM firmware 1.6.7 or newer. Update the T-SIM firmware first.</p>
 <div id="c-gps"></div><div id="gpsmapw" hidden><div id="gpsmap" class="map sens"></div><p class="small mut" style="margin:4px 0 0">Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors</p></div><div id="p-gps"></div>
-<details class="small" style="margin-top:10px"><summary>Location settings</summary>
+<details class="small" style="margin-top:10px"><summary>Location settings</summary><div id="gpsds"></div>
 <form id="gpsf" style="margin-top:8px"><label class="tog"><input type="checkbox" name="auto"> Auto-update location on every check-in (uses extra battery: GPS runs up to the timeout each check-in)</label>
 <label>Fix timeout (seconds, 30–600)<input name="to" type="number" min="30" max="600" step="5"></label>
 <button type="submit" class="g">Save</button> <span id="gpsmsg" class="msg"></span>
@@ -3703,6 +3730,16 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <p class="small mut">Uses the modem's built-in GPS. Needs a GNSS antenna on the T-SIM's GPS/GNSS u.FL connector (not the LTE one) with a view of the sky. The first fix can take up to 5 min (180 s or more timeout recommended). GPS stays on about 5 min after a try, so a retry soon after is faster. Coordinates are hidden until you press the eye.</p>
 </div></section>
 <section><h2>Settings</h2>
+<details class="card" id="lbbox"><summary><b>Battery: low-battery protection</b><small id="lbsum" class="mut"></small></summary><div class="in">
+<p class="small mut">The T-SIM checks its (calibrated, idle) battery on a timer without starting LTE. Below the OFF level it sends <code>set repeat off</code> to the repeater; when the battery recovers to the ON level it sends <code>set repeat on</code>. The ON level must be at least 10% higher than OFF. Settings reach the T-SIM at its next wake and are kept on the T-SIM, so it works offline. Needs T-SIM firmware 1.6.5+ and repeater firmware with the MeshCore CLI (no power saving).</p>
+<div id="lbds"></div><div id="lbinfo"></div><div id="lbdel" class="small"></div>
+<form id="lbf"><p class="small">Turn it on or off, and set how often the T-SIM checks, under <b>Quick local checks</b> in <b>Automatic check-ins</b>. The cutoff uses the T-SIM's own battery reading (calibrate it in <b>Battery calibration</b>), not the repeater's.</p><span hidden><input type="checkbox" name="en"></span>
+<label>Turn repeat OFF below (V) <small class="mut" id="lbopct"></small><input name="lo" type="number" step="0.01" min="3" max="4"></label>
+<label>Turn repeat ON at/above (V) <small class="mut" id="lbhpct"></small><input name="hi" type="number" step="0.01" min="3.3" max="4.3"></label>
+<span hidden><small id="lbih"></small><input name="inth" type="number" step="0.25" min="0.25" max="24"></span>
+<label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
+<button type="submit">Save &amp; send now</button> <button type="button" class="g" id="lbsave2">Save without sending</button><span id="lbmsg" class="msg"></span>
+<p class="small mut">"Save &amp; send now" texts the T-SIM once so it wakes and applies the settings within a few minutes. "Save without sending" waits for its next wake (useful to batch several changes).</p></form></div></details>
 <details class="card" id="calbox"><summary><b>Battery calibration</b><small id="calsum" class="mut"></small></summary><div class="in">
 <p class="small mut">The T-SIM reads the battery at the start of each wake, before the modem is used (idle). Measure the battery with a multimeter while the T-SIM is idle and enter the value; the factor is worked out from the latest idle reading. Settings reach the T-SIM at its next wake (no extra text). The Heltec's own reading is not changed.</p>
 <div id="calinfo"></div>
@@ -3720,13 +3757,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label>Direct link<input name="url" placeholder="https://.../firmware.bin"></label>
 <label>Checksum (optional; GitHub's own checksum is used if empty)<input name="checksum" placeholder="sha256:..."></label>
 <button type="submit">Save</button><span id="tsimmsg" class="msg"></span></form></div></details>
-<details class="card" id="schbox"><summary><b>Automatic status check</b><small id="schsum" class="mut"></small></summary><div class="in">
-<p class="small">When this is on, the dashboard automatically wakes the T-SIM every few hours, so the battery, signal and mesh stats here stay fresh without you pressing <b>Request status</b>.</p>
-<p class="small mut">Cost: each check sends <b>one text</b> to the T-SIM (counts toward your SIM plan) and keeps it awake for a minute or two with LTE on (uses some battery). Nothing is sent while this is off.</p>
-<div id="schinfo"></div>
-<label class="tog"><input type="checkbox" id="schon"> Check automatically</label>
-<label>How often<select id="sch"><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Once a day</option><option value="168">Once a week</option></select></label>
-<button id="schsave">Save</button><span id="schmsg" class="msg"></span></div></details>
+
 <details class="card"><summary><b>Login &amp; password</b><small class="mut">dashboard access</small></summary><div class="in">
 <p class="small mut">Each T-SIM has its own dashboard password; fleet logins open several. Passwords are changed by the owner with the admin API (<code>/admin/devices/&lt;id&gt;/reset-password</code>), see docs/SETUP.md. The T-SIM's upload key is separate and never shown here.</p></div></details>
 </section>
@@ -3753,10 +3784,17 @@ function pollCmds(d){
  for(let i=0;i<a.length;i++)add(a[i]);
  for(let i=0;i<u.length;i++)add(u[i]);
  return out}
-const post=async(a,b)=>{
- const r=await fetch(API+a,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
- try{const j=await r.clone().json();armText(j)}catch(e){}
+// v1.8.0: every click gets its own idempotency key (a double-click or a retried request is not sent twice);
+// a held-back wake text can be forced from the banner.
+const idemKey=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),x=>x.toString(16).padStart(2,"0")).join("");
+let supLast=null;
+const post=async(a,b,force)=>{
+ const h={"Content-Type":"application/json","Idempotency-Key":idemKey()};if(force)h["X-Force-Text"]="1";
+ const r=await fetch(API+a,{method:"POST",credentials:"same-origin",headers:h,body:b===undefined?undefined:JSON.stringify(b)});
+ try{const j=await r.clone().json();armText(j);const w=j&&(j.suppressed?j:j.wake&&j.wake.suppressed?j.wake:null);
+  if(w){supLast={a:a,b:b};$("supmsg").textContent=w.message||"A wake text is still unanswered, so no new text was sent.";$("supbar").hidden=false}}catch(e){}
  return r};
+if($("supforce")){$("supforce").onclick=async()=>{if(!supLast)return;$("supbar").hidden=true;const x=supLast;supLast=null;await post(x.a,x.b,true);load()};$("supx").onclick=()=>{$("supbar").hidden=true;supLast=null}}
 function armText(j){
  if(!(j&&(j.sent===true||(j.wake&&j.wake.sent===true))))return;
  const now=Date.now();waitReport=now;waitIds=null;
@@ -3789,7 +3827,7 @@ async function load(){
  try{unitsBtn();
  const r=await fetch(API+"telemetry",{credentials:"same-origin"});
  if(r.status===401){location.href="/";return}
- const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.watchdog)showWd(d);if(d.gps)showGps(d);
+ const d=await r.json(),L=d.latest||{},U=d.updates||{},M=d.mesh||{},S=d.settings||{},PG=d.progress||{};if(d.presets&&!Object.keys(PRE).length)setPresets(d.presets);if(d.source)showSource(d.source);if(d.fwup)showFwup(d);if(d.backup)showBackup(d);if(d.power)showPower(d);if(d.watchdog)showWd(d);if(d.checkins)showCheckins(d);if(d.queue)showQueue(d);if(d.device_state)showDs(d);if(d.gps)showGps(d);
  const seen=L.received_at?new Date(L.received_at):null,stale=!seen||Date.now()-seen>STALE_MS;
  const CI=(d.watchdog&&d.watchdog.checkin)||{},off=!!CI.offline;
  $("seen").textContent=seen?(off?"Offline · last seen ":stale?"Stale · ":"Online · ")+ago(L.received_at):"Never seen";$("seen").className="badge"+(stale||off?" stale":"");
@@ -3869,7 +3907,7 @@ $("srcf").onsubmit=async ev=>{ev.preventDefault();const f=ev.target;
  const j=await rj(r);say("srcmsg",r.ok,r.ok?"Saved":friendly(j,r.status));if(r.ok){srcLoaded=false;showSource(j.source);load();}};
 function bpct(v){v=+v;if(!isFinite(v)||!v)return"";return "≈"+(v>=4.15?100:v<=3.3?0:Math.round((v-3.3)*100/0.85))+"%"}
 let pwrLoaded=false,PWR={};
-function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.event;PWR=S;
+function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.event;PWR=S;const PD=((d.device_state||{}).power||{}).device||(L.lb_lo==null?null:{lb_lo:L.lb_lo,lb_hi:L.lb_hi,lb_int:L.lb_int,at:L.received_at});
  const W=P.wake,del=S.applied_at?'<span class="ok">✓ Applied on T-SIM at '+e(t(S.applied_at))+' ET</span>':P.pending?(W&&W.sent?"⏳ Sent "+e(t(W.at))+" ET — waiting for the T-SIM to wake and apply it":W&&W.error?'<span class="err">Not sent: '+e(W.error)+'</span> Saved; it will be applied at the next wake.':"Saved — will be applied at the T-SIM's next wake (no text sent)"):"";
  $("caldel").innerHTML=del;$("lbdel").innerHTML=del;
  const pend=P.pending?(W&&W.sent?" · sent, waiting for T-SIM":" · waiting for next wake"):"";
@@ -3877,7 +3915,7 @@ function showPower(d){const P=d.power||{},S=P.settings||{},L=d.latest||{},E=P.ev
  $("calinfo").innerHTML=kv([["Idle raw reading",L.battery_raw_v==null?"none yet (needs 1.6.5)":L.battery_raw_v.toFixed(3)+" V · "+t(L.received_at)],["T-SIM is using",L.cal_scale==null?null:"x"+L.cal_scale+" "+(L.cal_off>=0?"+":"")+L.cal_off+" V"],["Saved here",S.applied_at?"applied "+t(S.applied_at):S.updated_at?"saved "+t(S.updated_at)+", not applied yet":"defaults"]]);
  const st=L.lb_state==null?null:(L.lb_state?"Repeat OFF (battery protection)":"Repeat ON (normal)");
  $("lbsum").textContent=(S.lb_en?"on · OFF<"+S.lb_lo.toFixed(2)+" V, ON≥"+S.lb_hi.toFixed(2)+" V · checks battery every "+hrs(S.lb_int):"off")+pend;
- $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",L.lb_lo==null?null:"OFF<"+L.lb_lo.toFixed(2)+" / ON≥"+L.lb_hi.toFixed(2)+" V · checks battery every "+hrs(L.lb_int)]]);
+ $("lbinfo").innerHTML=kv([["State on T-SIM",st?st+(L.lb_en===false?" · protection disabled on T-SIM":""):"not reported yet"],["Battery (idle)",L.battery_v==null?null:L.battery_v.toFixed(2)+" V "+bpct(L.battery_v)],["Last action",E?E.msg+" · "+t(E.at):"none"],["T-SIM thresholds",PD&&PD.lb_lo!=null?"OFF<"+(+PD.lb_lo).toFixed(2)+" / ON≥"+(+PD.lb_hi).toFixed(2)+" V · checks battery every "+hrs(PD.lb_int)+" · confirmed "+ago(PD.at):null]]);
  if(!pwrLoaded){const f=$("lbf");f.en.checked=!!S.lb_en;f.lo.value=S.lb_lo.toFixed(2);f.hi.value=S.lb_hi.toFixed(2);f.inth.value=+(S.lb_int/60).toFixed(2);f.imm.checked=!!S.lb_imm;
   const m=$("calm");m.scale.value=S.cal_scale;m.off.value=S.cal_off;lbPct();pwrLoaded=true}}
 function showRd(d){
@@ -3891,6 +3929,41 @@ function showRd(d){
   tb.innerHTML=ev.length?ev.map(function(x){return "<tr><td>"+e(t(x.iso))+"</td><td>"+e(x.label)+"</td></tr>";}).join(""):'<tr><td colspan="2" class="mut">No samples yet</td></tr>';}
  const ov=$("ov-rd");if(ov){ov.className="small"+(kind==="silent"?" err":kind==="restored"?" ok":" mut");ov.textContent="Radio debugger: "+v;}
 }
+// v1.8.0: what the T-SIM confirmed vs what is saved here. Never shows a saved value as the device's.
+const CIDO={h:"report status",c:"queued commands",m:"mesh stats",s:"settings refresh",g:"GPS",t:"waiting texts"},CIQ={b:"low-battery protection",u:"reboot detection"};
+function ciText(T){if(!T)return "";const d=String(T.do||"").split("").map(x=>CIDO[x]).filter(Boolean),q=String(T.q||"").split("").map(x=>CIQ[x]).filter(Boolean);
+ return (T.ci?"check in every "+hrs(T.ci):"check-ins off")+(T.ci&&d.length?" ("+d.join(", ")+")":"")+"; quick checks "+(T.qc&&q.length?"every "+T.qc+" min ("+q.join(", ")+")":"off")}
+function dsHtml(ds,fmt,who){if(!ds)return "";who=who||"On T-SIM";const D=ds.device;
+ let h='<div class="small"><b>'+e(who)+':</b> '+(D?e(fmt(D))+' <span class="mut">(confirmed '+e(ago(D.at))+')</span>':'<span class="mut">not reported yet</span>')+'</div>';
+ if(ds.saved&&(ds.differs||!D||ds.pending))h+='<div class="small"><b>Saved here, not confirmed yet:</b> '+e(fmt(ds.saved))+' '+(ds.pending?'<span class="badge warnb">Waiting for T-SIM to confirm</span>':D?'<span class="badge warnb">Different from the T-SIM: press Save &amp; send to apply</span>':'<span class="badge warnb">Waiting for T-SIM to confirm</span>')+'</div>';
+ return h}
+${costEstimate.toString()}
+function ciForm(){const f=$("cif"),dl="hcmsgt".split("").filter(x=>f["do_"+x].checked).join(""),ql="bu".split("").filter(x=>f["q_"+x].checked).join("");
+ return {ci:+f.ci.value,do:dl,cs:+f.cs.value,qc:+f.qc.value,q:ql,usol:f.usol_day.checked?2000:0,gto:+f.gto.value||180}}
+function ciCost(){const c=costEstimate(ciForm());$("cicost").textContent="Estimated cost: about "+c.lte_wakes_day+" LTE wake"+(c.lte_wakes_day===1?"":"s")+" a day (~"+Math.round(c.lte_secs_day/60)+" min of LTE), plus "+c.quick_wakes_day+" quick local checks (about a second each, no LTE)."}
+let ciLoaded=false,CIV18=false;
+function showCheckins(d){const C=d.checkins||{},T=C.settings||{},DS=(d.device_state||{}).checkins,f=$("cif");CIV18=!!C.v18;
+ $("cids").innerHTML=dsHtml(DS,ciText);
+ $("cisum").textContent=!C.supported?"· needs T-SIM 1.7.1":DS&&DS.device?"· "+ciText(DS.device):"· not reported yet";
+ document.querySelectorAll(".ci18").forEach(x=>x.hidden=CIV18);["m","s","g"].forEach(x=>{f["do_"+x].disabled=!CIV18&&!String(T.do||"").includes(x)});f.cs.disabled=!CIV18;
+ $("cioff").textContent=CIV18?"Off: no timed check-ins. The T-SIM still checks its modem once a day so it can't get stuck offline, but it only uses LTE if it had to fix something or has a report waiting.":"Off on this T-SIM firmware (older than 1.8.0) still checks the modem every 24 h, and reports or picks up commands then if those are ticked. T-SIM 1.8.0 makes Off silent.";
+ f.querySelectorAll("select,input,button").forEach(x=>{if(!C.supported)x.disabled=true});
+ if(!ciLoaded){ciLoaded=true;f.ci.value=String(T.ci??360);"hcmsgt".split("").forEach(x=>f["do_"+x].checked=String(T.do||"").includes(x));f.cs.value=String(T.cs||0);f.qc.value=String(T.qc??30);
+  "bu".split("").forEach(x=>f["q_"+x].checked=String(T.q||"").includes(x));f.usol_day.checked=T.usol!==0;f.gto.value=String(T.gto||180)}
+ ciCost()}
+async function ciSave(send){const r=await post("checkin-settings",{...ciForm(),send:send});const j=await rj(r);
+ say("cimsg",r.ok,r.ok?(j.unchanged?"Saved (nothing new to send)":j.wake&&j.wake.suppressed?"Saved and queued":send?"Saved; text sent":"Saved; goes with the next check-in"):friendly(j,r.status));ciLoaded=false;load()}
+if($("cif")){$("cif").addEventListener("change",ciCost);$("cisend").onclick=()=>ciSave(true);$("cisave").onclick=()=>ciSave(false)}
+function qLabel(c){return c.cmd}
+function showQueue(d){const Q=d.queue||[];const h=!Q.length?'<span class="mut">Nothing is waiting to be sent.</span>':'<b>Waiting to be sent ('+Q.length+')</b><ul style="margin:4px 0">'+Q.map(c=>'<li><code>'+e(qLabel(c))+'</code> <span class="mut">'+(c.status==="sent"?"sent to the T-SIM, waiting for its reply":"queued "+e(ago(c.queued_at)))+'</span>'+(c.status==="queued"?' <button type="button" class="g sm" data-qrm="'+e(c.id)+'">Remove</button>':'')+'</li>').join("")+'</ul>';
+ ["qtray","qtray2"].forEach(x=>{if($(x))$(x).innerHTML=h})}
+document.addEventListener("click",async ev=>{const b=ev.target.closest&&ev.target.closest("[data-qrm]");if(!b)return;b.disabled=true;const r=await post("cmd-remove",{cmd_id:b.dataset.qrm});if(!r.ok){const j=await rj(r);alert(friendly(j,r.status))}load()});
+function fmtPow(P){return (P.lb_en?"protection on":"protection off")+(P.lb_lo!=null&&P.lb_hi!=null?", OFF below "+(+P.lb_lo).toFixed(2)+" V, ON at "+(+P.lb_hi).toFixed(2)+" V":"")+(P.lb_int?", checks every "+P.lb_int+" min":"")+(P.lb_imm?", reports changes at once":"")}
+function fmtWd(W){return (W.int_min?"modem check every "+hrs(W.int_min):"modem check off")+(W.hb?", reports every check":", reports after a recovery only")+(W.sms?", runs waiting texts":"")}
+function fmtGps(G){return (G.auto?"GPS on every check-in":"GPS only when you ask")+(G.timeout_s?", timeout "+G.timeout_s+" s":"")}
+function fmtCache(C){return C.en?"refresh at most every "+C.int_h+" h":"automatic refresh off"}
+function showDs(d){const D=d.device_state||{};const set=(id,h)=>{if($(id))$(id).innerHTML=h};
+ set("lbds",dsHtml(D.power,fmtPow));set("wdds",dsHtml(D.watchdog,fmtWd));set("gpsds",dsHtml(D.gps,fmtGps));set("cacheds",dsHtml(D.cache,fmtCache))}
 let wdLoaded=false;
 const WDST={ok:"OK",soft:"Recovered (AT+CFUN reset)",hard:"Recovered (modem power-cycle)",lowbat:"Low battery: recovery skipped",fail:"Failed"};
 function showWd(d){const W=d.watchdog||{},S=W.settings||{},X=W.last,L=d.latest||{};
@@ -3978,16 +4051,19 @@ function rsInput(i){const id=rsId(i.k);
   '<div class="rsradio"><label>Freq (MHz)<input id="rs-radio-f" data-k="radio" type="number" min="300" max="2500" step="0.001"></label><label>BW (kHz)<select id="rs-radio-bw" data-k="radio"><option value=""></option>'+["7.8","10.4","15.6","20.8","31.25","41.7","62.5","125","250","500"].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>SF<select id="rs-radio-sf" data-k="radio"><option value=""></option>'+[5,6,7,8,9,10,11,12].map(x=>'<option>'+x+'</option>').join("")+'</select></label><label>CR<select id="rs-radio-cr" data-k="radio"><option value=""></option>'+[5,6,7,8].map(x=>'<option>'+x+'</option>').join("")+'</select></label></div><div id="rs-phnote" class="small mut"></div>';
  if(i.type==="secret")return '<form class="rssec" autocomplete="off" onsubmit="return false"><input id="'+id+'" data-k="'+i.k+'" name="rs_secret_'+i.k.replace(/\\W/g,"_")+'" type="password" maxlength="'+i.max+'" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" readonly onfocus="this.removeAttribute(\\'readonly\\')" autocapitalize="none" spellcheck="false" placeholder="'+(i.wo?"new password":"unchanged")+'"></form>';
  return '<input id="'+id+'" data-k="'+i.k+'" name="rs_'+i.k.replace(/\\W/g,"_")+'" type="text" maxlength="'+i.max+'" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocapitalize="none">'}
-function rsBuild(){$("rsgrid").innerHTML=RS.map((c,ci)=>'<details id="rscat'+ci+'" class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
- c.items.map(i=>'<div class="rsrow"><div class="rsl">'+e(i.label)+(i.risk?' <span class="warn" title="Risky change">⚠</span>':i.riskVals?' <span class="warn" title="'+e("Risky when set to "+i.riskVals.join(" / "))+'">⚠</span>':'')+(i.wo?'':' <button type="button" class="g sm rsr" data-rs1="'+e(i.k)+'" title="Read just this setting">Read</button>')+'</div><div class="rsi">'+rsInput(i)+'</div><div class="small" id="rsst-'+i.k+'"></div>'+(i.help?'<div class="small mut">'+e(i.help)+'</div>':'')+'</div>').join("")+
- '<button type="button" class="g sm" data-rsread="'+ci+'">Read this group</button></div></details>').join("");
+function rsRows(items){return items.map(i=>'<div class="rsrow"><div class="rsl">'+e(i.label)+(i.risk?' <span class="warn" title="Risky change">⚠</span>':i.riskVals?' <span class="warn" title="'+e("Risky when set to "+i.riskVals.join(" / "))+'">⚠</span>':'')+(i.wo?'':' <button type="button" class="g sm rsr" data-rs1="'+e(i.k)+'" title="Read just this setting">Read</button>')+'</div><div class="rsi">'+rsInput(i)+'</div><div class="small" id="rsst-'+i.k+'"></div>'+(i.help?'<div class="small mut">'+e(i.help)+'</div>':'')+'</div>').join("")}
+// v1.8.0: groups marked sub:"Advanced" are collected in one collapsed Advanced card at the end.
+function rsBuild(){const H=RS.map((c,ci)=>'<details id="rscat'+ci+'" class="card rscat'+(c.risk?' risky':'')+'"><summary><b>'+e(c.cat)+'</b>'+(c.risk?' <span class="badge warnb">careful</span>':'')+' <small class="mut" id="rssum'+ci+'"></small></summary><div class="in">'+(c.note?'<p class="small '+(c.risk?'warn':'mut')+'">'+e(c.note)+'</p>':'')+
+ rsRows(c.items.filter(i=>!i.adv))+(c.items.some(i=>i.adv)?'<details class="small"><summary>More options</summary>'+rsRows(c.items.filter(i=>i.adv))+'</details>':'')+
+ '<button type="button" class="g sm" data-rsread="'+ci+'">Read this group</button></div></details>');
+ $("rsgrid").innerHTML=H.filter((h,ci)=>!RS[ci].sub).join("")+(RS.some(c=>c.sub)?'<details class="card rscat" id="rsadv"><summary><b>Advanced</b> <small class="mut">timing, bridge, diagnostics, passwords</small></summary><div class="in">'+H.filter((h,ci)=>RS[ci].sub).join("")+'</div></details>':"");
  const markTyped=ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(k&&ev.isTrusted)TYPED.add(k)};
  ["keydown","paste","drop","cut"].forEach(t=>$("rsgrid").addEventListener(t,markTyped,true));
  $("rsgrid").addEventListener("change",ev=>{if(ev.target.tagName==="SELECT")markTyped(ev)},true);
  $("rsgrid").addEventListener("pointerdown",ev=>{if(ev.target.type==="number")markTyped(ev)},true);
  $("rsgrid").addEventListener("input",ev=>{const k=ev.target.dataset&&ev.target.dataset.k;if(!k)return;if(ev.target.tagName==="SELECT"&&ev.isTrusted)TYPED.add(k);
   if(ev.target.id==="rs-preset"){const v=ev.target.value;if(v){const p=v.split(",");["f","bw","sf","cr"].forEach((x,j)=>$("rs-radio-"+x).value=x==="bw"?String(+p[j]):p[j]);const ph=ev.target.selectedOptions[0].dataset.ph;
-   $("rs-phnote").textContent=ph?"This mesh also uses a "+ph+"-byte path hash (Repeating & routing › Advert path hash size = "+(ph-1)+"). Change it separately if you want to match.":""}}
+   $("rs-phnote").textContent=ph?"This mesh also uses a "+ph+"-byte path hash (Repeating › More options › Advert path hash size = "+(ph-1)+"). Change it separately if you want to match.":""}}
   else if(k==="radio")$("rs-preset").value="";rsDirty()});
  $("rsgrid").addEventListener("click",ev=>{const b1=ev.target.closest("[data-rs1]");if(b1){const k=b1.dataset.rs1,it=RS.flatMap(c=>c.items).find(i=>i.k===k);return rsRead([k],"just "+it.label)}
   const b=ev.target.closest("[data-rsread]");if(b)rsRead(RS[+b.dataset.rsread].items.filter(i=>!i.wo).map(i=>i.k),RS[+b.dataset.rsread].cat)})}
@@ -3997,7 +4073,7 @@ function rsChanges(){const ch=[];for(const c of RS)for(const i of c.items){if(i.
  if(cur==="")continue;if(!TYPED.has(i.k))continue;if(i.type==="secret"||rsNorm(i,cur)!==rsNorm(i,rv))ch.push(i)}return ch}
 function rsScrub(){for(const c of RS)for(const i of c.items){if(TYPED.has(i.k))continue;const el=$(rsId(i.k));if(!el)continue;
  if(i.type==="secret"){if(el.value)el.value=""}else if(i.type==="text"){const rv=RV[i.k]&&RV[i.k].value;if(el.value&&el.value!==(rv??""))el.value=rv??""}}}
-function rsDirty(){rsScrub();const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Save "+n+" change"+(n>1?"s":"")+" & send":"Save changes";
+function rsDirty(){rsScrub();const n=rsChanges().length;$("rssave").disabled=!n;$("rssave").textContent=n?"Apply changes ("+n+") now":"Apply changes";if($("rslater"))$("rslater").disabled=!n;
  document.querySelectorAll(".rsrow").forEach(r=>r.classList.remove("dirty"));rsChanges().forEach(i=>{const el=$(i.type==="radio"?"rs-preset":rsId(i.k));el&&el.closest(".rsrow").classList.add("dirty")})}
 function showRpt(d){const R=d.rpt||{},S=d.settings||{},PS=!!(d.powersaving&&d.powersaving.blocks);RV=R.vals||{};RQ=R.queued||{};PERWAKE=R.per_wake||PERWAKE0;
  if(!RLOAD){rsBuild();RLOAD=true}
@@ -4030,13 +4106,15 @@ async function cachePost(now){const b={en:$("cacheon").checked,int_h:+$("cachein
  const r=await post("cache-settings",b);const j=await rj(r);say("cachemsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?(now?(j.wake&&j.wake.sent?"Text sent; values update within a few minutes.":"Saved; wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status)):"Saved. Applied at the T-SIM's next wake."):(j.error||friendly(j,r.status)));cacheLoaded=false;load()}
 $("cachesave").onclick=()=>cachePost(false);$("cachenow").onclick=()=>cachePost(true);
 $("rsreadall").onclick=()=>rsRead(RS.filter(c=>!c.noAll).flatMap(c=>c.items.filter(i=>!i.wo&&(!i.dep||depOkC(RV[i.dep]))).map(i=>i.k)));
+let RSLATER=false;
+if($("rslater"))$("rslater").onclick=async()=>{RSLATER=true;try{await $("rssave").onclick()}finally{RSLATER=false}};
 $("rssave").onclick=async()=>{const ch=rsChanges();if(!ch.length)return;const changes={};ch.forEach(i=>changes[i.k]=rsCur(i));
  const isR=i=>i.risk||(i.riskVals||[]).includes(String(changes[i.k]).toLowerCase()),risky=ch.filter(isR),lines=ch.map(i=>"• "+i.label+": "+(i.type==="secret"?"(hidden)":i.type==="radio"?changes[i.k].replace(/,/g," / ")+"  (MHz / kHz / SF / CR)":changes[i.k])+(isR(i)?"  ⚠":""));
- let msg="Send these changes to the repeater now (one text)?\\n\\n"+lines.join("\\n");
+ let msg=(RSLATER?"Queue these changes for the T-SIM's next check-in (no text)?":"Send these changes to the repeater now (one text)?")+"\\n\\n"+lines.join("\\n");
  if(risky.length)msg+="\\n\\n⚠ WARNING: "+risky.map(i=>i.k==="radio"||i.k==="tx"||i.k==="radio.fem.txgain"?"radio changes can drop the repeater off your mesh (applied after a radio restart)":i.k==="powersaving"?"power saving ON stops this dashboard reaching the repeater's console":i.k==="repeat"?"repeat off stops relaying":i.k==="path.hash.mode"?"older nodes drop multi-byte paths":i.warn?i.warn:"passwords control who can administer the repeater").filter((x,ix,a)=>a.indexOf(x)===ix).join("; ")+".";
  if(!confirm(msg))return;
  let typed="";if(ch.some(i=>i.typed)){typed=prompt("Changing the admin password. Anyone with the old password loses admin access, and the new password is stored in this dashboard's history until it runs.\\n\\nType CHANGE to confirm.")||"";if(typed.trim().toUpperCase()!=="CHANGE")return say("rsmsg",false,"Not sent: admin password change not confirmed.")}
- const r=await post("rpt-save",{changes,risk_ok:risky.length>0,typed});const j=await rj(r);
+ const r=await post("rpt-save",{changes,risk_ok:risky.length>0,typed,later:RSLATER});const j=await rj(r);
  if(r.ok){ch.forEach(i=>{TYPED.delete(i.k);if(i.type==="secret"){$(rsId(i.k)).value=""}document.querySelectorAll(".rsrow.dirty").forEach(x=>x.classList.remove("dirty"))})}
  say("rsmsg",r.ok&&!(j.wake&&!j.wake.sent),r.ok?"Queued "+j.queued+" change"+(j.queued>1?"s":"")+". "+(j.wake&&j.wake.sent?"Text sent; results appear within a few minutes.":"Wake text not sent: "+friendly(j.wake||{},(j.wake||{}).status))+(changes.radio?" Radio changes apply after Reboot radio.":""):(j.error||friendly(j,r.status)));load()};
 document.querySelectorAll("[data-rsact]").forEach(b=>b.onclick=async()=>{const a=b.dataset.rsact;if(!confirm(b.textContent+" now? This sends one text."))return;const r=await post("rpt-action",{act:a});const j=await rj(r);say("rsmsg",r.ok,r.ok?(j.wake&&j.wake.sent?"Text sent.":"Queued; wake text not sent."):(j.error||friendly(j,r.status)));load()});

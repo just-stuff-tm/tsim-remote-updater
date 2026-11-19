@@ -1423,7 +1423,7 @@ console.log("serial.ondemand tests OK");
   unthrottle(); r = await P("rpt-save", { changes: { "radio.rxps": "level 10" } }); assert.equal(r.status, 409);
   unthrottle(); r = await P("rpt-save", { changes: { "serial.ondemand": "off" }, risk_ok: true }); assert.equal(r.status, 200);
   let fl = (await (await call("/api/dev/tsim-1/commands", { headers: { "X-Device-Key": dev.ingest_key } })).text()).trim().split("\n").map((l) => l.split("\t"));
-  const sent = fl.map((x) => x[1]); for (const x of ["set serial.ondemand on", "set reboot.interval 24", "set radio.rxps level 6", "set serial.ondemand off"]) assert(sent.includes(x), x);
+  const sent = fl.map((x) => x[1]); for (const x of ["set reboot.interval 24", "set radio.rxps level 6", "set serial.ondemand off"]) assert(sent.includes(x), x); assert(!sent.includes("set serial.ondemand on"), "v1.8.0: the newer serial.ondemand value replaced the queued older one");
   for (const [cid, cc] of fl) await ingest({ type: "cmd", cmd_id: cid, cmd: cc, output: cc.includes("rxps") ? "  -> OK - on,level=6,preamble=0,rx=1200,sleep=5000" : "  -> OK" });
   let cv = JSON.parse(kv.get("rptcfg:tsim-1")); assert.equal(cv["reboot.interval"].value, "24"); assert.equal(cv["radio.rxps"].value, "level 6");
   // reads: unsupported on stock

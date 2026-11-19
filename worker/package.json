@@ -2,6 +2,6 @@
   "name": "tsim-remote-updater-worker",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node test/harness.mjs", "deploy": "wrangler deploy" },
+  "scripts": { "test": "node test/harness.mjs && node test/v180.mjs", "deploy": "wrangler deploy" },
   "devDependencies": { "wrangler": "^3" }
 }
