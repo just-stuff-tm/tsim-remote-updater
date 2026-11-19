@@ -4,6 +4,7 @@
 #include "tsim_frame.h"
 #include "wake_path.h"
 #include "sms_diag.h"
+#include "tcfg.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -268,5 +269,212 @@ int main() {
   assert(!updokShouldRun(200, "{\"ok\": false}", why, sizeof(why)));
   assert(strcmp(why, "cancelled") == 0);
   printf("v1.7.11 host tests OK (sms diag, updok fail-open)\n");
+
+  // 15) v1.8.0: TCFG parse/validate/canonicalize/format, legacy mapping, seed, scheduler, dedupe.
+  {
+    Tcfg t; tcfgInit(&t);
+    assert(t.ci == 360 && !strcmp(t.do_, "hc") && t.cs == 0 && t.qc == 30 && !strcmp(t.q_, "u"));
+    assert(t.usol == 2000 && t.gto == 180);
+    bool rej = false;
+    int n = tcfgApply(&t, "ci=180 do=hcmsgt cs=24 qc=15 q=bu usol=0 gto=30", &rej);
+    assert(n == 7 && !rej);
+    assert(t.ci == 180 && !strcmp(t.do_, "hcmsgt") && t.cs == 24 && t.qc == 15 && !strcmp(t.q_, "bu"));
+    assert(t.usol == 0 && t.gto == 30);
+    char buf[240];
+    tcfgFormatApplied(buf, sizeof(buf), n, false, &t);
+    assert(!strcmp(buf, "TCFG applied 7: ci=180 do=hcmsgt cs=24 qc=15 q=bu usol=0 gto=30"));
+    // omitted keys keep current; unknown keys/letters ignored
+    n = tcfgApply(&t, "do=hxcz q=bz foo=1", &rej);
+    assert(n == 2 && !rej && !strcmp(t.do_, "hc") && !strcmp(t.q_, "b") && t.ci == 180);
+    n = tcfgApply(&t, "do=- q=", &rej);
+    assert(n == 2 && !t.do_[0] && !t.q_[0]);
+    tcfgFormatApplied(buf, sizeof(buf), n, false, &t);
+    assert(strstr(buf, "do=-") && strstr(buf, " q=- "));
+    // canonical order
+    tcfgCanonDo("tgschm", t.do_); assert(!strcmp(t.do_, "hcmsgt"));
+    tcfgCanonDo("HHCC", t.do_); assert(!strcmp(t.do_, "hc"));
+    tcfgCanonQ("ub", t.q_); assert(!strcmp(t.q_, "bu"));
+    // rejects: out of range, not stored
+    uint32_t old_ci = t.ci;
+    n = tcfgApply(&t, "ci=10 cs=6 qc=14 usol=20001 gto=29", &rej);
+    assert(n == 0 && rej && t.ci == old_ci && t.cs == 24);
+    tcfgFormatApplied(buf, sizeof(buf), 0, true, &t);
+    assert(strstr(buf, "TCFG applied 0 (a value was REJECTED: ci 0 or 30-1440, cs 0|1|24|168, qc 0 or 15-240, usol 0-20000, gto 30-600):"));
+    n = tcfgApply(&t, "ci=0", &rej);
+    assert(n == 1 && !rej && t.ci == 0);
+    n = tcfgApply(&t, "ci=29", &rej); assert(n == 0 && rej && t.ci == 0);
+    n = tcfgApply(&t, "ci=1441", &rej); assert(n == 0 && rej);
+    n = tcfgApply(&t, "ci=30 cs=0 qc=240 gto=600", &rej);
+    assert(n == 4 && !rej && t.ci == 30 && t.cs == 0 && t.qc == 240 && t.gto == 600);
+    n = tcfgApply(&t, "cs=1", &rej); assert(n == 1 && t.cs == 1);
+    n = tcfgApply(&t, "cs=168", &rej); assert(n == 1 && t.cs == 168);
+    n = tcfgApply(&t, "cs=24", &rej); assert(n == 1 && t.cs == 24);
+    n = tcfgApply(&t, "qc=0", &rej); assert(n == 1 && t.qc == 0);
+    n = tcfgApply(&t, "ci=abc", &rej); assert(n == 0 && rej);
+    char js[200];
+    tcfgJson(&t, js, sizeof(js));
+    assert(strstr(js, "\"tcfg\":{\"v\":1,"));
+    assert(strstr(js, "\"safety\":1440"));
+    assert(strstr(js, "\"do\":\"hc\"") || strstr(js, "\"do\":\"-\"") || strstr(js, "\"do\":\""));
+  }
+  {
+    // seed from 1.7.11 defaults
+    TcfgLegacy L = {180, 1, 1, 0, 1, 60, 2000, 0, 30, 0, 24, 0, 180};
+    Tcfg t; tcfgSeedFromLegacy(&t, &L);
+    assert(t.ci == 180 && !strcmp(t.do_, "hcm") && t.cs == 24 && t.qc == 60 && !strcmp(t.q_, "u"));
+    assert(t.usol == 2000 && t.gto == 180);
+    // 1440 stays 1440 (ambiguous off vs 24 h)
+    L.wd_int = 1440; tcfgSeedFromLegacy(&t, &L); assert(t.ci == 1440);
+    L.wd_int = 0; tcfgSeedFromLegacy(&t, &L); assert(t.ci == 1440);
+    // battery + uptime: qc = min, both letters
+    L.wd_int = 180; L.lb_en = 1; L.lb_int = 30; L.upm = 60;
+    tcfgSeedFromLegacy(&t, &L);
+    assert(t.qc == 30 && !strcmp(t.q_, "bu"));
+    // only battery; clamp 5 -> 15, 1440 -> 240
+    L.lb_en = 1; L.lb_int = 5; L.upm = 0;
+    tcfgSeedFromLegacy(&t, &L);
+    assert(t.qc == 15 && !strcmp(t.q_, "b"));
+    L.lb_int = 1440; tcfgSeedFromLegacy(&t, &L); assert(t.qc == 240);
+    // neither
+    L.lb_en = 0; L.upm = 0; tcfgSeedFromLegacy(&t, &L);
+    assert(t.qc == 0 && !t.q_[0]);
+    // letters: sms, cs, gps
+    L.hb = 1; L.cmd = 1; L.sms = 1; L.smesh = 0; L.cs_en = 1; L.gps_auto = 1;
+    tcfgSeedFromLegacy(&t, &L);
+    assert(!strcmp(t.do_, "hcsgt"));
+    // cs snap
+    assert(tcfgSnapCs(0) == 0 && tcfgSnapCs(1) == 1 && tcfgSnapCs(24) == 24 && tcfgSnapCs(168) == 168);
+    assert(tcfgSnapCs(6) == 1 && tcfgSnapCs(12) == 1 && tcfgSnapCs(48) == 24 && tcfgSnapCs(100) == 168);
+  }
+  {
+    Tcfg t; tcfgInit(&t);
+    // WDCFG int=0 -> ci=0 silent Off; else clamp 30..1440
+    assert(tcfgMapWdIntToCi(0) == 0);
+    assert(tcfgMapWdIntToCi(180) == 180);
+    assert(tcfgMapWdIntToCi(10) == 30);
+    assert(tcfgMapWdIntToCi(2000) == 1440);
+    assert(tcfgLegacyIntFromCi(0) == 1440);
+    assert(tcfgLegacyIntFromCi(360) == 360);
+    t.ci = tcfgMapWdIntToCi(0); assert(t.ci == 0);
+    tcfgMapWdHb(&t, 0); tcfgMapWdCmd(&t, 0); tcfgMapWdSms(&t, 1); tcfgMapWdSmesh(&t, 1);
+    assert(tcfgDoHas(&t, 't') && tcfgDoHas(&t, 'm') && !tcfgDoHas(&t, 'h') && !tcfgDoHas(&t, 'c'));
+    // upoll=0 clears u; upoll=N sets u and min with existing qc if b
+    tcfgInit(&t); t.qc = 30; tcfgSetLetter(t.q_, 4, TCFG_Q_ORDER, 'b', true);
+    tcfgMapUpoll(&t, 60);
+    assert(tcfgQHas(&t, 'u') && tcfgQHas(&t, 'b') && t.qc == 30);  // min(30, 60)
+    tcfgMapUpoll(&t, 0);
+    assert(!tcfgQHas(&t, 'u') && tcfgQHas(&t, 'b') && t.qc == 30);
+    tcfgMapUpoll(&t, 0);  // still b, qc stays
+    Tcfg t2; tcfgInit(&t2); t2.qc = 0; t2.q_[0] = 0;
+    tcfgMapUpoll(&t2, 60); assert(t2.qc == 60 && tcfgQHas(&t2, 'u'));
+    tcfgMapUpoll(&t2, 0); assert(!t2.q_[0] && t2.qc == 0);
+    // PWRCFG
+    Tcfg t3; tcfgInit(&t3); t3.qc = 0; t3.q_[0] = 0;
+    tcfgMapPwr(&t3, true, 1, true, 30);
+    assert(tcfgQHas(&t3, 'b') && t3.qc == 30);
+    tcfgMapPwr(&t3, true, 0, false, 0);
+    assert(!tcfgQHas(&t3, 'b') && t3.qc == 0);  // no u either
+    tcfgMapPwr(&t3, true, 1, false, 0);
+    assert(tcfgQHas(&t3, 'b') && t3.qc == 30);  // qc was 0, default 30
+    tcfgMapPwr(&t3, false, 0, true, 5);
+    assert(t3.qc == 15);  // clamped
+    tcfgMapPwr(&t3, false, 0, true, 1440);
+    assert(t3.qc == 240);
+    tcfgMapCsEn(&t3, 1); assert(tcfgDoHas(&t3, 's'));
+    t3.cs = tcfgSnapCs(6); assert(t3.cs == 1);
+    tcfgMapGpsAuto(&t3, 1); assert(tcfgDoHas(&t3, 'g'));
+    t3.gto = 90; assert(t3.gto == 90);
+  }
+  {
+    assert(tcfgCiSchedMin(0) == 1440 && tcfgCiSchedMin(360) == 360);
+    assert(tcfgTolSecs(180) == 1080 && tcfgTolSecs(5) == 60 && tcfgTolSecs(1440) == 8640);
+    int64_t now = 1000000;
+    assert(tcfgIsDue(now, 0, 180));
+    assert(tcfgIsDue(now, now, 180));
+    assert(tcfgIsDue(now, now + 1080, 180));          // exactly 10% early
+    assert(!tcfgIsDue(now, now + 1081, 180));
+    assert(tcfgIsDue(now + 10, now, 180));
+    // silent Off uses 1440 for tolerance
+    assert(tcfgIsDue(now, now + 8640, 1440));
+    assert(!tcfgIsDue(now, now + 8641, 1440));
+    // backoff 30/60/120.. capped at interval
+    assert(tcfgBackoffSecs(0, 180) == 180 * 60);
+    assert(tcfgBackoffSecs(1, 180) == 1800);
+    assert(tcfgBackoffSecs(2, 180) == 3600);
+    assert(tcfgBackoffSecs(3, 180) == 7200);
+    assert(tcfgBackoffSecs(1, 30) == 1800);          // 30 min interval, first fail = 30 min
+    assert(tcfgBackoffSecs(5, 180) == 180 * 60);     // 480 min would exceed 180
+    assert(tcfgBackoffSecs(1, 0) == 1800);           // ci=0: cap 1440 min, 30 min backoff
+    assert(tcfgBackoffSecs(0, 0) == 1440 * 60);
+    // sleep timer: 24 h cap, floor 5, ext0 60, never 0
+    assert(tcfgSleepTimerSecs(true, now, now + 100, 180, false, 0, 0, false, 0) == 60);
+    int64_t s = tcfgSleepTimerSecs(false, now, now + 360 * 60, 360, true, now + 30 * 60, 30, false, 0);
+    assert(s == 30 * 60);
+    s = tcfgSleepTimerSecs(false, now, now + 360 * 60, 360, false, 0, 0, false, 0);
+    assert(s == 360 * 60);
+    s = tcfgSleepTimerSecs(false, now, now + 20000 * 60, 20000, false, 0, 0, false, 0);
+    assert(s == 1440 * 60);  // 24 h cap
+    s = tcfgSleepTimerSecs(false, now, now - 100, 180, false, 0, 0, false, 0);
+    assert(s == 5);          // past due, floor
+    s = tcfgSleepTimerSecs(false, now, now + 300, 180, false, 0, 0, true, now + 120);
+    assert(s == 120);        // GNSS warm window
+    s = tcfgSleepTimerSecs(false, now, 0, 180, false, 0, 0, false, 0);
+    assert(s == 180 * 60);   // unscheduled ci -> interval from now
+    // silent Off still schedules 24 h
+    s = tcfgSleepTimerSecs(false, now, now + 1440 * 60, 1440, false, 0, 0, false, 0);
+    assert(s == 1440 * 60);
+    assert(tcfgQcEnabled(nullptr) == false);
+    Tcfg t; tcfgInit(&t); assert(tcfgQcEnabled(&t));
+    t.qc = 0; assert(!tcfgQcEnabled(&t));
+    t.qc = 30; t.q_[0] = 0; assert(!tcfgQcEnabled(&t));
+    // silent Off data
+    t.ci = 0; tcfgCanonDo("hc", t.do_);
+    assert(!tcfgCiWantsData(&t, false, false));
+    assert(tcfgCiWantsData(&t, true, false));
+    assert(tcfgCiWantsData(&t, false, true));
+    t.ci = 360;
+    assert(tcfgCiWantsData(&t, false, false));  // do=hc
+    t.do_[0] = 0;
+    assert(!tcfgCiWantsData(&t, false, false));
+    assert(tcfgCiWantsData(&t, false, true));
+  }
+  {
+    TcfgIdRing r; tcfgIdClear(&r);
+    assert(!tcfgIdSeen(&r, "a"));
+    tcfgIdPush(&r, "id1"); assert(tcfgIdSeen(&r, "id1"));
+    assert(!tcfgIdSeen(&r, "id2"));
+    for (int i = 2; i <= 16; i++) {
+      char id[8]; snprintf(id, sizeof(id), "id%d", i);
+      tcfgIdPush(&r, id);
+    }
+    assert(r.n == 16);
+    assert(tcfgIdSeen(&r, "id1"));
+    tcfgIdPush(&r, "id17");
+    assert(!tcfgIdSeen(&r, "id1"));  // evicted
+    assert(tcfgIdSeen(&r, "id17") && tcfgIdSeen(&r, "id2"));
+    tcfgIdPush(&r, ""); assert(tcfgIdSeen(&r, "id17"));  // empty ignored
+    assert(tcfgCmdKind("TCFG ci=1") == TCFG_KIND_TCFG);
+    assert(tcfgCmdKind("tcfg") == TCFG_KIND_TCFG);
+    assert(tcfgCmdKind("WDCFG int=0") == TCFG_KIND_WDCFG);
+    assert(tcfgCmdKind("PWRCFG en=1") == TCFG_KIND_PWRCFG);
+    assert(tcfgCmdKind("CFGSNAP en=0") == TCFG_KIND_CFGSNAP);
+    assert(tcfgCmdKind("GPSCFG auto=1") == TCFG_KIND_GPSCFG);
+    assert(tcfgCmdKind("GPSFIX") == TCFG_KIND_NONE);
+    assert(tcfgCmdKind("get name") == TCFG_KIND_NONE);
+    assert(tcfgIsSysCmd("TCFG ci=360") && tcfgIsSysCmd("TCFG") && tcfgIsSysCmd("WDCFG int=1"));
+    assert(tcfgIsSysCmd("GPSFIX") && tcfgIsSysCmd("GPSCFG auto=0"));
+    assert(!tcfgIsSysCmd("get name"));
+    int kinds[6] = { TCFG_KIND_TCFG, TCFG_KIND_WDCFG, TCFG_KIND_TCFG, TCFG_KIND_PWRCFG, TCFG_KIND_GPSCFG, TCFG_KIND_NONE };
+    bool super[6];
+    tcfgMarkSuperseded(kinds, 6, super);
+    assert(super[0] && !super[1] && !super[2] && !super[3] && !super[4] && !super[5]);
+    int k2[3] = { TCFG_KIND_WDCFG, TCFG_KIND_WDCFG, TCFG_KIND_WDCFG };
+    bool s2[3];
+    tcfgMarkSuperseded(k2, 3, s2);
+    assert(s2[0] && s2[1] && !s2[2]);
+    assert(!strcmp(tcfgKindName(TCFG_KIND_TCFG), "TCFG"));
+    assert(!strcmp(tcfgKindName(TCFG_KIND_CFGSNAP), "CFGSNAP"));
+  }
+  printf("v1.8.0 host tests OK (TCFG parse, legacy map, seed, scheduler, silent Off, dedupe, supersede)\n");
   return 0;
 }
