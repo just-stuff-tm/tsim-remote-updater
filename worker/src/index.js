@@ -542,6 +542,69 @@ export function parseFlashInfo(msg) {
   for (const k of ["size", "written"]) if (out[k] != null) out[k] = +out[k];
   return Object.keys(out).length ? out : null;
 }
+// v1.8.1 loader codes (esp_loader.h). The name in the message wins when present.
+const LOADER_ERR = { 0: "SUCCESS", 1: "FAIL", 2: "TIMEOUT", 3: "IMAGE_SIZE", 4: "INVALID_MD5", 5: "INVALID_PARAM", 6: "INVALID_TARGET", 7: "UNSUPPORTED_CHIP", 8: "UNSUPPORTED_FUNC", 9: "INVALID_RESPONSE" };
+function flashCommas(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+function flashStepOf(chunk) {
+  const m = String(chunk || "").match(/step=([A-Za-z0-9_]+)\s+err=(\d+)(?:\(([A-Za-z0-9_]+)\))?/);
+  if (!m) return null;
+  const code = +m[2];
+  const baudM = String(chunk).match(/baud=(\d+)/);
+  const atM = String(chunk).match(/\bat=(\d+)/);
+  return { step: m[1], code, name: m[3] || LOADER_ERR[code] || "ERROR", baud: baudM ? baudM[1] : null, at: atM ? +atM[1] : 0 };
+}
+function flashNoun(step) {
+  if (step === "connect" || step === "connect_stub") return "connect";
+  if (step === "baud") return "baud rate";
+  if (step === "flash_start") return "start (erase)";
+  if (step === "write") return "write";
+  if (step === "verify") return "verify";
+  if (step === "file_read") return "reading the file";
+  return step || "flash";
+}
+function flashDetail(step, name, baud) {
+  if (step === "connect" || step === "connect_stub") return "the radio did not enter download mode";
+  if (step === "verify" || name === "INVALID_MD5") return "the data written does not match the file";
+  const link = !name || name === "TIMEOUT" || name === "FAIL" || name === "ERROR";
+  if (link && (step === "baud" || step === "flash_start" || step === "write" || name === "TIMEOUT"))
+    return baud ? "timeout talking to the radio at " + baud + " baud" : "timeout talking to the radio";
+  return String(name || "error").toLowerCase().replace(/_/g, " ");
+}
+function flashHint(step, name) {
+  if (step === "connect" || step === "connect_stub") return "The radio did not enter download mode. Check the BOOT and RST wiring and that it has power.";
+  if (step === "verify" || name === "INVALID_MD5") return "The data written does not match the file.";
+  if (step === "baud" || step === "flash_start" || step === "write" || name === "TIMEOUT" || name === "INVALID_RESPONSE" || name === "FAIL")
+    return "The serial link was unreliable. That is often a low battery or the wiring.";
+  return "";
+}
+function flashByte(st) { return st && st.step === "write" && st.at ? " (byte " + flashCommas(st.at) + ")" : ""; }
+// Plain explanation of a v1.8.1 flash result. Null for older messages (no step= / retry baud=).
+export function explainFlash(msg) {
+  const s = String(msg || "");
+  if (!/step=/.test(s) && !/retry baud=/.test(s)) return null;
+  const parts = s.split(/;\s*retry\s+/i);
+  const first = flashStepOf(parts[0]);
+  let retry = null, retryOk = false, retryBaud = null;
+  if (parts[1]) {
+    const rm = parts[1].match(/baud=(\d+)/);
+    retryBaud = rm ? rm[1] : null;
+    if (/\bOK\b/.test(parts[1]) && !/step=/.test(parts[1])) retryOk = true;
+    else retry = flashStepOf(parts[1]);
+  }
+  if (!first && !retryOk) return null;
+  let text = "";
+  if (first) text = "Flash failed at: " + flashNoun(first.step) + " — " + flashDetail(first.step, first.name, first.baud) + flashByte(first) + ".";
+  if (retryOk) text += (text ? " " : "") + "Retried at " + (retryBaud || "115200") + ": OK.";
+  else if (retry) {
+    const rb = retry.baud || retryBaud || "115200";
+    text += (text ? " " : "") + "Retried at " + (retryBaud || rb) + ": failed at " + flashNoun(retry.step) + " — " + flashDetail(retry.step, retry.name, rb) + flashByte(retry) + ".";
+  }
+  const hintSrc = (retry && !retryOk) ? retry : first;
+  const hint = hintSrc ? flashHint(hintSrc.step, hintSrc.name) : "";
+  if (hint && text.indexOf(hint) < 0) text += (text ? " " : "") + hint;
+  text = text.replace(/\s+/g, " ").trim();
+  return text ? { text, raw: s } : null;
+}
 export function flashFile(msg) {
   const m = String(msg || "").match(/^SUCCESS:\s*(\S+)/); return m ? decodeURIComponent(m[1].split(/[?#]/)[0].split("/").pop()) : null;
 }
@@ -561,7 +624,7 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
   const mine = evs.filter((h) => Date.parse(h.received_at) >= startAt - 5000);
   const target = sent ? (sent.asset_name || "") + (sent.tag && !["url", "direct"].includes(sent.tag) ? " (" + sent.tag + ")" : "") : null;
   const times = { 0: new Date(startAt).toISOString() };
-  let step = 0, state = "running", reason = null, finished = null, flash = null;
+  let step = 0, state = "running", reason = null, finished = null, flash = null, flashExplain = null;
   for (const h of mine) {
     const m = h.msg;
     if (kind === "tsim") {
@@ -572,19 +635,24 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
       else if (/OTA OK/.test(m)) { step = 5; times[5] = h.received_at; state = "done"; finished = h.received_at; reason = null; }   // v1.8.0: a later success clears an earlier failure
       else if (/OTA FAIL/.test(m)) { state = "failed"; reason = friendlyFail(m); finished = h.received_at; }
     } else {
-      if (/^(UPDATE )?start/i.test(m) || /^UPDATE start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; if (state === "failed") { state = "running"; reason = null; finished = null; } }   // v1.8.0: a new attempt starts clean
+      if (/^(UPDATE )?start/i.test(m) || /^UPDATE start/.test(m)) { step = Math.max(step, 1); times[1] = h.received_at; if (state === "failed") { state = "running"; reason = null; finished = null; flashExplain = null; } }   // v1.8.0: a new attempt starts clean
       else if (/^Download done/.test(m)) { step = Math.max(step, 3); times[1] ||= h.received_at; times[2] = times[3] = h.received_at; }
       else if (/^Flashing:/.test(m)) { step = Math.max(step, 3); flash = { ...flash, ...parseFlashInfo(m) }; }
-      else if (/^SUCCESS/.test(m)) { flash = { ...flash, ...parseFlashInfo(m) }; step = 5; times[4] = times[5] = h.received_at; state = "done"; finished = h.received_at; reason = null; }   // v1.8.0
-      else if (/FAIL/.test(m)) { const fi = parseFlashInfo(m); if (fi) flash = { ...flash, ...fi }; state = "failed"; reason = friendlyFail(m.split(" | ")[0]); finished = h.received_at; }
+      else if (/^Flash retry/.test(m)) { /* v1.8.1: diagnostic only; the final SUCCESS/FAIL line is the outcome */ }
+      else if (/^SUCCESS/.test(m)) { flash = { ...flash, ...parseFlashInfo(m) }; step = 5; times[4] = times[5] = h.received_at; state = "done"; finished = h.received_at; reason = null; flashExplain = explainFlash(m); }   // v1.8.0
+      else if (/FAIL/.test(m)) { const fi = parseFlashInfo(m); if (fi) flash = { ...flash, ...fi }; state = "failed"; const ex = explainFlash(m); flashExplain = ex; reason = ex ? ex.text : friendlyFail(m.split(" | ")[0]); finished = h.received_at; }
     }
   }
   const cancel = kind === "tsim" ? st.tsim_cancel : st.heltec_cancel;
   // v1.7.11: a Heltec cancel also clears a failed (and, while still "running", a stall) display.
   const cancelStops = state === "running" || (kind === "heltec" && state === "failed");
-  if (cancelStops && cancel && Date.parse(cancel.at) >= startAt)
-    return { state: "cancelled", step, steps: STEPS, times, target, started_at: times[0], finished_at: cancel.at, pct: 0,
+  if (cancelStops && cancel && Date.parse(cancel.at) >= startAt) {
+    const cancelled = { state: "cancelled", step, steps: STEPS, times, target, started_at: times[0], finished_at: cancel.at, pct: 0,
       reason: cancel.note || "Cancel requested." };
+    if (flash) cancelled.flash = flash;
+    if (flashExplain) cancelled.flash_explain = flashExplain;
+    return cancelled;
+  }
   // Version check: if the device already runs the target (or newer), the update is done, whatever the log says.
   if (state !== "done" && sent) {
     const ti = kind === "tsim" ? (fwIdent(sent.tag) || fwIdent(sent.asset_name)) : relIdent(sent);
@@ -593,7 +661,7 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
     if (ti && iv && fwReached(inst, ti)) {
       const at = (kind === "tsim" ? st.tsim_fw_at : st.radio_ver_at) || null;
       return { state: "done", step: 5, steps: STEPS, times: { ...times, 5: at }, target, started_at: times[0], finished_at: at, reason: null, pct: 100,
-        resolved: `${kind === "tsim" ? "T-SIM" : "Repeater"} reports ${vstr(iv)}`, ...(flash ? { flash } : {}) };
+        resolved: `${kind === "tsim" ? "T-SIM" : "Repeater"} reports ${vstr(iv)}`, ...(flash ? { flash } : {}), ...(flashExplain ? { flash_explain: flashExplain } : {}) };
     }
   }
   const lastAt = Math.max(startAt, ...mine.map((h) => Date.parse(h.received_at) || 0), st.last_checkin_ts || 0);
@@ -614,6 +682,7 @@ export function computeProgress(kind, history = [], st = {}, now = Date.now(), w
       "The update started but stopped reporting for 10 minutes, most likely a lost cell connection mid-download. Press Retry to start it again."; }
   const out = { state, step, steps: STEPS, times, target, started_at: times[0], finished_at: finished, reason, pct: Math.round((step / 5) * 100) };
   if (flash) out.flash = flash;
+  if (flashExplain) out.flash_explain = flashExplain;
   return out;
 }
 
@@ -667,7 +736,7 @@ const MESH_RAW = ["heltec_cli", "ver", "name", "clock", "stats_core", "stats_rad
 export function sanitizeTelemetry(t) {
   const o = { type: ["status", "update", "reboot", "event", "mesh", "cmd"].includes(t.type) ? t.type : "event" };
   for (const k of NUM) if (typeof t[k] === "number" && Number.isFinite(t[k])) o[k] = t[k];
-  for (const k of STR) if (t[k] != null) o[k] = String(t[k]).slice(0, 300);
+  for (const k of STR) if (t[k] != null) o[k] = String(t[k]).slice(0, k === "msg" ? 512 : 300);
   for (const k of ["lb_en", "lb_imm"]) if (typeof t[k] === "boolean") o[k] = t[k];
   if (t.type === "power") o.type = "power";
   return o;
@@ -1587,6 +1656,10 @@ export function smsDiagLine(sd) {
     }
   }
   if (cms.length) parts.push("+CMTI at " + cms.join(", "));
+  var npv = sd.np != null ? Number(sd.np) : NaN;
+  if (Number.isFinite(npv) && npv >= 0) parts.push(Math.floor(npv) + " passes");
+  if (sd.tf === 1 || sd.tf === true) parts.push("new text found");
+  else if (sd.tf === 0 || sd.tf === false) parts.push("no new text");
   if (!parts.length && (wake == null || wake === "")) return "";
   var line = "Texts: " + parts.join(", ");
   if (wake != null && wake !== "" && Number.isFinite(Number(wake))) {
@@ -1618,6 +1691,10 @@ export function smsDiagKeep(sd) {
     const a = cmSrc.slice(0, 4).map(n).filter((v) => v != null && v >= 0 && v <= 3600000).map((v) => Math.floor(v));
     if (a.length) out.cm = a;
   }
+  if (n(sd.np) != null) out.np = Math.max(0, Math.min(255, Math.floor(sd.np)));
+  if (sd.tf === 0 || sd.tf === 1) out.tf = sd.tf;
+  else if (sd.tf === false) out.tf = 0;
+  else if (sd.tf === true) out.tf = 1;
   return smsDiagLine(out) ? out : null;
 }
 export const WD_FW = "1.7.1", DEFAULT_WD = { int_min: 180, hb: true, sms: false };
@@ -2657,9 +2734,12 @@ async function deviceApi(request, env, dev, action) {
     }
     const checkins = { settings: tcSaved, stored: !!tcStored, applied_at: (tcStored && tcStored.applied_at) || null, supported: fwAtLeast(latest && latest.fw, WD_FW), v18: fwAtLeast(latest && latest.fw, TCFG_FW), cost: costEstimate(tcSaved), schedule: { hours: settings.schedule_hours || 0 } };
     const queue = (cmds || []).filter((c) => c.status === "queued" || c.status === "sent").map((c) => ({ id: c.id, cmd: redactCmd(String(c.cmd || "")).replace(/^((?:set\s+)?(?:guest\.)?password|set bridge\.secret)\s+.*/i, "$1 ••••"), status: c.status, sys: !!c.sys, queued_at: c.queued_at, sent_at: c.sent_at || null }));
+    const lur0 = s.last_update_result || null;
+    const lurEx = lur0 && lur0.msg ? explainFlash(lur0.msg) : null;
+    const lur = lur0 ? (lurEx ? { ...lur0, explain: lurEx } : lur0) : null;
     return json({ checkins, device_state, queue, radio_debug, watchdog, cache: { settings: { ...DEFAULT_CACHE, ...((await kvJson(env, `cachecfg:${id}`)) || {}) }, last: (await kvJson(env, `rptcache:${id}`)) || null, supported: fwAtLeast(latest && latest.fw, CACHE_FW), pending: (cmds || []).some((c) => /^cfgsnap\s/i.test(c.cmd || "") && (c.status === "queued" || c.status === "sent")) }, rpt: { vals: rptVals, queued: rptq, lists: rptLists, ops_pending: rptOpsQ, ops_q: rptOpsL.map((c) => redactCmd(c.cmd)), per_wake: cmdsPerWake(latest && latest.fw) }, adc: { ...(adcSt || {}), pending: adcq.length ? adcq[0].status : null }, nicks: nicks || {}, gps: gpsInfo, device: { id, name: dev.name }, source, latest, mesh, settings, schedule, commands: userCommands(cmds), awaiting: awaitingCmds(cmds),
       power: { settings: pwr, pending: pq ? pq.status : null, wake: pwr.wake || null, event: (st && st.power_event) || null, ratio: LB_RATIO }, history: history || [], updates: {
-      heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: s.last_update_result || null,
+      heltec_fw: s.heltec_fw || null, latest_available: rel, last_update_result: lur,
       last_update_sent: s.last_update_sent || null, last_action: s.last_action || null },
       powersaving: { on: s.heltec_powersaving === true, ondemand: s.serial_ondemand === true, blocks: psBlocks(s), unknown: s.heltec_powersaving === null, at: s.powersaving_at || null, source: s.powersaving_source || null },
       tsim: { fw: (latest && latest.fw) || null, source: tsimSrc, latest_available: tsimRel, last_ota: s.tsim_last_ota || null, last_sent: s.tsim_update_sent || null },
@@ -3818,7 +3898,7 @@ function prog(p,label,pend){
   return '<li class="'+c+'"><span>'+e(s)+'</span><span>'+(p.times&&p.times[i]?e(t(p.times[i])):"")+'</span></li>'}).join("");
  return '<div style="margin-top:10px"><div class="row"><b class="small">'+e(head)+'</b><span class="badge '+(cls==="done"?"":cls==="failed"?"failed":"run")+'">'+(p.state==="done"?"Done":p.state==="timeout"?"Stalled":fail?"Failed":p.pct+"%")+'</span></div>'+
   '<div class="bar '+cls+'"><i style="width:'+(fail?Math.max(p.pct,8):p.pct)+'%"></i></div>'+(p.target?'<div class="small mut">File: '+e(p.target)+'</div>':'')+(p.resolved?'<div class="small mut">Confirmed: '+e(p.resolved)+'</div>':'')+finfo(p.flash)+
-  (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
+  (p.reason?'<p class="small err">'+e(p.reason)+'</p>':'')+(p.flash_explain&&p.flash_explain.text&&p.flash_explain.text!==p.reason?'<p class="small">'+e(p.flash_explain.text)+'</p>':'')+(p.flash_explain&&p.flash_explain.raw?'<details class="small"><summary>Technical detail</summary><p class="small mut">'+e(p.flash_explain.raw)+'</p></details>':'')+(p.state==="running"||p.state==="timeout"?'<ol class="steps">'+rows+'</ol>':'<details class="small" data-k="'+e(label)+'" ontoggle="DS[this.dataset.k]=this.open"'+(DS[label]?' open':'')+'><summary>Show steps</summary><ol class="steps">'+rows+'</ol></details>')+'</div>'}
 var DS={};
 async function load(){
  if(document.hidden){clearTimeout(window._t);return}
@@ -3837,7 +3917,9 @@ async function load(){
  $("c-cell").innerHTML=kv([["Signal",sig(L.csq)],["RSRP / RSRQ",L.rsrp==null?null:L.rsrp+" / "+L.rsrq],["Network",L.operator],["IP",sens(L.ip)],...(L.iccid?[["ICCID",sens(L.iccid)]]:[]),...(L.imei?[["IMEI",sens(L.imei)]]:[])]);sensApply();
  const la=U.latest_available,TS=d.tsim||{},tla=TS.latest_available;
  const US=d.update_status||{};RADCUR=!!(US.radio&&US.radio.state==="current");
- $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)],["Last flashed",US.radio&&US.radio.flashed?US.radio.flashed.file+" · "+t(US.radio.flashed.at):null]])+(US.radio&&US.radio.flashed?finfo(US.radio.flashed.flash):"")+relnotes(US.radio);
+ var lur=U.last_update_result,lex=lur&&lur.explain,pEx=PG.heltec&&PG.heltec.flash_explain;
+ var lexHtml=(lex&&lex.text&&!pEx)?'<p class="small">'+e(lex.text)+'</p>'+(lex.raw?'<details class="small"><summary>Technical detail</summary><p class="small mut">'+e(lex.raw)+'</p></details>':''):"";
+ $("c-upd").innerHTML=kv([["Status",utext(US.radio)],["Running",M.heltec_fw||U.heltec_fw],["Latest available",la?la.asset_name:"press Check for updates"],["Checked",la&&t(la.checked_at)],["Last flashed",US.radio&&US.radio.flashed?US.radio.flashed.file+" · "+t(US.radio.flashed.at):null]])+(US.radio&&US.radio.flashed?finfo(US.radio.flashed.flash):"")+lexHtml+relnotes(US.radio);
  $("c-tsimfw").innerHTML=kv([["Status",utext(US.tsim)],["Running",TS.fw||L.fw],["Latest available",tla?tla.asset_name+(tla.tag&&tla.tag!=="url"?" ("+tla.tag+")":""):"press Check for updates"]])+relnotes(US.tsim);
  for(const k of ["heltec","tsim"]){const p=PG[k];if(pending[k]&&p&&p.started_at&&new Date(p.started_at)>=pending[k]-5000)delete pending[k];if(pending[k]&&Date.now()-pending[k]>15*60e3)delete pending[k];}
  $("p-heltec").innerHTML=prog(PG.heltec,"Heltec",pending.heltec);$("p-tsim").innerHTML=prog(PG.tsim,"T-SIM",pending.tsim);

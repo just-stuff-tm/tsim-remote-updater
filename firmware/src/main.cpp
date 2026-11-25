@@ -21,12 +21,14 @@
 #include "wake_path.h"  // v1.7.8 SMS light wake + CMD vs STATUS extras; v1.7.10 late +CMTI window (host-tested)
 #include "lp_power.h"   // v1.7.9 eDRX / PSM parsing (host-tested)
 #include "sms_diag.h"   // v1.7.11 text-timing diagnostic + SMS UPDATE allow check (host-tested)
+#include "sms_queue.h"  // v1.8.1 SMS hash ring, ordering, poll decisions (host-tested)
 #include "tcfg.h"       // v1.8.0 unified check-ins (TCFG parse, scheduler, dedupe; host-tested)
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 #include "esp_loader.h"
+#include "esp_loader_io.h"
 #include "arduino_port.h"
 #include "modem_tcp.h"
 
@@ -88,6 +90,12 @@ static bool fieldWake() {
 static bool s_pdp_up = false;
 static bool s_modem_ready = false;  // v1.7.9: AT has answered this wake (gates the one SMS catch-up)
 static bool s_sms_catch_done = false;  // v1.7.9: that catch-up runs once per boot, not in a loop
+static uint32_t s_cmti_ms = 0;          // v1.8.1: millis() of the latest +CMTI this wake (0 = none)
+static uint32_t s_sms_pass_done_ms = 0; // v1.8.1: millis() when the last inbox pass finished listing
+static int s_sms_new = 0;               // v1.8.1: texts executed this wake (ring hits do not count)
+static int s_sms_trigger = 0;           // v1.8.1: a text from this wake (recent stamp, or it arrived after the first list)
+static bool s_sms_opened = false;       // v1.8.1: the first inbox pass of this wake has run
+#define SMS_RECENT_S 180
 static bool s_busy_update = false;
 static bool s_tcp_busy = false;  // true while TLS/TCP socket owns the modem AT UART
 
@@ -124,9 +132,9 @@ static void deadlineStopForSleep() {
 
 
 // v1.4.1: dashboard telemetry queue (JSON bodies), flushed by pendingFlush()
-static char s_ingest_q[6][1024];
+static char s_ingest_q[6][1536];
 static int s_ingest_q_len = 0;
-static char s_ingest_body[1024];
+static char s_ingest_body[1536];
 static void ingestEvent(const char *type, const char *msg);
 static void ingestFlush(void);
 static bool ingestSend(const char *json);
@@ -255,10 +263,15 @@ RTC_DATA_ATTR static int64_t s_qc_due = 0;
 #define CID_MAGIC 0xC1D18E00UL
 RTC_DATA_ATTR static TcfgIdRing s_cid;
 RTC_DATA_ATTR static uint32_t s_cid_magic = 0;
+#define SMS_RING_MAGIC 0x534D5131UL
+RTC_DATA_ATTR static SmsRing s_sms_ring;
+RTC_DATA_ATTR static uint32_t s_sms_ring_magic = 0;
 static void tcfgSave();
 static void tcfgApplyCfg(const char *args, char *out, size_t cap);
 static void cidSave();
 static void cidLoad();
+static void smsRingSave();
+static void smsRingLoad();
 static void tcfgSave() {
   Preferences p; p.begin("tsimci", false);
   p.putUChar("v", 1);
@@ -284,6 +297,19 @@ static void cidLoad() {
   p.end();
   if (n != sizeof(s_cid)) tcfgIdClear(&s_cid);
   s_cid_magic = CID_MAGIC;
+}
+static void smsRingSave() {
+  Preferences p; p.begin("tsimsms", false);
+  p.putBytes("ring", &s_sms_ring, sizeof(s_sms_ring));
+  p.end();
+}
+static void smsRingLoad() {
+  if (s_sms_ring_magic == SMS_RING_MAGIC && s_sms_ring.n <= SMS_RING_CAP && s_sms_ring.i < SMS_RING_CAP) return;
+  Preferences p; p.begin("tsimsms", true);
+  size_t n = p.getBytes("ring", &s_sms_ring, sizeof(s_sms_ring));
+  p.end();
+  if (n != sizeof(s_sms_ring) || s_sms_ring.n > SMS_RING_CAP || s_sms_ring.i >= SMS_RING_CAP) smsRingClear(&s_sms_ring);
+  s_sms_ring_magic = SMS_RING_MAGIC;
 }
 static void tcfgApplyCfg(const char *args, char *out, size_t cap);
 static void tcfgLoad();
@@ -358,17 +384,41 @@ static bool respLooksOk(const char *r) {
   return false;
 }
 
+static void smsNoteCmti() {
+  s_cmti_ms = millis();
+  smsDiagAddCmti(&s_sms_diag, s_cmti_ms);
+}
+
+// v1.8.1: modemAT() must still drop leftover bytes so the next reply is clean,
+// but a +CMTI in those bytes is the only signal that a text landed. Remember it.
+static void modemDrainNoticeCmti() {
+  static char line[96];
+  size_t ln = 0;
+  bool saw = false;
+  while (ModemSerial.available()) {
+    char c = (char)ModemSerial.read();
+    if (c == '\n') {
+      line[ln] = 0;
+      if (smsLateLineIsCmti(line)) saw = true;
+      ln = 0;
+    } else if (c != '\r' && ln + 1 < sizeof(line)) line[ln++] = c;
+    else if (ln + 1 >= sizeof(line)) ln = 0;
+  }
+  if (saw) { logf("v1.8.1: +CMTI before AT"); smsNoteCmti(); }
+}
+
 static bool modemAT(const char *cmd, uint32_t timeout_ms = 3000) {
   if (s_tcp_busy) {
     logf("AT BLOCKED (tcp busy): %s", cmd);
     return false;
   }
-  while (ModemSerial.available()) ModemSerial.read();
+  modemDrainNoticeCmti();
   logf(">> %s", cmd);
   ModemSerial.print(cmd);
   ModemSerial.print("\r\n");
   size_t n = modemReadUntil(timeout_ms);
   bool ok = respLooksOk(s_at_resp);
+  if (smsLateLineIsCmti(s_at_resp)) smsNoteCmti();
   if (!ok) logf("<< FAIL (%u): %.180s", (unsigned)n, s_at_resp);
   else if (n < 180) logf("<< %s", s_at_resp);
   else logf("<< OK (%u bytes)", (unsigned)n);
@@ -633,7 +683,7 @@ static float s_bat_idle_fwd(void);
 static void ingestEvent(const char *type, const char *msg) {
   float bat = s_bat_idle_fwd();
   float sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
-  char m[400], lr[170];
+  char m[640], lr[170];
   jsonEsc(m, sizeof(m), msg); jsonEsc(lr, sizeof(lr), s_last_result);
   snprintf(s_ingest_body, sizeof(s_ingest_body),
     "{\"type\":\"%s\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"rr\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
@@ -1885,9 +1935,18 @@ static bool fileMd5(const char *path, size_t padded_len, String &md5_file, Strin
   return true;
 }
 
-// Always leave the Heltec running its app: BOOT high-Z, then RST pulse.
+static void heltecFlushRx() {
+  while (HeltecSerial.available()) HeltecSerial.read();
+}
+
+// Always leave the Heltec running its app: UART back at 115200, BOOT high-Z, then RST pulse.
 static void heltecEndFlash(bool loader_up) {
-  if (loader_up) loader_port_arduino_deinit();
+  if (loader_up) {
+    HeltecSerial.updateBaudRate(115200);
+    delay(20);
+    heltecFlushRx();
+    loader_port_arduino_deinit();
+  }
   pinMode(HELTEC_BOOT_PIN, INPUT);   // release BOOT/GPIO0 first
   delay(20);
   heltecReboot();                    // pulse RST -> normal boot
@@ -1895,9 +1954,60 @@ static void heltecEndFlash(bool loader_up) {
   logf("flash: BOOT released + Heltec reset");
 }
 
-// v1.6.4: flash details reported to the dashboard (chip, image type, address, bytes, verify)
-static char s_flash_info[200] = "";
+// Drop a garbled 460800 session and put the chip back in the ROM bootloader.
+// Does not boot the app. The next connect() pulses RST again.
+static void heltecAbortForRetry() {
+  HeltecSerial.updateBaudRate(115200);
+  delay(20);
+  heltecFlushRx();
+  loader_port_enter_bootloader();
+  loader_port_arduino_deinit();
+}
+
+// v1.6.4 + v1.8.1: chip/image/addr/size plus the step that failed (for the dashboard).
+static char s_flash_info[360] = "";
 static const char *imageKindName(int k) { return k == 2 ? "classic-merged" : k == 1 ? "merged" : "app-only"; }
+
+static const char *loaderErrName(esp_loader_error_t e) {
+  switch (e) {
+    case ESP_LOADER_SUCCESS: return "SUCCESS";
+    case ESP_LOADER_ERROR_FAIL: return "FAIL";
+    case ESP_LOADER_ERROR_TIMEOUT: return "TIMEOUT";
+    case ESP_LOADER_ERROR_IMAGE_SIZE: return "IMAGE_SIZE";
+    case ESP_LOADER_ERROR_INVALID_MD5: return "INVALID_MD5";
+    case ESP_LOADER_ERROR_INVALID_PARAM: return "INVALID_PARAM";
+    case ESP_LOADER_ERROR_INVALID_TARGET: return "INVALID_TARGET";
+    case ESP_LOADER_ERROR_UNSUPPORTED_CHIP: return "UNSUPPORTED_CHIP";
+    case ESP_LOADER_ERROR_UNSUPPORTED_FUNC: return "UNSUPPORTED_FUNC";
+    case ESP_LOADER_ERROR_INVALID_RESPONSE: return "INVALID_RESPONSE";
+    default: return "UNKNOWN";
+  }
+}
+
+static void flashInfoAdd(const char *fmt, ...) {
+  size_t L = strlen(s_flash_info);
+  if (L + 1 >= sizeof(s_flash_info)) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(s_flash_info + L, sizeof(s_flash_info) - L, fmt, ap);
+  va_end(ap);
+}
+
+static void flashNoteFail(const char *step, esp_loader_error_t err, uint32_t baud, uint32_t at, bool retry) {
+  if (!retry) {
+    flashInfoAdd("%sstep=%s err=%d(%s) baud=%u at=%u",
+                 s_flash_info[0] ? " " : "", step, (int)err, loaderErrName(err), (unsigned)baud, (unsigned)at);
+  } else {
+    flashInfoAdd("; retry baud=%u: step=%s err=%d(%s) at=%u",
+                 (unsigned)baud, step, (int)err, loaderErrName(err), (unsigned)at);
+  }
+}
+
+static void flashIngestRetry(const char *step, esp_loader_error_t err) {
+  char m[140];
+  snprintf(m, sizeof(m), "Flash retry at 115200 after step=%s err=%d(%s)", step, (int)err, loaderErrName(err));
+  ingestEvent("update", m);
+}
 
 static bool flashHeltecFromFile(const char *path, const char *url) {
   s_flash_info[0] = 0;
@@ -1929,22 +2039,41 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   cfg.boot_pin = HELTEC_BOOT_PIN;
   cfg.uart_tx_pin = HELTEC_UART_TX_PIN;
   cfg.uart_rx_pin = HELTEC_UART_RX_PIN;
-  loader_port_arduino_init(&cfg);
 
   esp_loader_connect_args_t connect = ESP_LOADER_CONNECT_DEFAULT();
   connect.trials = 15; connect.sync_timeout = 200;
-  esp_loader_error_t err = esp_loader_connect(&connect);
-  if (err != ESP_LOADER_SUCCESS) {
-    logf("flash: connect fail %d, stub", (int)err);
-    err = esp_loader_connect_with_stub(&connect);
-  }
-  if (err != ESP_LOADER_SUCCESS) {
-    logf("flash: connect FAILED %d", (int)err);
-    f.close(); heltecEndFlash(true); return false;
-  }
-  {
-    // v1.6.3: detect target chip and pick merged-image base. Classic ESP32 bootloader lives at 0x1000,
-    // S2/S3/C2/C3/C6/H2 at 0x0. App partition is 0x10000 on all of them.
+  bool base_set = false;
+  bool loader_up = false;
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    const bool retry = attempt > 0;
+    if (!loader_up) {
+      loader_port_arduino_init(&cfg);
+      loader_up = true;
+    }
+    if (retry && !f.seek(0)) {
+      f.close();
+      f = LittleFS.open(path, "r");
+      if (!f) {
+        flashNoteFail("file_read", ESP_LOADER_ERROR_FAIL, 115200, 0, true);
+        heltecEndFlash(loader_up);
+        return false;
+      }
+    }
+
+    esp_loader_error_t err = esp_loader_connect(&connect);
+    bool tried_stub = false;
+    if (err != ESP_LOADER_SUCCESS) {
+      logf("flash: connect fail %d, stub", (int)err);
+      tried_stub = true;
+      err = esp_loader_connect_with_stub(&connect);
+    }
+    if (err != ESP_LOADER_SUCCESS) {
+      logf("flash: connect FAILED %d", (int)err);
+      flashNoteFail(tried_stub ? "connect_stub" : "connect", err, 115200, 0, retry);
+      f.close(); heltecEndFlash(true); return false;
+    }
+
     target_chip_t chip = esp_loader_get_target();
     const char *cn = "unknown";
     switch (chip) {
@@ -1958,80 +2087,147 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
       default: break;
     }
     logf("flash: target chip %s (%d)", cn, (int)chip);
-    progressf("UPDATE", "hammer_and_wrench", 4, "Repeater chip detected: %s", cn);
+    if (!retry) progressf("UPDATE", "hammer_and_wrench", 4, "Repeater chip detected: %s", cn);
     if (chip == ESP8266_CHIP || chip >= ESP_MAX_CHIP || chip == ESP32_RESERVED0_CHIP) {
       setLastResult("FLASH REFUSED: unsupported/unknown repeater chip (%d)", (int)chip);
       logf("flash: unknown chip - refusing");
+      if (!base_set) {
+        snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
+                 cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
+        base_set = true;
+      }
+      flashNoteFail("connect", ESP_LOADER_ERROR_UNSUPPORTED_CHIP, 115200, 0, retry);
       f.close(); heltecEndFlash(true); return false;
     }
     if (kind == 2) {
       if (chip != ESP32_CHIP) {
         setLastResult("FLASH REFUSED: image is classic-ESP32 merged (from 0x1000) but chip is %s", cn);
         logf("flash: 0x1000 merged image on %s - refusing", cn);
+        if (!base_set) {
+          snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
+                   cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
+          base_set = true;
+        }
+        flashNoteFail("connect", ESP_LOADER_ERROR_INVALID_TARGET, 115200, 0, retry);
         f.close(); heltecEndFlash(true); return false;
       }
       addr = 0x1000;
     }
     logf("flash: write address 0x%X (kind=%d, chip=%s)", addr, kind, cn);
-    snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
-             cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
-    { char m[240]; snprintf(m, sizeof(m), "Flashing: %s", s_flash_info); ingestEvent("update", m); }
-  }
-  if (esp_loader_change_transmission_rate(460800) == ESP_LOADER_SUCCESS) {
-    HeltecSerial.updateBaudRate(460800);
-  }
-  err = esp_loader_flash_start(addr, flash_size, FLASH_BLOCK_SIZE);
-  if (err != ESP_LOADER_SUCCESS) {
-    logf("flash: start FAILED %d", (int)err);
-    f.close(); heltecEndFlash(true); return false;
-  }
-  size_t written = 0;
-  int next_pct = 20;
-  while (written < size) {
-    size_t toRead = FLASH_BLOCK_SIZE;
-    if (written + toRead > size) toRead = size - written;
-    size_t got = f.read(s_flash_block, toRead);
-    if (got != toRead) {
-      logf("flash: file read short %u/%u @%u", (unsigned)got, (unsigned)toRead, (unsigned)written);
-      f.close(); heltecEndFlash(true); return false;
+    if (!base_set) {
+      snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
+               cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
+      base_set = true;
+      char m[240];
+      snprintf(m, sizeof(m), "Flashing: %s", s_flash_info);
+      ingestEvent("update", m);
     }
-    // Pass the REAL length: the library pads to the block size itself and its
-    // incremental MD5 then covers only (got+3)&~3 bytes, matching flash_size.
-    err = esp_loader_flash_write(s_flash_block, (uint32_t)got);
+
+    uint32_t baud = 115200;
+    if (!retry) {
+      err = esp_loader_change_transmission_rate(460800);
+      if (err == ESP_LOADER_SUCCESS) {
+        HeltecSerial.updateBaudRate(460800);
+        delay(50);
+        heltecFlushRx();
+        baud = 460800;
+        logf("flash: baud 460800");
+      } else {
+        // The ROM command failed. The local UART is still 115200. Keep going.
+        logf("flash: baud change failed %d (%s), staying at 115200", (int)err, loaderErrName(err));
+      }
+    }
+
+    err = esp_loader_flash_start(addr, flash_size, FLASH_BLOCK_SIZE);
     if (err != ESP_LOADER_SUCCESS) {
-      logf("flash: write fail @%u", (unsigned)written);
+      logf("flash: start FAILED %d (%s) baud=%u", (int)err, loaderErrName(err), (unsigned)baud);
+      if (baud == 460800 && !retry) {
+        flashNoteFail("flash_start", err, baud, 0, false);
+        flashIngestRetry("flash_start", err);
+        heltecAbortForRetry();
+        loader_up = false;
+        continue;
+      }
+      flashNoteFail("flash_start", err, baud, 0, retry);
       f.close(); heltecEndFlash(true); return false;
     }
-    written += got;
-    int pct = (int)((written * 100ULL) / size);
-    if (pct >= next_pct || written >= size) {
-      logf("flash: %d%%", pct);
-      progressf("UPDATE", "hammer_and_wrench", 3, "Flash %d%%", pct);
-      next_pct += 20;
+
+    size_t written = 0;
+    int next_pct = 20;
+    bool file_fail = false, write_fail = false;
+    uint32_t fail_at = 0;
+    esp_loader_error_t write_err = ESP_LOADER_SUCCESS;
+    while (written < size) {
+      size_t toRead = FLASH_BLOCK_SIZE;
+      if (written + toRead > size) toRead = size - written;
+      size_t got = f.read(s_flash_block, toRead);
+      if (got != toRead) {
+        logf("flash: file read short %u/%u @%u", (unsigned)got, (unsigned)toRead, (unsigned)written);
+        file_fail = true; fail_at = (uint32_t)written; break;
+      }
+      // Pass the REAL length: the library pads to the block size itself and its
+      // incremental MD5 then covers only (got+3)&~3 bytes, matching flash_size.
+      err = esp_loader_flash_write(s_flash_block, (uint32_t)got);
+      if (err != ESP_LOADER_SUCCESS) {
+        logf("flash: write fail @%u err=%d (%s)", (unsigned)written, (int)err, loaderErrName(err));
+        write_fail = true; write_err = err; fail_at = (uint32_t)written; break;
+      }
+      written += got;
+      int pct = (int)((written * 100ULL) / size);
+      if (pct >= next_pct || written >= size) {
+        logf("flash: %d%%", pct);
+        progressf("UPDATE", "hammer_and_wrench", 3, "Flash %d%%", pct);
+        next_pct += 20;
+      }
     }
+    if (file_fail) {
+      flashNoteFail("file_read", ESP_LOADER_ERROR_FAIL, baud, fail_at, retry);
+      f.close(); heltecEndFlash(true); return false;
+    }
+    if (write_fail) {
+      if (baud == 460800 && !retry) {
+        flashNoteFail("write", write_err, baud, fail_at, false);
+        flashIngestRetry("write", write_err);
+        heltecAbortForRetry();
+        loader_up = false;
+        continue;
+      }
+      flashNoteFail("write", write_err, baud, fail_at, retry);
+      f.close(); heltecEndFlash(true); return false;
+    }
+
+    // Verify against the MD5 we streamed from the file (independent of the
+    // library's incremental context). Heltec hashes addr..addr+flash_size.
+    // A verify miss is not a baud retry: the bytes were already written.
+    err = esp_loader_flash_verify_known_md5(addr, flash_size, (const uint8_t *)md5_pad.c_str());
+    bool ok = (err == ESP_LOADER_SUCCESS);
+    if (retry) {
+      if (ok) flashInfoAdd("; retry baud=%u: OK written=%u verify=OK", (unsigned)baud, (unsigned)written);
+      else flashNoteFail("verify", err, baud, 0, true);
+    } else {
+      flashInfoAdd(" written=%u verify=%s md5=%s baud=%u",
+                   (unsigned)written, ok ? "OK" : "FAIL", md5_file.c_str(), (unsigned)baud);
+      if (!ok) flashNoteFail("verify", err, baud, 0, false);
+    }
+    if (ok) {
+      logf("flash: MD5 OK  file=%s  heltec=%s", md5_file.c_str(), md5_pad.c_str());
+      progressf("UPDATE", "white_check_mark", 3, "MD5 verify OK %s", md5_file.c_str());
+      esp_loader_flash_finish(true);
+      delay(200);
+    } else {
+      logf("flash: MD5 FAILED err=%d expected(file)=%s (Heltec value printed by [flasher] above)",
+           (int)err, md5_pad.c_str());
+      progressf("UPDATE", "x", 5, "MD5 mismatch, file=%s", md5_file.c_str());
+    }
+    f.close();
+    heltecEndFlash(true);
+    if (ok) progressf("UPDATE", "recycle", 3, "Heltec reset done");
+    return ok;
   }
   f.close();
-
-  // Verify against the MD5 we streamed from the file (independent of the
-  // library's incremental context). Heltec hashes addr..addr+flash_size.
-  err = esp_loader_flash_verify_known_md5(addr, flash_size, (const uint8_t *)md5_pad.c_str());
-  bool ok = (err == ESP_LOADER_SUCCESS);
-  { size_t L = strlen(s_flash_info);
-    snprintf(s_flash_info + L, sizeof(s_flash_info) - L, " written=%u verify=%s md5=%s",
-             (unsigned)written, ok ? "OK" : "FAIL", md5_file.c_str()); }
-  if (ok) {
-    logf("flash: MD5 OK  file=%s  heltec=%s", md5_file.c_str(), md5_pad.c_str());
-    progressf("UPDATE", "white_check_mark", 3, "MD5 verify OK %s", md5_file.c_str());
-    esp_loader_flash_finish(true);
-    delay(200);
-  } else {
-    logf("flash: MD5 FAILED err=%d expected(file)=%s (Heltec value printed by [flasher] above)",
-         (int)err, md5_pad.c_str());
-    progressf("UPDATE", "x", 5, "MD5 mismatch, file=%s", md5_file.c_str());
-  }
-  heltecEndFlash(true);   // ALWAYS: release BOOT + reset, success or failure
-  if (ok) progressf("UPDATE", "recycle", 3, "Heltec reset done");
-  return ok;
+  if (loader_up) heltecEndFlash(true);
+  else heltecEndFlash(false);
+  return false;
 }
 
 // -------------------- POWER: battery calibration + low-battery repeat protection (v1.6.5) --------------------
@@ -2588,7 +2784,7 @@ static bool doUpdate(const char *url, bool flash_too) {
     setLastResult("FAIL: flash");
     progressf("UPDATE", "x", 5, "FAIL: flash");
   }
-  { char m[380]; snprintf(m, sizeof(m), "%s %.160s%s%s", flashed ? "SUCCESS:" : "FAIL: flash", url,
+  { char m[560]; snprintf(m, sizeof(m), "%s %.100s%s%s", flashed ? "SUCCESS:" : "FAIL: flash", url,
                           s_flash_info[0] ? " | " : "", s_flash_info); ingestEvent("update", m); }
   return flashed;
 }
@@ -2719,7 +2915,7 @@ static void cfgSnapshot() {
 // A heartbeat is posted to the dashboard after a recovery, after a failure that was not reported yet, and (hb=1,
 // default) after every check. Queued dashboard commands are never fetched on a watchdog wake. Texts already stored
 // on the modem are processed only when sms=1 (default off). No SMS is ever sent.
-static void processSmsInbox(bool unread_only = false);
+static int processSmsInbox(bool force_list = false);
 static void lpApply();   // v1.7.9: defined with the watchdog, after wdRegistered()
 static void wdSave() {
   Preferences p; p.begin("tsimwd", false);
@@ -3428,10 +3624,10 @@ static int parseOneCmgl(const char **p_inout) {
   return index;
 }
 
-// v1.6.6: SMS replay protection.
-//  - each message is deleted from the modem BEFORE its command runs (an update reboot can no longer leave it stored)
-//  - in the read-all fallback, already-read (REC READ) messages are discarded, never executed
-//  (No time-based dedupe: a legitimate Retry of the same command always runs.)
+// v1.6.6: each message is deleted BEFORE its command runs (an update reboot cannot leave it stored).
+// v1.8.1: REC READ is no longer "stale". A hash of timestamp+sender+body (RTC + NVS)
+// skips a text that already ran. A dashboard Retry has a new timestamp, so it runs.
+// See sms_queue.h for why the text that rang RI was missing from the first CMGL.
 static bool looksLikeCommand(const char *body) {
   static char n[1024]; strncpy(n, body, sizeof(n) - 1); n[sizeof(n) - 1] = 0; normalizeSmsBody(n);
   size_t l = strlen(n); if (l >= 4 && strcasecmp(n + l - 4, " ACK") == 0) { n[l - 4] = 0; normalizeSmsBody(n); }
@@ -3439,42 +3635,48 @@ static bool looksLikeCommand(const char *body) {
          !strncasecmp(n, "UPDATE ", 7) || !strncasecmp(n, "TSIMUPDATE ", 11);   // v1.7.9: STATUS AUTO is a command
 }
 
-static void processSmsInbox(bool unread_only) {
-  // v1.7.11: one AT+CPMS? per inbox pass (read+unread count). No extra wait.
-  if (modemAT("AT+CPMS?", 3000)) smsDiagAddStore(&s_sms_diag, smsDiagParseCpms(s_at_resp));
-  else smsDiagAddStore(&s_sms_diag, -1);
-  // Read with UCS2 so every char ('_', '@', '$', ...) arrives as unambiguous hex.
-  modemAT("AT+CSCS=\"UCS2\"");
-  bool all_mode = false;
-  bool unread_ok = modemAT("AT+CMGL=\"REC UNREAD\"", 15000);
-  bool has_unread = unread_ok && strstr(s_at_resp, "+CMGL:");
-  // v1.7.9: the pre-sleep catch-up only wants new texts. An empty unread list is enough;
-  // do not scan the whole store (that is the normal inbox fallback, and it can be slow).
-  if (!has_unread) {
-    if (unread_only && unread_ok) { modemAT("AT+CSCS=\"GSM\""); logf("v1.7.9: no unread SMS before sleep"); return; }
-    modemAT("AT+CMGL=\"ALL\"", 15000); all_mode = true;
+struct SmsHeld {
+  int idx;
+  uint32_t key;
+  uint32_t hash;
+  char ts[32];
+  char from[160];
+  char body[1024];
+};
+
+// CPMS, then CMGL "ALL" when the count says there is something (or force).
+// Deletes what it collected. Does not execute. Returns how many were collected.
+static int smsCollectDelete(SmsHeld *msgs, int cap, bool force_list) {
+  int used = -1;
+  if (modemAT("AT+CPMS?", 3000)) used = smsDiagParseCpms(s_at_resp);
+  smsDiagAddStore(&s_sms_diag, used);
+  if (!smsShouldList(used, force_list)) {
+    logf("v1.8.1: SMS store %d, skip CMGL", used);
+    s_sms_pass_done_ms = millis();
+    return 0;
   }
+  modemAT("AT+CSCS=\"UCS2\"");
+  bool listed = modemAT("AT+CMGL=\"ALL\"", 15000);
   static char inbox[8192];
   strncpy(inbox, s_at_resp, sizeof(inbox) - 1); inbox[sizeof(inbox) - 1] = 0;
-  modemAT("AT+CSCS=\"GSM\"");  // restore default charset
-  // Pass 1: collect messages (and GSM re-reads) while they still exist on the modem.
-  struct Msg { int idx; bool stale; char ts[32]; char from[160]; char body[1024]; };
-  static Msg msgs[10];
+  modemAT("AT+CSCS=\"GSM\"");
+  if (!listed && !strstr(inbox, "+CMGL:")) {
+    s_sms_pass_done_ms = millis();
+    return 0;
+  }
   const char *cursor = inbox;
   int count = 0;
-  while (count < 10) {
+  while (count < cap) {
     int idx = parseOneCmgl(&cursor);
     if (idx < 0) break;
-    Msg &m = msgs[count++];
+    SmsHeld &m = msgs[count];
+    memset(&m, 0, sizeof(m));
     m.idx = idx;
-    m.stale = all_mode && strstr(s_sms_stat, "READ") && !strstr(s_sms_stat, "UNREAD");
-    strncpy(m.ts, s_sms_ts, sizeof(m.ts) - 1); m.ts[sizeof(m.ts) - 1] = 0;
-    strncpy(m.from, s_sms_from, sizeof(m.from) - 1); m.from[sizeof(m.from) - 1] = 0;
-    strncpy(m.body, s_sms_body, sizeof(m.body) - 1); m.body[sizeof(m.body) - 1] = 0;
+    strncpy(m.ts, s_sms_ts, sizeof(m.ts) - 1);
+    strncpy(m.from, s_sms_from, sizeof(m.from) - 1);
+    strncpy(m.body, s_sms_body, sizeof(m.body) - 1);
     logf("SMS[%d] stat=%s ts=%s from=%s body='%.200s'", idx, s_sms_stat, s_sms_ts, m.from, m.body);
-    if (!m.stale && !looksLikeCommand(m.body)) {
-      // v1.5.1: some texts come back from UCS2 CMGL as short/odd hex (e.g. "005300" for STATUS).
-      // Re-read this one message in GSM charset (before it is deleted).
+    if (!looksLikeCommand(m.body)) {
       snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGR=%d", idx);
       if (modemAT(s_cmdbuf, 5000)) {
         const char *h = strstr(s_at_resp, "+CMGR:");
@@ -3488,29 +3690,71 @@ static void processSmsInbox(bool unread_only) {
         }
       }
     }
-    if (!m.stale) smsDiagAddText(&s_sms_diag, m.idx, m.ts, (uint32_t)millis());
+    m.key = smsTsKey(m.ts);
+    m.hash = smsTextHash(m.ts, m.from, m.body);
+    smsDiagAddText(&s_sms_diag, m.idx, m.ts, (uint32_t)millis());
+    count++;
   }
-  // Pass 2: delete every collected message first, so nothing can be replayed after a reboot.
   for (int i = 0; i < count; i++) {
     snprintf(s_cmdbuf, sizeof(s_cmdbuf), "AT+CMGD=%d", msgs[i].idx);
     modemAT(s_cmdbuf, 5000);
   }
-  // Pass 3: execute. v1.7.6: identical STATUS / CMD texts in one pass run once (all were deleted in pass 2).
-  static char norm[10][16]; const char *seen[10]; int nseen = 0, merged = 0;
-  for (int i = 0; i < count; i++) {
-    Msg &m = msgs[i];
-    if (m.stale) { logf("SMS[%d] ignored: already read (stale)", m.idx); continue; }
-    char *n = norm[nseen]; strncpy(n, m.body, sizeof(norm[0]) - 1); n[sizeof(norm[0]) - 1] = 0;
+  s_sms_pass_done_ms = millis();
+  return count;
+}
+
+// Returns how many texts were executed (not ring skips, not same-pass merges).
+static int processSmsInbox(bool force_list) {
+  bool first = !s_sms_opened;
+  s_sms_opened = true;
+  static SmsHeld msgs[12];
+  int n = smsCollectDelete(msgs, 10, force_list);
+  int n2 = 0;
+  // One recheck after deletes: CMGD makes the modem send SMMA, and the text
+  // that rang RI often arrives in that gap. Execute both batches oldest-first.
+  if (n > 0 && n < 12) n2 = smsCollectDelete(msgs + n, 12 - n, false);
+  int total = n + (n2 > 0 ? n2 : 0);
+  if (total <= 0) return 0;
+  int ord[12];
+  uint32_t keys[12];
+  for (int i = 0; i < total; i++) { ord[i] = i; keys[i] = msgs[i].key; }
+  smsOrderOldest(ord, total, keys);
+  static char norm[12][16];
+  const char *seen[12];
+  int nseen = 0, merged = 0, ran = 0;
+  int64_t nowu = rtcNow();
+  for (int k = 0; k < total; k++) {
+    SmsHeld &m = msgs[ord[k]];
+    if (smsRingHas(&s_sms_ring, m.hash)) {
+      logf("SMS[%d] skipped: already executed", m.idx);
+      continue;
+    }
+    char *nb = norm[nseen < 12 ? nseen : 11];
+    strncpy(nb, m.body, sizeof(norm[0]) - 1); nb[sizeof(norm[0]) - 1] = 0;
     if (strlen(m.body) < sizeof(norm[0])) {
-      normalizeSmsBody(n);
-      size_t l = strlen(n); if (l >= 4 && strcasecmp(n + l - 4, " ACK") == 0) { n[l - 4] = 0; normalizeSmsBody(n); }
-    } else n[0] = 0;   // long bodies (UPDATE ...) are never merged
-    if (smsIsDup(seen, nseen, n)) { merged++; logf("SMS[%d] merged: same %s already ran this pass", m.idx, n); continue; }
-    if (smsMergeable(n)) seen[nseen++] = n;
+      normalizeSmsBody(nb);
+      size_t l = strlen(nb); if (l >= 4 && strcasecmp(nb + l - 4, " ACK") == 0) { nb[l - 4] = 0; normalizeSmsBody(nb); }
+    } else nb[0] = 0;
+    if (smsIsDup(seen, nseen, nb)) { merged++; logf("SMS[%d] merged: same %s already ran this pass", m.idx, nb); continue; }
+    smsRingPush(&s_sms_ring, m.hash);
+    smsRingSave();
+    if (smsMergeable(nb) && nseen < 12) seen[nseen++] = nb;
     handleCommand(m.from, m.body);
+    ran++;
+    s_sms_new++;
+    // The text already sitting in the store at the first CMGL is usually the
+    // previous one. It still runs. It does not end the RI wait unless its
+    // network time is within a few minutes, or it arrived on the post-delete
+    // recheck / a later poll (that is the text that rang the pin).
+    bool arrived_later = !first || ord[k] >= n;
+    if (arrived_later || smsTsRecent(m.ts, nowu, SMS_RECENT_S)) {
+      s_sms_trigger++;
+      smsDiagSetFound(&s_sms_diag);
+    }
   }
   if (merged) { char em[64]; snprintf(em, sizeof(em), "Merged %d duplicate text(s) (ran once)", merged); ingestEvent("event", em); }
-  logf("SMS processed: %d", count);
+  logf("SMS processed: collected=%d executed=%d", total, ran);
+  return ran;
 }
 
 // v1.7.10: drain modem UART for a +CMTI URC. Does not send AT (modemAT would flush the URC).
@@ -3525,7 +3769,7 @@ static bool modemPollCmti() {
     if (c == '\r') continue;
     if (c == '\n') {
       line[n] = 0;
-      if (smsLateLineIsCmti(line)) { logf("v1.7.10: %s", line); saw = true; smsDiagAddCmti(&s_sms_diag, (uint32_t)millis()); }
+      if (smsLateLineIsCmti(line)) { logf("v1.7.10: %s", line); saw = true; smsNoteCmti(); }
       n = 0;
     } else if (n + 1 < sizeof(line)) line[n++] = c;
     else n = 0;
@@ -3599,47 +3843,56 @@ static void sleepQuick() {
 
 static void goToSleep() {
   if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
-  // v1.7.9: one unread-SMS pass, then sleep. Not a timed linger. Only after a wake that already
-  // reads the inbox (text ring or GPIO6 STATUS). A watchdog wake stays on WDCFG sms=0|1, which
-  // wdRun already honored. Messages are deleted before they run, so this cannot replay them.
-  // Sleep is still modemEnableSleep (DTR high, AT+CSCLK=1). The modem is not powered off.
-  // v1.7.10: a text (RI/ext0) wake keeps the modem up until ~22 s after boot so the +CMTI for
-  // the text that rang RI can land (with eDRX it often is not in the store at the first pass).
-  // Extra wait is at most ~20 s, 0 if this wake already ran past 22 s. At most 3 extra inbox
-  // passes on +CMTI, then one final unread check. UPDATE/TLS aborts the wait (same as before).
+  // v1.8.1: on an RI wake the triggering text is often not stored yet at the first
+  // CMGL, and +CMTI is dropped by modemAT()'s flush. Poll CPMS every ~2.5 s until
+  // one new text has run, or until ~30 s from boot. Other inbox wakes still do one
+  // catch-up. UPDATE/TLS abort the wait (same flags as v1.7.10).
   const bool sms_wake = smsWakeUsesLight((int)s_wake_cause);
   bool inbox_wake = sms_wake || s_tf_status_boot || s_did_status || s_did_cmd;
-  if (sms_wake && smsLateWaitOk(true, s_modem_ready, s_tcp_busy, s_busy_update)) {
-    uint32_t remain = smsLateRemainMs(millis());
-    logf("v1.7.10: SMS late window %u ms left (keep modem up until ~22 s after wake)", (unsigned)remain);
-    uint8_t extra = 0;
+  if (sms_wake && smsLateWaitOk(true, s_modem_ready, s_tcp_busy, s_busy_update) && !smsTriggerFound(s_sms_trigger)) {
+    uint32_t remain = smsLateRemainFor(millis(), true);
+    logf("v1.8.1: SMS late window %u ms (poll every %u ms until a new text)", (unsigned)remain, (unsigned)SMS_LATE_POLL_MS);
     uint32_t deadline = millis() + remain;
-    while ((int32_t)(deadline - millis()) > 0) {
+    uint32_t last_poll = s_sms_pass_done_ms ? s_sms_pass_done_ms : millis();
+    while ((int32_t)(deadline - millis()) > 0 && !smsTriggerFound(s_sms_trigger)) {
       if (s_tcp_busy || s_busy_update) break;
-      if (smsLateShouldRecheck(modemPollCmti(), extra, SMS_LATE_MAX_PASSES)) {
-        extra++;
-        logf("v1.7.10: +CMTI during late window, unread pass %u/%u", (unsigned)extra, (unsigned)SMS_LATE_MAX_PASSES);
-        processSmsInbox(true);
-        lpApply();  // v1.7.10: WDCFG in this pass (edrx=0/psm=0) is sent this wake; no-op if clean/busy
+      modemPollCmti();
+      if (smsPollDue(millis(), last_poll, SMS_LATE_POLL_MS)) {
+        processSmsInbox(false);
+        last_poll = millis();
+        lpApply();
         if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
       }
       hwAwakeService();
       delay(20);
     }
-    if (!s_sms_catch_done && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
+    if (!smsTriggerFound(s_sms_trigger) && !s_sms_catch_done && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
       s_sms_catch_done = true;
-      logf("v1.7.10: final unread SMS check after late window");
+      logf("v1.8.1: final SMS check after late window");
+      processSmsInbox(false);
+      lpApply();
+      if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+    }
+  } else if (!s_sms_catch_done && inbox_wake && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)
+             && !(sms_wake && smsTriggerFound(s_sms_trigger))) {
+    s_sms_catch_done = true;
+    processSmsInbox(false);
+    lpApply();
+    if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
+  }
+  hwAwakeService();   // v1.7.4: a Heltec reboot seen during this wake is handled before sleeping
+  // v1.8.1: don't sleep through an RI pulse or a +CMTI that landed after the last pass.
+  if (s_modem_ready && smsCatchupBeforeSleep(true, s_tcp_busy, s_busy_update)) {
+    pinMode(MODEM_RI_PIN, INPUT);
+    bool ri_low = digitalRead(MODEM_RI_PIN) == LOW;
+    bool cmti_after = smsCmtiAfterPass(s_cmti_ms, s_sms_pass_done_ms);
+    if (smsSleepExtraPass(ri_low, cmti_after)) {
+      logf("v1.8.1: SMS pass before sleep ri=%d cmti_after=%d", (int)ri_low, (int)cmti_after);
       processSmsInbox(true);
       lpApply();
       if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
     }
-  } else if (!s_sms_catch_done && inbox_wake && smsCatchupBeforeSleep(s_modem_ready, s_tcp_busy, s_busy_update)) {
-    s_sms_catch_done = true;
-    processSmsInbox(true);
-    lpApply();  // v1.7.10: same dirty check as setup(); skipped during TLS/update / not registered
-    if (s_busy_update) { logf("sleep deferred — UPDATE running"); return; }
   }
-  hwAwakeService();   // v1.7.4: a Heltec reboot seen during this wake is handled before sleeping
   heltecMonStop();
   g6DiagStop();
   gpsHousekeep();
@@ -3755,6 +4008,7 @@ void setup() {
   deadlineArm(AWAKE_MAX_S);   // v1.7.2: first thing, so nothing after this can keep the T-SIM awake forever
   s_wake_cause = esp_sleep_get_wakeup_cause();   // v1.7.9: before the USB settle, so a field wake can skip it
   smsDiagBegin(&s_sms_diag, (int)s_wake_cause);  // v1.7.11: timing only; does not add a wait
+  s_sms_new = 0; s_sms_trigger = 0; s_sms_opened = false; s_cmti_ms = 0; s_sms_pass_done_ms = 0;
   bool fast = (s_wake_cause == ESP_SLEEP_WAKEUP_EXT0) || (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER);
   Serial.begin(115200);
   if (fieldWake()) Serial.setTxTimeoutMs(10);   // v1.7.9: an idle USB host must not stall each log line (default 100 ms)
@@ -3774,6 +4028,7 @@ void setup() {
   pwrLoad();
   gpsLoad(); csLoad(); wdLoad();
   tcfgLoad(); cidLoad();   // v1.8.0: unified check-ins (seed tsimci from legacy keys on first boot)
+  smsRingLoad();            // v1.8.1: texts already executed (RTC, else NVS)
   pwrReadIdle();   // v1.6.5: idle battery, before the modem is touched
   // v1.7.1 watchdog timer wake. The RTC clock drifts, so a wake up to 10% early still counts; with battery checks off
   // the watchdog is the only timer left (GNSS warm-window wakes and OTA verification keep the full boot path).

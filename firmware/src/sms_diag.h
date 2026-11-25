@@ -26,6 +26,8 @@ struct SmsDiag {
   uint8_t ntx;
   uint32_t cmti_ms[SMS_DIAG_MAX_CMTI];
   uint8_t ncmti;
+  uint8_t passes;  // v1.8.1: total inbox passes this wake (not capped at 4)
+  uint8_t tf;      // v1.8.1: 1 once a new text was executed this wake
   uint8_t on;
 };
 
@@ -40,7 +42,9 @@ static inline void smsDiagBegin(SmsDiag *d, int wake) {
 
 // used = messages in the modem store (read + unread). -1 if this pass could not read it.
 static inline void smsDiagAddStore(SmsDiag *d, int used) {
-  if (!d || d->npass >= SMS_DIAG_MAX_PASSES) return;
+  if (!d) return;
+  if (d->passes < 255) d->passes++;
+  if (d->npass >= SMS_DIAG_MAX_PASSES) return;
   d->store[d->npass++] = used;
 }
 
@@ -66,6 +70,11 @@ static inline void smsDiagAddCmti(SmsDiag *d, uint32_t ms) {
   d->cmti_ms[d->ncmti++] = ms;
 }
 
+static inline void smsDiagSetFound(SmsDiag *d) {
+  if (!d) return;
+  d->tf = 1;
+}
+
 // AT+CPMS? → used count. Prefers the "SM" store (the SMS inbox). -1 if unparseable.
 // Typical: +CPMS: "SM",3,50,"SM",3,50,"SM",3,50
 static inline int smsDiagParseCpms(const char *resp) {
@@ -88,10 +97,10 @@ static inline int smsDiagParseCpms(const char *resp) {
 // Empty (returns 0, writes nothing) when this wake recorded no pass, text, or +CMTI.
 static inline size_t smsDiagJson(const SmsDiag *d, char *out, size_t cap) {
   if (!d || !d->on || !out || cap < 8) return 0;
-  if (!d->npass && !d->ntx && !d->ncmti) return 0;
+  if (!d->npass && !d->ntx && !d->ncmti && !d->passes && !d->tf) return 0;
   char tmp[512];
   size_t o = 0;
-  int n = snprintf(tmp, sizeof(tmp), ",\"sd\":{\"w\":%d", d->wake);
+  int n = snprintf(tmp, sizeof(tmp), ",\"sd\":{\"w\":%d,\"np\":%u,\"tf\":%u", d->wake, (unsigned)d->passes, (unsigned)d->tf);
   if (n < 0 || (size_t)n >= sizeof(tmp)) return 0;
   o = (size_t)n;
   int nstore = 0;

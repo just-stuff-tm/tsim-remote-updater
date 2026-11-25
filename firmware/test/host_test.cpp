@@ -4,6 +4,7 @@
 #include "tsim_frame.h"
 #include "wake_path.h"
 #include "sms_diag.h"
+#include "sms_queue.h"
 #include "tcfg.h"
 #include <cassert>
 #include <cstdio>
@@ -476,5 +477,66 @@ int main() {
     assert(!strcmp(tcfgKindName(TCFG_KIND_CFGSNAP), "CFGSNAP"));
   }
   printf("v1.8.0 host tests OK (TCFG parse, legacy map, seed, scheduler, silent Off, dedupe, supersede)\n");
+
+  // 16) v1.8.1: SMS hash ring, oldest-first order, poll / late-window decisions.
+  assert(smsLateRemainFor(0, false) == smsLateRemainMs(0));
+  assert(smsLateRemainFor(3000, false) == smsLateRemainMs(3000));
+  assert(smsLateRemainFor(22000, false) == 0);
+  assert(smsLateRemainFor(0, true) == 30000u);
+  assert(smsLateRemainFor(22000, true) == 8000u);
+  assert(smsLateRemainFor(30000, true) == 0);
+  assert(SMS_LATE_POLL_MS == 2500u);
+  assert(smsPollDue(2500, 0, SMS_LATE_POLL_MS));
+  assert(!smsPollDue(2499, 0, SMS_LATE_POLL_MS));
+  assert(smsPollDue(100, 0xFFFFFFF0u, 32));  // millis wrap
+  assert(smsShouldList(0, false) == false);
+  assert(smsShouldList(1, false));
+  assert(smsShouldList(0, true));
+  assert(smsShouldList(-1, false));
+  assert(smsTriggerFound(1) && !smsTriggerFound(0));
+  assert(smsSleepExtraPass(true, false));
+  assert(smsSleepExtraPass(false, true));
+  assert(!smsSleepExtraPass(false, false));
+  assert(!smsCmtiAfterPass(0, 0));
+  assert(!smsCmtiAfterPass(5000, 5000));
+  assert(smsCmtiAfterPass(6000, 5000));
+  assert(!smsCmtiAfterPass(100, 5000));
+  assert(smsCmtiAfterPass(10, 0xFFFFFFF0u));  // wrap: 10 is after 0xFFFFFFF0
+  uint32_t h1 = smsTextHash("26/11/24,18:21:04+04", "+15551212", "UPDATE https://x");
+  uint32_t h2 = smsTextHash("26/11/24,18:21:04+04", "+15551212", "UPDATE https://x");
+  uint32_t h3 = smsTextHash("26/11/24,23:20:42+04", "+15551212", "UPDATE https://x");
+  assert(h1 == h2);
+  assert(h1 != h3);  // a Retry is a new timestamp
+  assert(smsTextHash("ab", "c", "") != smsTextHash("a", "bc", ""));
+  SmsRing ring; smsRingClear(&ring);
+  assert(!smsRingHas(&ring, 0));
+  smsRingPush(&ring, 0);
+  assert(smsRingHas(&ring, 0));  // hash 0 is a real entry
+  for (uint32_t i = 1; i <= 16; i++) smsRingPush(&ring, i);
+  assert(ring.n == 16);
+  assert(!smsRingHas(&ring, 0));  // evicted
+  assert(smsRingHas(&ring, 1) && smsRingHas(&ring, 16));
+  uint32_t keys[4] = { 100, 0, 50, 50 };
+  int idx[4] = { 0, 1, 2, 3 };
+  smsOrderOldest(idx, 4, keys);
+  assert(idx[0] == 1 && idx[1] == 2 && idx[2] == 3 && idx[3] == 0);  // 0, then the two 50s in order, then 100
+  assert(smsTsKey("nope") == 0);
+  assert(smsTsKey("26/11/24,18:21:04+04") < smsTsKey("26/11/24,23:20:42+04"));
+  // 2026-11-24 22:20:53 UTC. Modem stamp is UTC+1 ("+04" quarters).
+  const int64_t nowu = 1795558853LL;  // 2026-11-24 22:20:53 UTC
+  assert(smsTsRecent("26/11/24,23:20:42+04", nowu, 180));       // 22:20:42 UTC, 11 s earlier
+  assert(!smsTsRecent("26/11/24,18:21:04+04", nowu, 180));      // 17:21:04 UTC, hours earlier
+  assert(!smsTsRecent("26/11/24,23:20:42", nowu, 180));         // no timezone: not recent
+  assert(!smsTsRecent("26/11/24,23:20:42+04", 1000, 180));      // clock not set
+  SmsDiag sd; smsDiagBegin(&sd, 2);
+  for (int i = 0; i < 5; i++) smsDiagAddStore(&sd, 1);
+  assert(sd.npass == 4);
+  assert(sd.passes == 5);
+  smsDiagSetFound(&sd);
+  char js181[512];
+  assert(smsDiagJson(&sd, js181, sizeof(js181)) > 0);
+  assert(strstr(js181, "\"np\":5"));
+  assert(strstr(js181, "\"tf\":1"));
+  printf("v1.8.1 host tests OK (SMS ring, order, poll, recent text)\n");
   return 0;
 }

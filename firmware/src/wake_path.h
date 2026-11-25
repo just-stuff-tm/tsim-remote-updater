@@ -110,3 +110,17 @@ static inline bool smsLateShouldRecheck(bool saw_cmti, unsigned extra_done, unsi
 static inline bool smsLateLineIsCmti(const char *line) {
   return line && strstr(line, "+CMTI") != nullptr;
 }
+
+// v1.8.1: on an RI wake the text that rang the pin is often stored a few seconds
+// after the first CMGL, and +CMTI is routinely lost because modemAT() flushes the
+// UART. Poll the store on a timer instead of waiting for that URC. The 22 s
+// window stays for a wake that already ran a new text. Only an RI wake that has
+// not executed one yet may stay up to SMS_LATE_EXT_WINDOW_MS (30 s from boot).
+#define SMS_LATE_POLL_MS       2500u
+#define SMS_LATE_EXT_WINDOW_MS 30000u
+
+static inline uint32_t smsLateRemainFor(uint32_t now_ms, bool extend) {
+  if (!extend) return smsLateRemainMs(now_ms);
+  if (now_ms >= SMS_LATE_EXT_WINDOW_MS) return 0;
+  return SMS_LATE_EXT_WINDOW_MS - now_ms;
+}

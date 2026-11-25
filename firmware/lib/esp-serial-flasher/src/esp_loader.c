@@ -28,6 +28,12 @@
 #define DEFAULT_FLASH_TIMEOUT 3000
 #define LOAD_RAM_TIMEOUT_PER_MB 2000000
 #define MD5_TIMEOUT_PER_MB 8000
+/* esptool ERASE_REGION_TIMEOUT_PER_MB is 30000. The old 10000 made a ~1.2 MB
+ * image time out at ~12 s, which is also how a dead 460800 link showed up
+ * (flash_begin returned before any erase reached the chip). */
+#ifndef SERIAL_FLASHER_ERASE_REGION_TIMEOUT_PER_MB
+#define SERIAL_FLASHER_ERASE_REGION_TIMEOUT_PER_MB 30000
+#endif
 
 typedef enum {
     SPI_FLASH_READ_ID = 0x9F
@@ -327,16 +333,26 @@ esp_loader_error_t esp_loader_flash_start(uint32_t offset, uint32_t image_size, 
 
     /* Flash size will be known in advance if we're in secure download mode or we already read it*/
     if (s_target_flash_size == 0) {
-        if (esp_loader_flash_detect_size(&s_target_flash_size) == ESP_LOADER_SUCCESS) {
+        esp_loader_error_t detect_err = esp_loader_flash_detect_size(&s_target_flash_size);
+        if (detect_err == ESP_LOADER_SUCCESS) {
             if (image_size + offset > s_target_flash_size) {
                 return ESP_LOADER_ERROR_IMAGE_SIZE;
             }
 
             loader_port_start_timer(DEFAULT_TIMEOUT);
             RETURN_ON_ERROR(loader_spi_parameters(s_target_flash_size));
-        } else {
+        } else if (detect_err == ESP_LOADER_ERROR_UNSUPPORTED_CHIP) {
+            /* The ID read completed, but the size byte is not in the table.
+             * That is not a dead link, so keep the 2 MB fallback. */
             loader_port_debug_print("Flash size detection failed, falling back to default");
             s_target_flash_size = DEFAULT_FLASH_SIZE;
+        } else {
+            /* TIMEOUT / FAIL / INVALID_RESPONSE: the SPI read did not complete.
+             * Assuming 2 MB hides a broken baud rate and flash_begin then waits
+             * out the erase timer. Surface it so the caller can reconnect. */
+            loader_port_debug_print("Flash size detection failed, link looks down");
+            s_target_flash_size = 0;
+            return detect_err;
         }
     }
 
@@ -348,7 +364,7 @@ esp_loader_error_t esp_loader_flash_start(uint32_t offset, uint32_t image_size, 
     const uint32_t erase_size = calc_erase_size(esp_loader_get_target(), offset, image_size);
     const uint32_t blocks_to_write = (image_size + block_size - 1) / block_size;
 
-    const uint32_t erase_region_timeout_per_mb = 10000;
+    const uint32_t erase_region_timeout_per_mb = SERIAL_FLASHER_ERASE_REGION_TIMEOUT_PER_MB;
     loader_port_start_timer(timeout_per_mb(erase_size, erase_region_timeout_per_mb));
     return loader_flash_begin_cmd(offset, erase_size, block_size, blocks_to_write, encryption_in_cmd);
 }
