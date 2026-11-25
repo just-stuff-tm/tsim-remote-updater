@@ -538,5 +538,21 @@ int main() {
   assert(strstr(js181, "\"np\":5"));
   assert(strstr(js181, "\"tf\":1"));
   printf("v1.8.1 host tests OK (SMS ring, order, poll, recent text)\n");
+
+  // 17) v1.8.2: tf is any text that will run, not only a recent one.
+  assert(smsCountsAsNewText(false, false));
+  assert(!smsCountsAsNewText(true, false));
+  assert(!smsCountsAsNewText(false, true));
+  assert(!smsCountsAsNewText(true, true));
+  SmsDiag execd; smsDiagBegin(&execd, 0);
+  assert(execd.tf == 0);
+  const bool old_text = !smsTsRecent("26/11/24,18:21:04+04", nowu, 180);
+  assert(old_text);
+  if (smsCountsAsNewText(false, false)) smsDiagSetFound(&execd);
+  assert(execd.tf == 1);
+  char js182[256];
+  assert(smsDiagJson(&execd, js182, sizeof(js182)) > 0);
+  assert(strstr(js182, "\"tf\":1"));
+  printf("v1.8.2 host tests OK (text executed flag)\n");
   return 0;
 }

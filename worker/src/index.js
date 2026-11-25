@@ -578,28 +578,41 @@ function flashHint(step, name) {
   return "";
 }
 function flashByte(st) { return st && st.step === "write" && st.at ? " (byte " + flashCommas(st.at) + ")" : ""; }
-// Plain explanation of a v1.8.1 flash result. Null for older messages (no step= / retry baud=).
+// Plain explanation of a v1.8.1+ flash result. Null for older messages (no step= / retry baud=).
+// Every "; retry ..." chunk is described. One retry keeps the v1.8.1 "Retried at" wording.
+// The hint follows the last failed attempt (the first failure, when the last attempt succeeded).
 export function explainFlash(msg) {
   const s = String(msg || "");
   if (!/step=/.test(s) && !/retry baud=/.test(s)) return null;
   const parts = s.split(/;\s*retry\s+/i);
   const first = flashStepOf(parts[0]);
-  let retry = null, retryOk = false, retryBaud = null;
-  if (parts[1]) {
-    const rm = parts[1].match(/baud=(\d+)/);
-    retryBaud = rm ? rm[1] : null;
-    if (/\bOK\b/.test(parts[1]) && !/step=/.test(parts[1])) retryOk = true;
-    else retry = flashStepOf(parts[1]);
+  const retries = [];
+  for (let i = 1; i < parts.length; i++) {
+    const chunk = parts[i];
+    const rm = chunk.match(/baud=(\d+)/);
+    const baud = rm ? rm[1] : null;
+    if (/\bOK\b/.test(chunk) && !/step=/.test(chunk)) retries.push({ ok: true, baud });
+    else {
+      const st = flashStepOf(chunk);
+      if (st) retries.push({ ok: false, baud: baud || st.baud, step: st });
+      else retries.push({ ok: false, baud, step: null });
+    }
   }
-  if (!first && !retryOk) return null;
+  if (!first && !retries.some((r) => r.ok)) return null;
   let text = "";
   if (first) text = "Flash failed at: " + flashNoun(first.step) + " — " + flashDetail(first.step, first.name, first.baud) + flashByte(first) + ".";
-  if (retryOk) text += (text ? " " : "") + "Retried at " + (retryBaud || "115200") + ": OK.";
-  else if (retry) {
-    const rb = retry.baud || retryBaud || "115200";
-    text += (text ? " " : "") + "Retried at " + (retryBaud || rb) + ": failed at " + flashNoun(retry.step) + " — " + flashDetail(retry.step, retry.name, rb) + flashByte(retry) + ".";
-  }
-  const hintSrc = (retry && !retryOk) ? retry : first;
+  const multi = retries.length > 1;
+  retries.forEach((r, i) => {
+    const label = multi ? ("Retry " + (i + 1) + " at ") : "Retried at ";
+    const b = r.baud || (r.step && r.step.baud) || "115200";
+    if (r.ok) text += (text ? " " : "") + label + b + ": OK.";
+    else if (r.step) {
+      const rb = r.step.baud || r.baud || "115200";
+      text += (text ? " " : "") + label + (r.baud || rb) + ": failed at " + flashNoun(r.step.step) + " — " + flashDetail(r.step.step, r.step.name, rb) + flashByte(r.step) + ".";
+    }
+  });
+  const last = retries.length ? retries[retries.length - 1] : null;
+  const hintSrc = (last && !last.ok && last.step) ? last.step : first;
   const hint = hintSrc ? flashHint(hintSrc.step, hintSrc.name) : "";
   if (hint && text.indexOf(hint) < 0) text += (text ? " " : "") + hint;
   text = text.replace(/\s+/g, " ").trim();

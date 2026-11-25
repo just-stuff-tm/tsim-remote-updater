@@ -266,6 +266,19 @@ RTC_DATA_ATTR static uint32_t s_cid_magic = 0;
 #define SMS_RING_MAGIC 0x534D5131UL
 RTC_DATA_ATTR static SmsRing s_sms_ring;
 RTC_DATA_ATTR static uint32_t s_sms_ring_magic = 0;
+// v1.8.2: early-boot trace so a rolled-back app can say why. Survives reset
+// (RTC) and power loss (mirrored to NVS "tsimrb" before the image is validated).
+#define OTA_RB_MAGIC 0x0B1820A2UL
+struct OtaRbRtc {
+  uint32_t magic;
+  uint32_t gen;
+  uint32_t boots;
+  uint8_t rr;
+  uint8_t pend;
+  char label[17];
+};
+RTC_DATA_ATTR static OtaRbRtc s_rb = {};
+static char s_rb_msg[160] = "";
 static void tcfgSave();
 static void tcfgApplyCfg(const char *args, char *out, size_t cap);
 static void cidSave();
@@ -683,7 +696,7 @@ static float s_bat_idle_fwd(void);
 static void ingestEvent(const char *type, const char *msg) {
   float bat = s_bat_idle_fwd();
   float sol = readAdcVolts(BOARD_SOLAR_ADC_PIN, 2.0f);
-  char m[640], lr[170];
+  char m[768], lr[170];
   jsonEsc(m, sizeof(m), msg); jsonEsc(lr, sizeof(lr), s_last_result);
   snprintf(s_ingest_body, sizeof(s_ingest_body),
     "{\"type\":\"%s\",\"fw\":\"%s\",\"uptime\":%lu,\"wake\":%d,\"rr\":%d,\"battery_v\":%.2f,\"battery_pct\":%d,"
@@ -1800,6 +1813,98 @@ static void rollbackIfPending(const char *why) {
   esp_ota_mark_app_invalid_rollback_and_reboot();
 }
 
+// v1.8.2: the new app writes its reset reason and boot count before it is
+// validated. If that image is rolled back, the app that comes back reads the
+// trace once and posts it on the next check-in.
+static const char *otaRstName(uint8_t rr) {
+  switch ((esp_reset_reason_t)rr) {
+    case ESP_RST_UNKNOWN: return "UNKNOWN";
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+static void otaRbReport();
+static void otaRbEarly() {
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  const esp_partition_t *inv = esp_ota_get_last_invalid_partition();
+  const bool pend = otaPendingVerify();
+  const char *lab = (run && run->label[0]) ? run->label : "?";
+  Preferences p;
+  p.begin("tsimrb", false);
+  uint32_t gen = p.getUInt("gen", 0);
+  uint32_t seen_gen = p.getUInt("seengen", 0);
+  OtaRbRtc prev = {};
+  bool have_prev = s_rb.magic == OTA_RB_MAGIC && s_rb.label[0];
+  if (have_prev) prev = s_rb;
+  else if (p.getUChar("pend", 0) && p.getUInt("rgen", 0)) {
+    String runS = p.getString("run", "");
+    if (runS.length()) {
+      strncpy(prev.label, runS.c_str(), sizeof(prev.label) - 1);
+      prev.rr = p.getUChar("rr", 255);
+      prev.boots = p.getUInt("boots", 0);
+      prev.gen = p.getUInt("rgen", 0);
+      prev.pend = 1;
+      prev.magic = OTA_RB_MAGIC;
+      have_prev = true;
+    }
+  }
+  const bool new_label = !have_prev || strcmp(prev.label, lab) != 0;
+  if (!pend && have_prev && prev.pend && inv && inv->label[0] &&
+      strcmp(prev.label, inv->label) == 0 && prev.gen && prev.gen != seen_gen) {
+    uint8_t now = (uint8_t)esp_reset_reason();
+    char prevs[24];
+    if (prev.rr <= (uint8_t)ESP_RST_SDIO) snprintf(prevs, sizeof(prevs), "%u(%s)", (unsigned)prev.rr, otaRstName(prev.rr));
+    else snprintf(prevs, sizeof(prevs), "?");
+    snprintf(s_rb_msg, sizeof(s_rb_msg), "T-SIM OTA rolled back: %s rr=%s boots=%u now=%u(%s)",
+             inv->label, prevs, (unsigned)prev.boots, (unsigned)now, otaRstName(now));
+    p.putString("msg", s_rb_msg);
+    p.putUInt("seengen", prev.gen);
+    logf("%s", s_rb_msg);
+  } else if (!s_rb_msg[0]) {
+    String saved = p.getString("msg", "");
+    if (saved.length()) {
+      strncpy(s_rb_msg, saved.c_str(), sizeof(s_rb_msg) - 1);
+      s_rb_msg[sizeof(s_rb_msg) - 1] = 0;
+    }
+  }
+  if (pend && new_label) {
+    gen += 1;
+    if (!gen) gen = 1;
+    p.putUInt("gen", gen);
+  } else if (pend && have_prev && prev.gen) gen = prev.gen;
+  s_rb.magic = OTA_RB_MAGIC;
+  s_rb.boots = (have_prev && !new_label) ? prev.boots + 1 : 1;
+  s_rb.rr = (uint8_t)esp_reset_reason();
+  s_rb.pend = pend ? 1 : 0;
+  s_rb.gen = pend ? gen : 0;
+  strncpy(s_rb.label, lab, sizeof(s_rb.label) - 1);
+  s_rb.label[sizeof(s_rb.label) - 1] = 0;
+  p.putUChar("rr", s_rb.rr);
+  p.putUInt("boots", s_rb.boots);
+  p.putUChar("pend", s_rb.pend);
+  p.putString("run", s_rb.label);
+  p.putUInt("rgen", s_rb.gen);
+  p.end();
+}
+static void otaRbReport() {
+  if (!s_rb_msg[0]) return;
+  if (!s_pdp_up && !modemOpenData()) return;
+  char m[160];
+  memcpy(m, s_rb_msg, sizeof(m));
+  s_rb_msg[0] = 0;
+  Preferences p; p.begin("tsimrb", false); p.putString("msg", ""); p.end();
+  ingestEvent("update", m);
+}
+
 static bool fileHash(const char *path, bool sha, char *hexout) {
   File f = LittleFS.open(path, "r");
   if (!f) return false;
@@ -1954,18 +2059,44 @@ static void heltecEndFlash(bool loader_up) {
   logf("flash: BOOT released + Heltec reset");
 }
 
-// Drop a garbled 460800 session and put the chip back in the ROM bootloader.
-// Does not boot the app. The next connect() pulses RST again.
-static void heltecAbortForRetry() {
+// Between attempts: UART back at 115200, BOOT low, RST held for settle_ms so the
+// chip stays in reset (it does not boot the app). The next connect() pulses RST
+// into the ROM bootloader. The loader port stays initialised across the wait.
+static void heltecSettleForRetry(uint32_t settle_ms) {
   HeltecSerial.updateBaudRate(115200);
   delay(20);
   heltecFlushRx();
-  loader_port_enter_bootloader();
-  loader_port_arduino_deinit();
+  pinMode(HELTEC_BOOT_PIN, OUTPUT);
+  digitalWrite(HELTEC_BOOT_PIN, LOW);
+  pinMode(HELTEC_RST_PIN, OUTPUT);
+  digitalWrite(HELTEC_RST_PIN, LOW);
+  logf("flash: retry settle %u ms (RST held, BOOT low)", (unsigned)settle_ms);
+  delay(settle_ms);
+  heltecFlushRx();
 }
 
-// v1.6.4 + v1.8.1: chip/image/addr/size plus the step that failed (for the dashboard).
-static char s_flash_info[360] = "";
+// v1.8.2: no modem transmit while the Heltec is in ROM download mode.
+// Finish queued posts, close HTTP/sockets/PDP, then wait. s_pdp_up is cleared
+// so the result ingest reopens the data link after heltecEndFlash.
+static void modemIdleForFlash() {
+  pendingFlush();
+  modemCloseData();
+  if (!s_tcp_busy) {
+    ModemTcpClient::netClose(ModemSerial);
+    modemAT("AT+CGACT=0,1", 15000);
+  } else {
+    logf("flash: tcp busy, data session left as-is");
+  }
+  s_pdp_up = false;
+  delay(300);
+  logf("flash: modem idle");
+}
+
+// v1.6.4 + v1.8.1/1.8.2: chip/image/addr/size plus every attempt (dashboard).
+// 3 attempts fit, and "FAIL: flash " + 100-char url + " | " + this stays under
+// the 512-char message the dashboard keeps and the ingest escape buffer.
+static char s_flash_info[384] = "";
+static_assert(sizeof(s_flash_info) + 114 < 512, "flash detail must fit in the dashboard message");
 static const char *imageKindName(int k) { return k == 2 ? "classic-merged" : k == 1 ? "merged" : "app-only"; }
 
 static const char *loaderErrName(esp_loader_error_t e) {
@@ -2003,10 +2134,21 @@ static void flashNoteFail(const char *step, esp_loader_error_t err, uint32_t bau
   }
 }
 
-static void flashIngestRetry(const char *step, esp_loader_error_t err) {
-  char m[140];
-  snprintf(m, sizeof(m), "Flash retry at 115200 after step=%s err=%d(%s)", step, (int)err, loaderErrName(err));
-  ingestEvent("update", m);
+// Prepend chip/image/addr/size once it is known. A connect failure on attempt 1
+// may already have written a step= line; keep that text after the prefix.
+static void flashInfoSetBase(const char *cn, int kind, uint32_t addr, uint32_t size) {
+  if (strncmp(s_flash_info, "chip=", 5) == 0) return;
+  char base[96];
+  snprintf(base, sizeof(base), "chip=%s image=%s addr=0x%X size=%u",
+           cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
+  if (!s_flash_info[0]) {
+    snprintf(s_flash_info, sizeof(s_flash_info), "%s", base);
+    return;
+  }
+  char rest[sizeof(s_flash_info)];
+  memcpy(rest, s_flash_info, sizeof(rest));
+  rest[sizeof(rest) - 1] = 0;
+  snprintf(s_flash_info, sizeof(s_flash_info), "%s %s", base, rest);
 }
 
 static bool flashHeltecFromFile(const char *path, const char *url) {
@@ -2020,7 +2162,8 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   (void)url;
   if (kind < 0) { logf("flash: not an ESP32 image (no 0xE9 header) - refusing"); return false; }
   bool merged = kind >= 1;
-  uint32_t addr = merged ? 0x0 : 0x10000;   // final address chosen after chip detection
+  // kind 2 is a classic-ESP32 image whose bootloader sits at 0x1000. Refused later if the chip is not ESP32.
+  uint32_t addr = kind == 2 ? 0x1000u : kind == 1 ? 0u : 0x10000u;
   uint32_t flash_size = (size + 3) & ~3u;
 
   String md5_file, md5_pad;
@@ -2029,6 +2172,15 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
   logf("flash: START size=%u addr=0x%X merged=%d", (unsigned)size, addr, (int)merged);
   progressf("UPDATE", "hammer_and_wrench", 4, "Flash start: %u bytes @ 0x%X merged=%d md5=%s",
         (unsigned)size, addr, (int)merged, md5_file.c_str());
+
+  // Chip type is only known after connect. Say what we are about to write, then
+  // drop the data session, before the Heltec enters ROM download mode.
+  {
+    char m[120];
+    snprintf(m, sizeof(m), "Flashing: image=%s addr=0x%X size=%u", imageKindName(kind), (unsigned)addr, (unsigned)size);
+    ingestEvent("update", m);
+  }
+  modemIdleForFlash();
 
   f = LittleFS.open(path, "r");
   if (!f) { logf("flash: reopen fail"); return false; }
@@ -2042,11 +2194,22 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
 
   esp_loader_connect_args_t connect = ESP_LOADER_CONNECT_DEFAULT();
   connect.trials = 15; connect.sync_timeout = 200;
-  bool base_set = false;
   bool loader_up = false;
-
-  for (int attempt = 0; attempt < 2; attempt++) {
+  bool ok_flash = false;
+  // Attempt 1 may use 460800. Retries stay at 115200. A baud-change miss is not
+  // fatal. Connect, size detect (surfaced as flash_start), write, and verify
+  // each get a full reset back into the ROM bootloader. Up to 2 retries.
+  // First-attempt connect failure waits 2 s; other gaps are 1 s then 3 s.
+  for (int attempt = 0; attempt < 3; attempt++) {
     const bool retry = attempt > 0;
+    auto again = [&](const char *step, esp_loader_error_t e, uint32_t baud, uint32_t at, bool connect_fail) -> bool {
+      flashNoteFail(step, e, baud, at, retry);
+      if (attempt + 1 >= 3) return false;
+      uint32_t settle = 3000;
+      if (attempt == 0) settle = connect_fail ? 2000 : 1000;
+      heltecSettleForRetry(settle);
+      return true;
+    };
     if (!loader_up) {
       loader_port_arduino_init(&cfg);
       loader_up = true;
@@ -2056,10 +2219,10 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
       f = LittleFS.open(path, "r");
       if (!f) {
         flashNoteFail("file_read", ESP_LOADER_ERROR_FAIL, 115200, 0, true);
-        heltecEndFlash(loader_up);
-        return false;
+        break;
       }
     }
+    logf("flash: attempt %d/3", attempt + 1);
 
     esp_loader_error_t err = esp_loader_connect(&connect);
     bool tried_stub = false;
@@ -2070,8 +2233,8 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
     }
     if (err != ESP_LOADER_SUCCESS) {
       logf("flash: connect FAILED %d", (int)err);
-      flashNoteFail(tried_stub ? "connect_stub" : "connect", err, 115200, 0, retry);
-      f.close(); heltecEndFlash(true); return false;
+      if (again(tried_stub ? "connect_stub" : "connect", err, 115200, 0, true)) continue;
+      break;
     }
 
     target_chip_t chip = esp_loader_get_target();
@@ -2091,37 +2254,19 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
     if (chip == ESP8266_CHIP || chip >= ESP_MAX_CHIP || chip == ESP32_RESERVED0_CHIP) {
       setLastResult("FLASH REFUSED: unsupported/unknown repeater chip (%d)", (int)chip);
       logf("flash: unknown chip - refusing");
-      if (!base_set) {
-        snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
-                 cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
-        base_set = true;
-      }
+      flashInfoSetBase(cn, kind, addr, (uint32_t)size);
       flashNoteFail("connect", ESP_LOADER_ERROR_UNSUPPORTED_CHIP, 115200, 0, retry);
-      f.close(); heltecEndFlash(true); return false;
+      break;
     }
-    if (kind == 2) {
-      if (chip != ESP32_CHIP) {
-        setLastResult("FLASH REFUSED: image is classic-ESP32 merged (from 0x1000) but chip is %s", cn);
-        logf("flash: 0x1000 merged image on %s - refusing", cn);
-        if (!base_set) {
-          snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
-                   cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
-          base_set = true;
-        }
-        flashNoteFail("connect", ESP_LOADER_ERROR_INVALID_TARGET, 115200, 0, retry);
-        f.close(); heltecEndFlash(true); return false;
-      }
-      addr = 0x1000;
+    if (kind == 2 && chip != ESP32_CHIP) {
+      setLastResult("FLASH REFUSED: image is classic-ESP32 merged (from 0x1000) but chip is %s", cn);
+      logf("flash: 0x1000 merged image on %s - refusing", cn);
+      flashInfoSetBase(cn, kind, addr, (uint32_t)size);
+      flashNoteFail("connect", ESP_LOADER_ERROR_INVALID_TARGET, 115200, 0, retry);
+      break;
     }
     logf("flash: write address 0x%X (kind=%d, chip=%s)", addr, kind, cn);
-    if (!base_set) {
-      snprintf(s_flash_info, sizeof(s_flash_info), "chip=%s image=%s addr=0x%X size=%u",
-               cn, imageKindName(kind), (unsigned)addr, (unsigned)size);
-      base_set = true;
-      char m[240];
-      snprintf(m, sizeof(m), "Flashing: %s", s_flash_info);
-      ingestEvent("update", m);
-    }
+    flashInfoSetBase(cn, kind, addr, (uint32_t)size);
 
     uint32_t baud = 115200;
     if (!retry) {
@@ -2136,20 +2281,15 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
         // The ROM command failed. The local UART is still 115200. Keep going.
         logf("flash: baud change failed %d (%s), staying at 115200", (int)err, loaderErrName(err));
       }
+    } else {
+      logf("flash: retry stays at 115200");
     }
 
     err = esp_loader_flash_start(addr, flash_size, FLASH_BLOCK_SIZE);
     if (err != ESP_LOADER_SUCCESS) {
       logf("flash: start FAILED %d (%s) baud=%u", (int)err, loaderErrName(err), (unsigned)baud);
-      if (baud == 460800 && !retry) {
-        flashNoteFail("flash_start", err, baud, 0, false);
-        flashIngestRetry("flash_start", err);
-        heltecAbortForRetry();
-        loader_up = false;
-        continue;
-      }
-      flashNoteFail("flash_start", err, baud, 0, retry);
-      f.close(); heltecEndFlash(true); return false;
+      if (again("flash_start", err, baud, 0, false)) continue;
+      break;
     }
 
     size_t written = 0;
@@ -2181,53 +2321,37 @@ static bool flashHeltecFromFile(const char *path, const char *url) {
       }
     }
     if (file_fail) {
-      flashNoteFail("file_read", ESP_LOADER_ERROR_FAIL, baud, fail_at, retry);
-      f.close(); heltecEndFlash(true); return false;
+      if (again("file_read", ESP_LOADER_ERROR_FAIL, baud, fail_at, false)) continue;
+      break;
     }
     if (write_fail) {
-      if (baud == 460800 && !retry) {
-        flashNoteFail("write", write_err, baud, fail_at, false);
-        flashIngestRetry("write", write_err);
-        heltecAbortForRetry();
-        loader_up = false;
-        continue;
-      }
-      flashNoteFail("write", write_err, baud, fail_at, retry);
-      f.close(); heltecEndFlash(true); return false;
+      if (again("write", write_err, baud, fail_at, false)) continue;
+      break;
     }
 
-    // Verify against the MD5 we streamed from the file (independent of the
-    // library's incremental context). Heltec hashes addr..addr+flash_size.
-    // A verify miss is not a baud retry: the bytes were already written.
+    // Heltec hashes addr..addr+flash_size. A miss is retried like any other
+    // failure after connect: reset into the ROM bootloader and write again.
     err = esp_loader_flash_verify_known_md5(addr, flash_size, (const uint8_t *)md5_pad.c_str());
-    bool ok = (err == ESP_LOADER_SUCCESS);
-    if (retry) {
-      if (ok) flashInfoAdd("; retry baud=%u: OK written=%u verify=OK", (unsigned)baud, (unsigned)written);
-      else flashNoteFail("verify", err, baud, 0, true);
-    } else {
-      flashInfoAdd(" written=%u verify=%s md5=%s baud=%u",
-                   (unsigned)written, ok ? "OK" : "FAIL", md5_file.c_str(), (unsigned)baud);
-      if (!ok) flashNoteFail("verify", err, baud, 0, false);
-    }
-    if (ok) {
+    if (err == ESP_LOADER_SUCCESS) {
+      if (retry) flashInfoAdd("; retry baud=%u: OK written=%u verify=OK md5=%s", (unsigned)baud, (unsigned)written, md5_file.c_str());
+      else flashInfoAdd(" written=%u verify=OK md5=%s baud=%u", (unsigned)written, md5_file.c_str(), (unsigned)baud);
       logf("flash: MD5 OK  file=%s  heltec=%s", md5_file.c_str(), md5_pad.c_str());
       progressf("UPDATE", "white_check_mark", 3, "MD5 verify OK %s", md5_file.c_str());
       esp_loader_flash_finish(true);
       delay(200);
-    } else {
-      logf("flash: MD5 FAILED err=%d expected(file)=%s (Heltec value printed by [flasher] above)",
-           (int)err, md5_pad.c_str());
-      progressf("UPDATE", "x", 5, "MD5 mismatch, file=%s", md5_file.c_str());
+      ok_flash = true;
+      break;
     }
-    f.close();
-    heltecEndFlash(true);
-    if (ok) progressf("UPDATE", "recycle", 3, "Heltec reset done");
-    return ok;
+    logf("flash: MD5 FAILED err=%d expected(file)=%s (Heltec value printed by [flasher] above)",
+         (int)err, md5_pad.c_str());
+    progressf("UPDATE", "x", 5, "MD5 mismatch, file=%s", md5_file.c_str());
+    if (again("verify", err, baud, 0, false)) continue;
+    break;
   }
-  f.close();
+  if (f) f.close();
   if (loader_up) heltecEndFlash(true);
-  else heltecEndFlash(false);
-  return false;
+  if (ok_flash) progressf("UPDATE", "recycle", 3, "Heltec reset done");
+  return ok_flash;
 }
 
 // -------------------- POWER: battery calibration + low-battery repeat protection (v1.6.5) --------------------
@@ -2773,6 +2897,7 @@ static bool doUpdate(const char *url, bool flash_too) {
   }
   { size_t sz = 0; File f = LittleFS.open(FW_PATH, "r"); if (f) { sz = f.size(); f.close(); }
     char m[80]; snprintf(m, sizeof(m), "Download done: %u bytes, flashing", (unsigned)sz); ingestEvent("update", m); }
+  // flashHeltecFromFile posts "Flashing:" and idles the modem before ROM mode.
   bool flashed = flashHeltecFromFile(FW_PATH, url);
   LittleFS.remove(FW_PATH);
   modemCloseData();
@@ -2784,7 +2909,9 @@ static bool doUpdate(const char *url, bool flash_too) {
     setLastResult("FAIL: flash");
     progressf("UPDATE", "x", 5, "FAIL: flash");
   }
-  { char m[560]; snprintf(m, sizeof(m), "%s %.100s%s%s", flashed ? "SUCCESS:" : "FAIL: flash", url,
+  // URL is capped at 100. With s_flash_info[384] the line stays under 512
+  // (dashboard msg cap) and under the ingest escape buffer.
+  { char m[640]; snprintf(m, sizeof(m), "%s %.100s%s%s", flashed ? "SUCCESS:" : "FAIL: flash", url,
                           s_flash_info[0] ? " | " : "", s_flash_info); ingestEvent("update", m); }
   return flashed;
 }
@@ -3238,7 +3365,7 @@ static bool ciBudgetOk(uint32_t t0) {
 }
 // v1.8.0: extras on a timed check-in, in spec order, within WD_BUDGET_MS / the awake deadline.
 static void ciRunExtras(bool ok, bool lowbat, bool recovered, const char *stage, int sms, uint32_t t0) {
-  bool pending = s_wd_pend || s_hrp_n || s_lb_pending[0];
+  bool pending = s_wd_pend || s_hrp_n || s_lb_pending[0] || s_rb_msg[0];
   bool want = tcfgCiWantsData(&s_tcfg, recovered, pending);
   if (lowbat) want = pending;
   if (!ok) want = pending;
@@ -3253,6 +3380,7 @@ static void ciRunExtras(bool ok, bool lowbat, bool recovered, const char *stage,
       lpApply();
       if (sms < 0) sms = wdSmsStored();
       if (s_lb_pending[0]) pwrReportPending();
+      otaRbReport();
       bool silent = s_tcfg.ci == 0;
       bool extras = !lowbat && !silent;
       auto skip_rest = [&](const char *what) { logf("v1.8.0: check-in extra %s skipped (budget)", what); };
@@ -3300,6 +3428,7 @@ static bool wdRun(bool force = false, bool checkin = false) {
   if (at) { s_modem_ready = true; modemAT("ATE0"); modemAT("AT+CMEE=2"); }  // v1.7.9: DTR-low wake, settings kept
   bool ok = at && wdHealthy(5000, 20000);
   if (s_hrp_n) s_wd_pend = true;   // v1.7.4: an undelivered Heltec-reboot report goes out with this heartbeat
+  if (s_rb_msg[0]) s_wd_pend = true;   // v1.8.2: rollback note rides the next check-in
   if (force) { logf("WD: forced recovery (check said healthy=%d)", (int)ok); ok = false; s_wd_pend = true; }
   bool lowbat = s_bat_idle >= 2.5f && s_bat_idle < WD_LOWBAT_V;
   const char *stage = "ok"; bool hard_tried = false;
@@ -3334,6 +3463,7 @@ static bool wdRun(bool force = false, bool checkin = false) {
         lpApply();   // v1.7.9: before the heartbeat, so this post's tl is the read-back. One try, no loop.
         sms = wdSmsStored();
         if (s_lb_pending[0]) pwrReportPending();
+        otaRbReport();
         if (wdHeartbeat(stage, sms)) s_wd_pend = false;
       }
     } else if (ok && !lowbat) {
@@ -3739,6 +3869,9 @@ static int processSmsInbox(bool force_list) {
     smsRingPush(&s_sms_ring, m.hash);
     smsRingSave();
     if (smsMergeable(nb) && nseen < 12) seen[nseen++] = nb;
+    // Before the command: UPDATE posts telemetry (tf) before handleCommand returns.
+    // Any text that will run counts, including one whose network time is old.
+    if (smsCountsAsNewText(false, false)) smsDiagSetFound(&s_sms_diag);
     handleCommand(m.from, m.body);
     ran++;
     s_sms_new++;
@@ -3747,10 +3880,7 @@ static int processSmsInbox(bool force_list) {
     // network time is within a few minutes, or it arrived on the post-delete
     // recheck / a later poll (that is the text that rang the pin).
     bool arrived_later = !first || ord[k] >= n;
-    if (arrived_later || smsTsRecent(m.ts, nowu, SMS_RECENT_S)) {
-      s_sms_trigger++;
-      smsDiagSetFound(&s_sms_diag);
-    }
+    if (arrived_later || smsTsRecent(m.ts, nowu, SMS_RECENT_S)) s_sms_trigger++;
   }
   if (merged) { char em[64]; snprintf(em, sizeof(em), "Merged %d duplicate text(s) (ran once)", merged); ingestEvent("event", em); }
   logf("SMS processed: collected=%d executed=%d", total, ran);
@@ -4007,6 +4137,7 @@ static bool modemSmsLight() {
 void setup() {
   deadlineArm(AWAKE_MAX_S);   // v1.7.2: first thing, so nothing after this can keep the T-SIM awake forever
   s_wake_cause = esp_sleep_get_wakeup_cause();   // v1.7.9: before the USB settle, so a field wake can skip it
+  otaRbEarly();   // v1.8.2: reset reason + boot count before this image can be validated or rolled back
   smsDiagBegin(&s_sms_diag, (int)s_wake_cause);  // v1.7.11: timing only; does not add a wait
   s_sms_new = 0; s_sms_trigger = 0; s_sms_opened = false; s_cmti_ms = 0; s_sms_pass_done_ms = 0;
   bool fast = (s_wake_cause == ESP_SLEEP_WAKEUP_EXT0) || (s_wake_cause == ESP_SLEEP_WAKEUP_TIMER);
@@ -4145,6 +4276,7 @@ void setup() {
     modemConfigureSms();
     if (reg_ok) lpApply();   // v1.7.9: awake and registered. Defaults off send CEDRXS=0/CPSMS=0 once, then idle wakes skip it.
     if (otaPendingVerify()) ingestEvent("event", "T-SIM booted new firmware after OTA, checking in");  // success marks it valid
+    otaRbReport();   // v1.8.2: one-shot rollback note, if the previous image did not stay
     if (s_wake_cause != ESP_SLEEP_WAKEUP_TIMER || !s_lb_en) pwrCheck("wake");
     pwrReportPending();
     if (s_hrp_n) wdHeartbeat("ok", -1);   // v1.7.4: deliver an earlier Heltec-reboot report that couldn't go out

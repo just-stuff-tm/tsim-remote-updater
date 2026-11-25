@@ -27,7 +27,7 @@ struct SmsDiag {
   uint32_t cmti_ms[SMS_DIAG_MAX_CMTI];
   uint8_t ncmti;
   uint8_t passes;  // v1.8.1: total inbox passes this wake (not capped at 4)
-  uint8_t tf;      // v1.8.1: 1 once a new text was executed this wake
+  uint8_t tf;      // v1.8.2: 1 once a new (not deduped) text was executed this wake
   uint8_t on;
 };
 
@@ -73,6 +73,14 @@ static inline void smsDiagAddCmti(SmsDiag *d, uint32_t ms) {
 static inline void smsDiagSetFound(SmsDiag *d) {
   if (!d) return;
   d->tf = 1;
+}
+
+// v1.8.2: tf is for every text this wake will actually run. A ring duplicate
+// (already executed) and a same-pass merge do not count. "Recent" network time
+// does not matter: a stored UPDATE still counts. Call smsDiagSetFound before
+// the command runs — UPDATE posts telemetry before it returns.
+static inline bool smsCountsAsNewText(bool ring_dup, bool pass_dup) {
+  return !ring_dup && !pass_dup;
 }
 
 // AT+CPMS? → used count. Prefers the "SM" store (the SMS inbox). -1 if unparseable.
