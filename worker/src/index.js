@@ -1838,7 +1838,7 @@ export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}
 export const TCFG_FW = "1.8.0";
 export const TCFG_DO = "hcmsgt", TCFG_Q = "bu";
 export const DEFAULT_TCFG = { ci: 360, do: "hc", cs: 0, qc: 30, q: "u", usol: 2000, gto: 180, txt_h: 0 };
-export const TCFG_CI_CHOICES = [0, 60, 120, 180, 360, 720, 1440], TCFG_QC_CHOICES = [0, 15, 30, 60, 120], TCFG_CS_CHOICES = [0, 24, 168];
+export const TCFG_CI_CHOICES = [0, 60, 120, 180, 360, 720, 1440], TCFG_QC_CHOICES = [0, 15, 30, 60, 120, 240], TCFG_CS_CHOICES = [0, 24, 168];
 export const tcfgCanon = (s, all) => [...all].filter((c) => String(s || "").includes(c)).join("");
 const tcfgCiOk = (v) => v === 0 || (Number.isInteger(v) && v >= 30 && v <= 1440);
 const tcfgQcOk = (v) => v === 0 || (Number.isInteger(v) && v >= 15 && v <= 240);
@@ -1871,7 +1871,7 @@ export function validateTcfg(cur, b = {}) {
   if (b.ci !== undefined) { const v = Number(b.ci); if (!TCFG_CI_CHOICES.includes(v)) throw new Error("Pick how often to check in: off, or every 1 to 24 hours."); t.ci = v; }
   if (b.do !== undefined) t.do = tcfgCanon(b.do, TCFG_DO);
   if (b.cs !== undefined) { const v = Number(b.cs); if (![0, 1, 24, 168].includes(v)) throw new Error("Pick how often to refresh the saved repeater settings."); t.cs = v; }
-  if (b.qc !== undefined) { const v = Number(b.qc); if (!TCFG_QC_CHOICES.includes(v)) throw new Error("Pick how often to run quick checks: off, or every 15 minutes to 2 hours."); t.qc = v; }
+  if (b.qc !== undefined) { const v = Number(b.qc); if (!TCFG_QC_CHOICES.includes(v)) throw new Error("Pick how often to run quick checks: off, or every 15 minutes to 4 hours."); t.qc = v; }
   if (b.q !== undefined) t.q = tcfgCanon(b.q, TCFG_Q);
   if (b.usol !== undefined) { const v = Number(b.usol); if (!Number.isInteger(v) || v < 0 || v > 20000) throw new Error("Daylight threshold must be 0 to 20 V."); t.usol = v; }
   if (b.gto !== undefined) { const v = Number(b.gto); if (!Number.isInteger(v) || v < 30 || v > 600) throw new Error("GPS timeout must be 30 to 600 seconds."); t.gto = v; }
@@ -3780,7 +3780,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" name="do_g"> Update the GPS location, up to <input name="gto" type="number" min="30" max="600" step="10" style="width:5em"> s of GPS (uses noticeably more battery) <small class="mut ci18">needs T-SIM 1.8.0</small></label>
 <label class="tog"><input type="checkbox" name="do_t"> Run texts still waiting on the modem</label>
 <b class="small">Quick local checks (no LTE)</b>
-<label>Run every<select name="qc"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes (recommended)</option><option value="60">1 hour</option><option value="120">2 hours</option></select></label>
+<label>Run every<select name="qc"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes (recommended)</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option></select></label>
+<p class="small mut">Longer intervals save a little battery, but low-battery protection and the daylight uptime check only run on these checks, so they react more slowly. The T-SIM accepts up to 4 hours.</p>
 <label class="tog"><input type="checkbox" name="q_b"> Low-battery protection (turn repeating off when the battery is low; levels in <b>Battery</b> below)</label>
 <label class="tog"><input type="checkbox" name="q_u"> Notice when the repeater reboots</label>
 <label class="tog"><input type="checkbox" name="usol_day"> …only in daylight (solar input at least 2 V)</label>
@@ -4026,8 +4027,11 @@ function showRd(d){
 }
 // v1.8.0: what the T-SIM confirmed vs what is saved here. Never shows a saved value as the device's.
 const CIDO={h:"report status",c:"queued commands",m:"mesh stats",s:"settings refresh",g:"GPS",t:"waiting texts"},CIQ={b:"low-battery protection",u:"reboot detection"};
+const QCL={0:"off",15:"15 minutes",30:"30 minutes",60:"1 hour",120:"2 hours",240:"4 hours"};
+function qcLabel(m){m=+m;return QCL[m]||(m+" min")}
+function keepSel(sel,v,lab){v=String(v);if(![...sel.options].some(o=>o.value===v)){const o=document.createElement("option");o.value=v;o.textContent=lab||v;sel.appendChild(o)}sel.value=v}
 function ciText(T){if(!T)return "";const d=String(T.do||"").split("").map(x=>CIDO[x]).filter(Boolean),q=String(T.q||"").split("").map(x=>CIQ[x]).filter(Boolean);
- return (T.ci?"check in every "+hrs(T.ci):"check-ins off")+(T.ci&&d.length?" ("+d.join(", ")+")":"")+"; quick checks "+(T.qc&&q.length?"every "+T.qc+" min ("+q.join(", ")+")":"off")}
+ return (T.ci?"check in every "+hrs(T.ci):"check-ins off")+(T.ci&&d.length?" ("+d.join(", ")+")":"")+"; quick checks "+(T.qc&&q.length?"every "+qcLabel(T.qc)+" ("+q.join(", ")+")":"off")}
 function dsHtml(ds,fmt,who){if(!ds)return "";who=who||"On T-SIM";const D=ds.device;
  let h='<div class="small"><b>'+e(who)+':</b> '+(D?e(fmt(D))+' <span class="mut">(confirmed '+e(ago(D.at))+')</span>':'<span class="mut">not reported yet</span>')+'</div>';
  if(ds.saved&&(ds.differs||!D||ds.pending))h+='<div class="small"><b>Saved here, not confirmed yet:</b> '+e(fmt(ds.saved))+' '+(ds.pending?'<span class="badge warnb">Waiting for T-SIM to confirm</span>':D?'<span class="badge warnb">Different from the T-SIM: press Save &amp; send to apply</span>':'<span class="badge warnb">Waiting for T-SIM to confirm</span>')+'</div>';
@@ -4043,7 +4047,7 @@ function showCheckins(d){const C=d.checkins||{},T=C.settings||{},DS=(d.device_st
  document.querySelectorAll(".ci18").forEach(x=>x.hidden=CIV18);["m","s","g"].forEach(x=>{f["do_"+x].disabled=!CIV18&&!String(T.do||"").includes(x)});f.cs.disabled=!CIV18;
  $("cioff").textContent=CIV18?"Off: no timed check-ins. The T-SIM still checks its modem once a day so it can't get stuck offline, but it only uses LTE if it had to fix something or has a report waiting.":"Off on this T-SIM firmware (older than 1.8.0) still checks the modem every 24 h, and reports or picks up commands then if those are ticked. T-SIM 1.8.0 makes Off silent.";
  f.querySelectorAll("select,input,button").forEach(x=>{if(!C.supported)x.disabled=true});
- if(!ciLoaded){ciLoaded=true;f.ci.value=String(T.ci??360);"hcmsgt".split("").forEach(x=>f["do_"+x].checked=String(T.do||"").includes(x));f.cs.value=String(T.cs||0);f.qc.value=String(T.qc??30);
+ if(!ciLoaded){ciLoaded=true;f.ci.value=String(T.ci??360);"hcmsgt".split("").forEach(x=>f["do_"+x].checked=String(T.do||"").includes(x));f.cs.value=String(T.cs||0);keepSel(f.qc,T.qc??30,qcLabel(T.qc??30));
   "bu".split("").forEach(x=>f["q_"+x].checked=String(T.q||"").includes(x));f.usol_day.checked=T.usol!==0;f.gto.value=String(T.gto||180)}
  ciCost()}
 async function ciSave(send){const r=await post("checkin-settings",{...ciForm(),send:send});const j=await rj(r);
