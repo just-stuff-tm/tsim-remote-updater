@@ -1374,11 +1374,19 @@ const isTsimUpd = (c) => /^tsimupdate\s/i.test(String(c.cmd || ""));
 // ---------- power: T-SIM battery calibration + low-battery repeat protection ----------
 export const LB_RATIO = 1.10;
 export const DEFAULT_POWER = { cal_scale: 1, cal_off: 0, lb_en: false, lb_lo: 3.40, lb_hi: 3.75, lb_int: 30, lb_imm: false };
+export const QC48_FW = "1.8.3";  // quick local checks / battery interval up to 2 days
 export const batPct = (v) => v == null ? null : v >= 4.15 ? 100 : v <= 3.30 ? 0 : Math.round((v - 3.30) * 100 / 0.85);  // same curve as the firmware
 const r4 = (x) => Math.round(x * 1e4) / 1e4;
+// Battery check interval max (hours): 1.8.3+ 48 h, 1.8.0–1.8.2 4 h (qc clamp), older 24 h (PWRCFG).
+export function powerIntMaxH(fw) {
+  if (fwAtLeast(fw, QC48_FW)) return 48;
+  if (fwAtLeast(fw, "1.8.0")) return 4;
+  return 24;
+}
 // b: {measured_v} | {cal_scale, cal_off} | {reset_cal:true} | {lb_en, lb_lo, lb_hi, lb_int, lb_imm}. rawIdle = latest idle raw ADC volts.
-export function validatePower(cur, b, rawIdle) {
+export function validatePower(cur, b, rawIdle, fw) {
   const o = { ...DEFAULT_POWER, ...cur };
+  const maxH = powerIntMaxH(fw), maxMin = maxH * 60;
   if (b.reset_cal) { o.cal_scale = 1; o.cal_off = 0; }
   if (b.measured_v !== undefined) {
     const m = Number(b.measured_v);
@@ -1396,14 +1404,14 @@ export function validatePower(cur, b, rawIdle) {
   if (b.lb_int !== undefined) o.lb_int = Math.round(Number(b.lb_int));
   if (b.lb_int_h !== undefined) {
     const h = Number(b.lb_int_h);
-    if (!(h >= 0.25 && h <= 24)) throw new Error("Check interval must be between 0.25 and 24 hours.");
+    if (!(h >= 0.25 && h <= maxH)) throw new Error(`Check interval must be between 0.25 and ${maxH} hours.`);
     o.lb_int = Math.round(h * 60);
   }
   if (!(o.lb_lo >= 3.0 && o.lb_lo <= 4.0)) throw new Error("'Turn repeat OFF below' must be between 3.00 and 4.00 V.");
   if (!(o.lb_hi <= 4.3)) throw new Error("'Turn repeat ON at/above' must be 4.30 V or lower.");
   if (!(o.lb_hi >= o.lb_lo * LB_RATIO - 0.005))
     throw new Error(`'Turn repeat ON at/above' must be at least 10% higher than 'OFF below': with OFF at ${o.lb_lo.toFixed(2)} V, ON must be ${(Math.ceil(o.lb_lo * LB_RATIO * 100) / 100).toFixed(2)} V or more.`);
-  if (!(o.lb_int >= 15 && o.lb_int <= 1440)) throw new Error("Check interval must be between 0.25 and 24 hours.");
+  if (!(o.lb_int >= 15 && o.lb_int <= maxMin)) throw new Error(`Check interval must be between 0.25 and ${maxH} hours.`);
   return o;
 }
 export const pwrCfgCmd = (p) => `PWRCFG scale=${p.cal_scale} off=${p.cal_off} en=${p.lb_en ? 1 : 0} lo=${p.lb_lo.toFixed(2)} hi=${p.lb_hi.toFixed(2)} int=${p.lb_int} imm=${p.lb_imm ? 1 : 0}`;
@@ -1838,15 +1846,17 @@ export const gpsCfgCmd = (g) => `GPSCFG auto=${g.auto ? 1 : 0} to=${g.timeout_s}
 export const TCFG_FW = "1.8.0";
 export const TCFG_DO = "hcmsgt", TCFG_Q = "bu";
 export const DEFAULT_TCFG = { ci: 360, do: "hc", cs: 0, qc: 30, q: "u", usol: 2000, gto: 180, txt_h: 0 };
-export const TCFG_CI_CHOICES = [0, 60, 120, 180, 360, 720, 1440], TCFG_QC_CHOICES = [0, 15, 30, 60, 120, 240], TCFG_CS_CHOICES = [0, 24, 168];
+export const TCFG_CI_CHOICES = [0, 60, 120, 180, 360, 720, 1440], TCFG_QC_CHOICES = [0, 15, 30, 60, 120, 240, 360, 720, 1440, 2880], TCFG_CS_CHOICES = [0, 24, 168];
+export const TCFG_QC_MAX = 2880, TCFG_QC_LEGACY_MAX = 240;
 export const tcfgCanon = (s, all) => [...all].filter((c) => String(s || "").includes(c)).join("");
 const tcfgCiOk = (v) => v === 0 || (Number.isInteger(v) && v >= 30 && v <= 1440);
-const tcfgQcOk = (v) => v === 0 || (Number.isInteger(v) && v >= 15 && v <= 240);
-const clampQc = (v) => (v <= 0 ? 0 : Math.min(240, Math.max(15, Math.round(v))));
+export const tcfgQcOk = (v) => v === 0 || (Number.isInteger(v) && v >= 15 && v <= TCFG_QC_MAX);
+export const clampQc = (v, max = TCFG_QC_MAX) => (v <= 0 ? 0 : Math.min(max, Math.max(15, Math.round(v))));
 const snapCs = (h) => (!(h > 0) ? 0 : h <= 1 ? 1 : h <= 72 ? 24 : 168);
 // Migration: the unified settings an existing device already runs, from the per-feature KV records.
 // Nothing stored at all -> new-device defaults. Otherwise each feature keeps today's per-key defaults.
-export function tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings } = {}) {
+// maxQc defaults to 240 so older T-SIMs never get a 6 h–2 day cadence from a legacy PWRCFG/upoll value.
+export function tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings } = {}, { maxQc = TCFG_QC_LEGACY_MAX } = {}) {
   if (!wdcfg && !power && !cachecfg && !gpscfg && !(settings && settings.schedule_hours)) return { ...DEFAULT_TCFG };
   const w = { ...DEFAULT_WD, ...(wdcfg || {}) }, p = { ...DEFAULT_POWER, ...(power || {}) }, c = { ...DEFAULT_CACHE, ...(cachecfg || {}) }, g = { ...DEFAULT_GPS, ...(gpscfg || {}) };
   const im = Number(w.int_min);
@@ -1862,7 +1872,7 @@ export function tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings } = {}
   let q = "", qs = [];
   if (p.lb_en) { q += "b"; qs.push(Number(p.lb_int) || DEFAULT_POWER.lb_int); }
   if (up > 0) { q += "u"; qs.push(up); }
-  const qc = qs.length ? clampQc(Math.min(...qs)) : DEFAULT_TCFG.qc;
+  const qc = qs.length ? clampQc(Math.min(...qs), maxQc) : DEFAULT_TCFG.qc;
   return { ci, do: tcfgCanon(d, TCFG_DO), cs: c.en ? snapCs(Number(c.int_h)) : 0, qc: q ? qc : 0, q: tcfgCanon(q, TCFG_Q),
     usol: Number.isInteger(Number(w.usol)) ? Number(w.usol) : DEFAULT_UP.usol, gto: Number(g.timeout_s) || 180, txt_h: Number(settings && settings.schedule_hours) || 0 };
 }
@@ -1871,7 +1881,7 @@ export function validateTcfg(cur, b = {}) {
   if (b.ci !== undefined) { const v = Number(b.ci); if (!TCFG_CI_CHOICES.includes(v)) throw new Error("Pick how often to check in: off, or every 1 to 24 hours."); t.ci = v; }
   if (b.do !== undefined) t.do = tcfgCanon(b.do, TCFG_DO);
   if (b.cs !== undefined) { const v = Number(b.cs); if (![0, 1, 24, 168].includes(v)) throw new Error("Pick how often to refresh the saved repeater settings."); t.cs = v; }
-  if (b.qc !== undefined) { const v = Number(b.qc); if (!TCFG_QC_CHOICES.includes(v)) throw new Error("Pick how often to run quick checks: off, or every 15 minutes to 4 hours."); t.qc = v; }
+  if (b.qc !== undefined) { const v = Number(b.qc); if (!TCFG_QC_CHOICES.includes(v)) throw new Error("Pick how often to run quick checks: off, or every 15 minutes to 2 days."); t.qc = v; }
   if (b.q !== undefined) t.q = tcfgCanon(b.q, TCFG_Q);
   if (b.usol !== undefined) { const v = Number(b.usol); if (!Number.isInteger(v) || v < 0 || v > 20000) throw new Error("Daylight threshold must be 0 to 20 V."); t.usol = v; }
   if (b.gto !== undefined) { const v = Number(b.gto); if (!Number.isInteger(v) || v < 30 || v > 600) throw new Error("GPS timeout must be 30 to 600 seconds."); t.gto = v; }
@@ -1970,7 +1980,7 @@ export function costEstimate(t) {
   if (has(t.do, "s") && wakes) cache = 30 * (t.cs ? Math.min(wakes, 24 / t.cs) : wakes);
   const texts = txt ? 24 / txt : 0;
   return { lte_wakes_day: Math.round((wakes + texts) * 10) / 10, lte_secs_day: Math.round(wakes * per + cache + texts * 90),
-    quick_wakes_day: qc && t.q ? Math.round(1440 / qc) : 0, texts_day: Math.round(texts * 10) / 10 };
+    quick_wakes_day: qc && t.q ? Math.round((1440 / qc) * 10) / 10 : 0, texts_day: Math.round(texts * 10) / 10 };
 }
 // Wake-text suppression: a text sent within windowMs that the T-SIM hasn't answered yet (no report since).
 export const WAKE_SUPPRESS_MS = 15 * 60 * 1000;
@@ -2724,7 +2734,8 @@ async function deviceApi(request, env, dev, action) {
     const stProg = { ...s, wd_int_min: wdUserInterval(wdCfgS, cmds) };
     // v1.8.0: unified check-ins, what the T-SIM confirmed vs what is saved here, and the waiting queue
     const [tcStored, ccS, pwrS] = await Promise.all([kvJson(env, `tcfg:${id}`), kvJson(env, `cachecfg:${id}`), kvJson(env, `power:${id}`)]);
-    const tcSaved0 = tcStored ? validateTcfg(tcStored, {}) : tcfgFromLegacy({ wdcfg: wdCfgS, power: pwrS, cachecfg: ccS, gpscfg: gcfg, settings: settings.schedule_hours ? settings : null });
+    const qcMax = fwAtLeast(latest && latest.fw, QC48_FW) ? TCFG_QC_MAX : TCFG_QC_LEGACY_MAX;
+    const tcSaved0 = tcStored ? validateTcfg(tcStored, {}) : tcfgFromLegacy({ wdcfg: wdCfgS, power: pwrS, cachecfg: ccS, gpscfg: gcfg, settings: settings.schedule_hours ? settings : null }, { maxQc: qcMax });
     const tcSaved = { ...tcSaved0, txt_h: settings.schedule_hours || 0 };   // the text fallback lives in settings:<id>
     const dsA = { latest, wd: wdLast, cmds: cmds || [] }, pick = (o, ks) => Object.fromEntries(ks.filter((k) => o && o[k] !== undefined).map((k) => [k, o[k]]));
     const device_state = {
@@ -2745,7 +2756,7 @@ async function deviceApi(request, env, dev, action) {
       device_state.checkins = { device: { ...dv, at: ats[ats.length - 1], source: "per-feature" }, saved: sv, pending: ["watchdog", "power", "cache", "gps"].some((k) => device_state[k].pending), differs };
       device_state.checkins.waiting = device_state.checkins.pending || differs;
     }
-    const checkins = { settings: tcSaved, stored: !!tcStored, applied_at: (tcStored && tcStored.applied_at) || null, supported: fwAtLeast(latest && latest.fw, WD_FW), v18: fwAtLeast(latest && latest.fw, TCFG_FW), cost: costEstimate(tcSaved), schedule: { hours: settings.schedule_hours || 0 } };
+    const checkins = { settings: tcSaved, stored: !!tcStored, applied_at: (tcStored && tcStored.applied_at) || null, supported: fwAtLeast(latest && latest.fw, WD_FW), v18: fwAtLeast(latest && latest.fw, TCFG_FW), qc48: fwAtLeast(latest && latest.fw, QC48_FW), cost: costEstimate(tcSaved), schedule: { hours: settings.schedule_hours || 0 } };
     const queue = (cmds || []).filter((c) => c.status === "queued" || c.status === "sent").map((c) => ({ id: c.id, cmd: redactCmd(String(c.cmd || "")).replace(/^((?:set\s+)?(?:guest\.)?password|set bridge\.secret)\s+.*/i, "$1 ••••"), status: c.status, sys: !!c.sys, queued_at: c.queued_at, sent_at: c.sent_at || null }));
     const lur0 = s.last_update_result || null;
     const lurEx = lur0 && lur0.msg ? explainFlash(lur0.msg) : null;
@@ -2794,7 +2805,7 @@ async function deviceApi(request, env, dev, action) {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     const cur = (await kvJson(env, `power:${id}`)) || {};
     const L = (await kvJson(env, `telem:${id}:latest`)) || {};
-    let p; try { p = validatePower(cur, b, L.battery_raw_v); } catch (e) { return json({ error: e.message }, 400); }
+    let p; try { p = validatePower(cur, b, L.battery_raw_v, L.fw); } catch (e) { return json({ error: e.message }, 400); }
     const cmd = pwrCfgCmd(p);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const unchanged = cur.applied_at && cur.last_cmd === cmd;  // same as what the T-SIM already runs: nothing to deliver
@@ -3082,10 +3093,11 @@ async function deviceApi(request, env, dev, action) {
     let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     const [wdcfg, power, cachecfg, gpscfg, settings, stored, lat] = await Promise.all([kvJson(env, `wdcfg:${id}`), kvJson(env, `power:${id}`), kvJson(env, `cachecfg:${id}`), kvJson(env, `gpscfg:${id}`), getSettings(env, id), kvJson(env, `tcfg:${id}`), kvJson(env, `telem:${id}:latest`)]);
     const L = lat || {};
-    const base = stored || tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings: settings.schedule_hours ? settings : null });
+    const base = stored || tcfgFromLegacy({ wdcfg, power, cachecfg, gpscfg, settings: settings.schedule_hours ? settings : null }, { maxQc: fwAtLeast(L.fw, QC48_FW) ? TCFG_QC_MAX : TCFG_QC_LEGACY_MAX });
     let t; try { t = validateTcfg(base, b); } catch (e) { return json({ error: e.message }, 400); }
     const v18 = fwAtLeast(L.fw, TCFG_FW);
     if (!v18 && !fwAtLeast(L.fw, WD_FW)) return json({ error: `Needs T-SIM firmware ${WD_FW} or newer. Update the T-SIM firmware first.` }, 409);
+    if (t.qc > TCFG_QC_LEGACY_MAX && !fwAtLeast(L.fw, QC48_FW)) return json({ error: "Quick checks longer than 4 hours need T-SIM firmware 1.8.3 or newer." }, 409);
     if (!v18) for (const c of "msg") if (t.do.includes(c) && !String(base.do || "").includes(c)) return json({ error: `That check-in option needs T-SIM firmware ${TCFG_FW} or newer.` }, 409);
     const list = (await kvJson(env, `cmds:${id}`)) || [];
     const now = new Date().toISOString(), add = [];
@@ -3780,8 +3792,8 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <label class="tog"><input type="checkbox" name="do_g"> Update the GPS location, up to <input name="gto" type="number" min="30" max="600" step="10" style="width:5em"> s of GPS (uses noticeably more battery) <small class="mut ci18">needs T-SIM 1.8.0</small></label>
 <label class="tog"><input type="checkbox" name="do_t"> Run texts still waiting on the modem</label>
 <b class="small">Quick local checks (no LTE)</b>
-<label>Run every<select name="qc"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes (recommended)</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option></select></label>
-<p class="small mut">Longer intervals save a little battery, but low-battery protection and the daylight uptime check only run on these checks, so they react more slowly. The T-SIM accepts up to 4 hours.</p>
+<label>Run every<select name="qc"><option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes (recommended)</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="360" disabled>6 hours (needs T-SIM 1.8.3)</option><option value="720" disabled>12 hours (needs T-SIM 1.8.3)</option><option value="1440" disabled>1 day (needs T-SIM 1.8.3)</option><option value="2880" disabled>2 days (needs T-SIM 1.8.3)</option></select></label>
+<p class="small mut">Longer intervals save a little battery, but low-battery protection and the daylight uptime check only run on these checks, so they react more slowly. T-SIM 1.8.3 accepts up to 2 days (older T-SIM up to 4 hours).</p>
 <label class="tog"><input type="checkbox" name="q_b"> Low-battery protection (turn repeating off when the battery is low; levels in <b>Battery</b> below)</label>
 <label class="tog"><input type="checkbox" name="q_u"> Notice when the repeater reboots</label>
 <label class="tog"><input type="checkbox" name="usol_day"> …only in daylight (solar input at least 2 V)</label>
@@ -3830,7 +3842,7 @@ export function dashboardPage(dev, acc = { kind: "d" }) {
 <form id="lbf"><p class="small">Turn it on or off, and set how often the T-SIM checks, under <b>Quick local checks</b> in <b>Automatic check-ins</b>. The cutoff uses the T-SIM's own battery reading (calibrate it in <b>Battery calibration</b>), not the repeater's.</p><span hidden><input type="checkbox" name="en"></span>
 <label>Turn repeat OFF below (V) <small class="mut" id="lbopct"></small><input name="lo" type="number" step="0.01" min="3" max="4"></label>
 <label>Turn repeat ON at/above (V) <small class="mut" id="lbhpct"></small><input name="hi" type="number" step="0.01" min="3.3" max="4.3"></label>
-<span hidden><small id="lbih"></small><input name="inth" type="number" step="0.25" min="0.25" max="24"></span>
+<span hidden><small id="lbih"></small><input name="inth" type="number" step="0.25" min="0.25" max="24" data-lbmax="24"></span>
 <label class="tog"><input type="checkbox" name="imm"> Report changes immediately (starts LTE; uses more power)</label>
 <button type="submit">Save &amp; send now</button> <button type="button" class="g" id="lbsave2">Save without sending</button><span id="lbmsg" class="msg"></span>
 <p class="small mut">"Save &amp; send now" texts the T-SIM once so it wakes and applies the settings within a few minutes. "Save without sending" waits for its next wake (useful to batch several changes).</p></form></div></details>
@@ -4027,7 +4039,7 @@ function showRd(d){
 }
 // v1.8.0: what the T-SIM confirmed vs what is saved here. Never shows a saved value as the device's.
 const CIDO={h:"report status",c:"queued commands",m:"mesh stats",s:"settings refresh",g:"GPS",t:"waiting texts"},CIQ={b:"low-battery protection",u:"reboot detection"};
-const QCL={0:"off",15:"15 minutes",30:"30 minutes",60:"1 hour",120:"2 hours",240:"4 hours"};
+const QCL={0:"off",15:"15 minutes",30:"30 minutes",60:"1 hour",120:"2 hours",240:"4 hours",360:"6 hours",720:"12 hours",1440:"1 day",2880:"2 days"};
 function qcLabel(m){m=+m;return QCL[m]||(m+" min")}
 function keepSel(sel,v,lab){v=String(v);if(![...sel.options].some(o=>o.value===v)){const o=document.createElement("option");o.value=v;o.textContent=lab||v;sel.appendChild(o)}sel.value=v}
 function ciText(T){if(!T)return "";const d=String(T.do||"").split("").map(x=>CIDO[x]).filter(Boolean),q=String(T.q||"").split("").map(x=>CIQ[x]).filter(Boolean);
@@ -4040,12 +4052,15 @@ ${costEstimate.toString()}
 function ciForm(){const f=$("cif"),dl="hcmsgt".split("").filter(x=>f["do_"+x].checked).join(""),ql="bu".split("").filter(x=>f["q_"+x].checked).join("");
  return {ci:+f.ci.value,do:dl,cs:+f.cs.value,qc:+f.qc.value,q:ql,usol:f.usol_day.checked?2000:0,gto:+f.gto.value||180}}
 function ciCost(){const c=costEstimate(ciForm());$("cicost").textContent="Estimated cost: about "+c.lte_wakes_day+" LTE wake"+(c.lte_wakes_day===1?"":"s")+" a day (~"+Math.round(c.lte_secs_day/60)+" min of LTE), plus "+c.quick_wakes_day+" quick local checks (about a second each, no LTE)."}
-let ciLoaded=false,CIV18=false;
+let ciLoaded=false,CIV18=false,LBMAXH=24;
 function showCheckins(d){const C=d.checkins||{},T=C.settings||{},DS=(d.device_state||{}).checkins,f=$("cif");CIV18=!!C.v18;
  $("cids").innerHTML=dsHtml(DS,ciText);
  $("cisum").textContent=!C.supported?"· needs T-SIM 1.7.1":DS&&DS.device?"· "+ciText(DS.device):"· not reported yet";
  document.querySelectorAll(".ci18").forEach(x=>x.hidden=CIV18);["m","s","g"].forEach(x=>{f["do_"+x].disabled=!CIV18&&!String(T.do||"").includes(x)});f.cs.disabled=!CIV18;
  $("cioff").textContent=CIV18?"Off: no timed check-ins. The T-SIM still checks its modem once a day so it can't get stuck offline, but it only uses LTE if it had to fix something or has a report waiting.":"Off on this T-SIM firmware (older than 1.8.0) still checks the modem every 24 h, and reports or picks up commands then if those are ticked. T-SIM 1.8.0 makes Off silent.";
+ const qc48=!!C.qc48;LBMAXH=qc48?48:CIV18?4:24;
+ ["360","720","1440","2880"].forEach(v=>{const o=[...f.qc.options].find(x=>x.value===v);if(!o)return;o.disabled=!qc48;o.textContent=qcLabel(v)+(qc48?"":" (needs T-SIM 1.8.3)")});
+ const inth=$("lbf")&&$("lbf").inth;if(inth){inth.max=String(LBMAXH);inth.dataset.lbmax=String(LBMAXH)}
  f.querySelectorAll("select,input,button").forEach(x=>{if(!C.supported)x.disabled=true});
  if(!ciLoaded){ciLoaded=true;f.ci.value=String(T.ci??360);"hcmsgt".split("").forEach(x=>f["do_"+x].checked=String(T.do||"").includes(x));f.cs.value=String(T.cs||0);keepSel(f.qc,T.qc??30,qcLabel(T.qc??30));
   "bu".split("").forEach(x=>f["q_"+x].checked=String(T.q||"").includes(x));f.usol_day.checked=T.usol!==0;f.gto.value=String(T.gto||180)}
@@ -4086,7 +4101,7 @@ async function saveWd(send){const f=$("wdf"),b={int_min:+f.int.value,hb:f.hb.che
  say("wdmsg",r.ok&&!(j.wake&&!j.wake.sent),!r.ok?(j.error||friendly(j,r.status)):j.unchanged?"No change: the T-SIM already uses these settings.":j.wake?(j.wake.sent?"Saved and sent; waiting for the T-SIM to wake.":"Saved; text not sent: "+friendly(j.wake,j.wake.status)):"Saved. Applied at the T-SIM's next wake (no text sent).");if(r.ok){wdLoaded=false;load()}}
 $("wdf").onsubmit=ev=>{ev.preventDefault();saveWd(false)};$("wdsend").onclick=()=>saveWd(true);
 function hrs(m){const h=m/60;return (h===1?"1 hour":(+h.toFixed(2))+" h")+(m<60?" ("+m+" min)":"")}
-function lbPct(){const f=$("lbf");$("lbopct").textContent=bpct(f.lo.value);$("lbhpct").textContent=bpct(f.hi.value);const h=+f.inth.value;$("lbih").textContent=h>=0.25&&h<=24?"Checks battery every "+hrs(Math.round(h*60)):"0.25–24 h"}
+function lbPct(){const f=$("lbf");$("lbopct").textContent=bpct(f.lo.value);$("lbhpct").textContent=bpct(f.hi.value);const h=+f.inth.value;$("lbih").textContent=h>=0.25&&h<=LBMAXH?"Checks battery every "+hrs(Math.round(h*60)):"0.25–"+LBMAXH+" h"}
 $("lbf").oninput=lbPct;
 async function savePwr(b,msg,send){if(send&&!confirm("Save and send ONE text now so the T-SIM wakes and applies these settings?"))return;
  const r=await post("power",{...b,send:!!send});const j=await rj(r);
@@ -4094,7 +4109,7 @@ async function savePwr(b,msg,send){if(send&&!confirm("Save and send ONE text now
  say(msg,r.ok&&!(j.wake&&!j.wake.sent&&!j.wake.already),m);if(r.ok){pwrLoaded=false;load()}}
 function lbBody(){const f=$("lbf"),lo=+f.lo.value,hi=+f.hi.value,h=+f.inth.value;
  if(!(hi>=lo*1.1-0.005)){say("lbmsg",false,"ON must be at least 10% higher than OFF: with OFF at "+lo.toFixed(2)+" V, ON must be "+(Math.ceil(lo*110)/100).toFixed(2)+" V or more.");return null}
- if(!(h>=0.25&&h<=24)){say("lbmsg",false,"Check interval must be between 0.25 and 24 hours.");return null}
+ if(!(h>=0.25&&h<=LBMAXH)){say("lbmsg",false,"Check interval must be between 0.25 and "+LBMAXH+" hours.");return null}
  return {lb_en:f.en.checked,lb_lo:lo,lb_hi:hi,lb_int_h:h,lb_imm:f.imm.checked}}
 $("lbf").onsubmit=ev=>{ev.preventDefault();const b=lbBody();if(b)savePwr(b,"lbmsg",true)};
 $("lbsave2").onclick=()=>{const b=lbBody();if(b)savePwr(b,"lbmsg",false)};
