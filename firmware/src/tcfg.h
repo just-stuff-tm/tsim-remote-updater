@@ -8,21 +8,23 @@
 #include <strings.h>
 #include <stdlib.h>
 
-#define TCFG_SAFETY_MIN     1440u
+#define TCFG_SAFETY_MIN     1440u   // ci=0 silent Off: still a 24 h modem safety check
+#define TCFG_SLEEP_MAX_MIN  2880u   // sleep-timer ceiling only; does not change the ci=0 interval
 #define TCFG_CI_MIN           30u
 #define TCFG_CI_MAX         1440u
 #define TCFG_QC_MIN           15u
-#define TCFG_QC_MAX          240u
+#define TCFG_QC_MAX         2880u
 #define TCFG_GTO_MIN          30u
 #define TCFG_GTO_MAX         600u
 #define TCFG_USOL_MAX      20000u
 #define TCFG_TOL_MIN_S        60
+#define TCFG_TOL_MAX_S      1800    // 30 min: 10% of 2880 min would be 4.8 h early
 #define TCFG_SLEEP_FLOOR_S     5
 #define TCFG_ID_RING          16
 #define TCFG_ID_LEN           20
 #define TCFG_DO_ORDER     "hcmsgt"
 #define TCFG_Q_ORDER      "bu"
-#define TCFG_REJ_MSG      " (a value was REJECTED: ci 0 or 30-1440, cs 0|1|24|168, qc 0 or 15-240, usol 0-20000, gto 30-600)"
+#define TCFG_REJ_MSG      " (a value was REJECTED: ci 0 or 30-1440, cs 0|1|24|168, qc 0 or 15-2880, usol 0-20000, gto 30-600)"
 
 #define TCFG_KIND_NONE     0
 #define TCFG_KIND_TCFG     1
@@ -35,7 +37,7 @@ struct Tcfg {
   uint32_t ci;       // 0 = silent Off (24 h safety modem check), else 30..1440 min
   char do_[8];       // canonical subset of "hcmsgt" (empty = none)
   uint32_t cs;       // 0 | 1 | 24 | 168 hours
-  uint32_t qc;       // 0 = off, else 15..240 min
+  uint32_t qc;       // 0 = off, else 15..2880 min
   char q_[4];        // canonical subset of "bu" (empty = none)
   uint32_t usol;     // 0..20000 mV (0 = day and night)
   uint32_t gto;      // 30..600 s
@@ -333,6 +335,7 @@ static inline int64_t tcfgTolSecs(uint32_t interval_min) {
   uint32_t m = interval_min ? interval_min : TCFG_SAFETY_MIN;
   int64_t t = (int64_t)m * 6;   // 10% of the interval, in seconds
   if (t < TCFG_TOL_MIN_S) t = TCFG_TOL_MIN_S;
+  if (t > TCFG_TOL_MAX_S) t = TCFG_TOL_MAX_S;
   return t;
 }
 
@@ -358,7 +361,8 @@ static inline void tcfgTakeSecs(int64_t *best, int64_t secs) {
   if (*best < 0 || secs < *best) *best = secs;
 }
 
-// Next sleep: min(ci_due, qc_due, GNSS warm-window end). Always 5 s .. 24 h.
+// Next sleep: min(ci_due, qc_due, GNSS warm-window end). Always 5 s .. 48 h.
+// ci=0 still schedules 24 h (TCFG_SAFETY_MIN). The 48 h ceiling is TCFG_SLEEP_MAX_MIN only.
 // ext0-failed path is 60 s. ci_due already includes failure backoff.
 static inline int64_t tcfgSleepTimerSecs(bool ext0_failed, int64_t now,
                                          int64_t ci_due, uint32_t ci_sched_min,
@@ -373,7 +377,7 @@ static inline int64_t tcfgSleepTimerSecs(bool ext0_failed, int64_t now,
     tcfgTakeSecs(&best, q_wait);
   }
   if (gnss_on) tcfgTakeSecs(&best, gnss_off_at - now);
-  if (best < 0 || best > (int64_t)TCFG_SAFETY_MIN * 60) best = (int64_t)TCFG_SAFETY_MIN * 60;
+  if (best < 0 || best > (int64_t)TCFG_SLEEP_MAX_MIN * 60) best = (int64_t)TCFG_SLEEP_MAX_MIN * 60;
   return best;
 }
 
