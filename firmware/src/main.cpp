@@ -2379,7 +2379,7 @@ static void pwrLoad() {
   if (!(s_cal_scale > 0.5f && s_cal_scale < 1.5f)) s_cal_scale = 1.0f;
   if (!(s_cal_off > -0.5f && s_cal_off < 0.5f)) s_cal_off = 0.0f;
   if (!(s_lb_on >= s_lb_off * LB_MIN_RATIO - 0.005f)) { s_lb_off = 3.40f; s_lb_on = 3.75f; }
-  if (s_lb_int_min < 5 || s_lb_int_min > 1440) s_lb_int_min = 30;
+  if (s_lb_int_min < 5 || s_lb_int_min > TCFG_QC_MAX) s_lb_int_min = 30;
 }
 static void pwrSavePending(const char *m) {
   strncpy(s_lb_pending, m, sizeof(s_lb_pending) - 1); s_lb_pending[sizeof(s_lb_pending) - 1] = 0;
@@ -2436,7 +2436,7 @@ static void pwrApplyCfg(const char *args, char *out, size_t cap) {
     else if (!strcmp(k, "imm")) { s_lb_imm = atoi(v) != 0; p.putBool("imm", s_lb_imm); n++; }
     else if (!strcmp(k, "lo")) { lo = atof(v); thr = true; }
     else if (!strcmp(k, "hi")) { hi = atof(v); thr = true; }
-    else if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m >= 5 && m <= 1440) { s_lb_int_min = m; p.putUInt("int", m); n++; saw_int = true; } }
+    else if (!strcmp(k, "int")) { uint32_t m = (uint32_t)atoi(v); if (m >= 5 && m <= TCFG_QC_MAX) { s_lb_int_min = m; p.putUInt("int", m); n++; saw_int = true; } }
   }
   bool rej = false;
   if (thr) { if (hi >= lo * LB_MIN_RATIO - 0.005f && lo >= 3.0f && hi <= 4.3f) { s_lb_off = lo; s_lb_on = hi; p.putFloat("lo", lo); p.putFloat("hi", hi); n++; } else rej = true; }
@@ -3908,7 +3908,7 @@ static bool modemPollCmti() {
 }
 
 // v1.8.0: one timer for every reason to wake (check-in, quick local, GNSS warm window end, failure backoff).
-// Always 5 s .. 24 h. ext0-failed path stays 60 s.
+// Always 5 s .. 48 h (TCFG_SLEEP_MAX_MIN). ci=0 still wakes at 24 h (TCFG_SAFETY_MIN). ext0-failed path stays 60 s.
 static uint64_t sleepTimerSecs() {
   if (s_ext0_failed) return 60;
   if (s_wd_due <= 0) wdSchedule(true);

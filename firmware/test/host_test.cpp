@@ -300,7 +300,7 @@ int main() {
     n = tcfgApply(&t, "ci=10 cs=6 qc=14 usol=20001 gto=29", &rej);
     assert(n == 0 && rej && t.ci == old_ci && t.cs == 24);
     tcfgFormatApplied(buf, sizeof(buf), 0, true, &t);
-    assert(strstr(buf, "TCFG applied 0 (a value was REJECTED: ci 0 or 30-1440, cs 0|1|24|168, qc 0 or 15-240, usol 0-20000, gto 30-600):"));
+    assert(strstr(buf, "TCFG applied 0 (a value was REJECTED: ci 0 or 30-1440, cs 0|1|24|168, qc 0 or 15-2880, usol 0-20000, gto 30-600):"));
     n = tcfgApply(&t, "ci=0", &rej);
     assert(n == 1 && !rej && t.ci == 0);
     n = tcfgApply(&t, "ci=29", &rej); assert(n == 0 && rej && t.ci == 0);
@@ -331,11 +331,13 @@ int main() {
     L.wd_int = 180; L.lb_en = 1; L.lb_int = 30; L.upm = 60;
     tcfgSeedFromLegacy(&t, &L);
     assert(t.qc == 30 && !strcmp(t.q_, "bu"));
-    // only battery; clamp 5 -> 15, 1440 -> 240
+    // only battery; clamp 5 -> 15, 1440 stays 1440, above TCFG_QC_MAX -> 2880
     L.lb_en = 1; L.lb_int = 5; L.upm = 0;
     tcfgSeedFromLegacy(&t, &L);
     assert(t.qc == 15 && !strcmp(t.q_, "b"));
-    L.lb_int = 1440; tcfgSeedFromLegacy(&t, &L); assert(t.qc == 240);
+    L.lb_int = 1440; tcfgSeedFromLegacy(&t, &L); assert(t.qc == 1440);
+    L.lb_int = 2880; tcfgSeedFromLegacy(&t, &L); assert(t.qc == 2880);
+    L.lb_int = 4000; tcfgSeedFromLegacy(&t, &L); assert(t.qc == 2880);
     // neither
     L.lb_en = 0; L.upm = 0; tcfgSeedFromLegacy(&t, &L);
     assert(t.qc == 0 && !t.q_[0]);
@@ -378,9 +380,13 @@ int main() {
     tcfgMapPwr(&t3, true, 1, false, 0);
     assert(tcfgQHas(&t3, 'b') && t3.qc == 30);  // qc was 0, default 30
     tcfgMapPwr(&t3, false, 0, true, 5);
-    assert(t3.qc == 15);  // clamped
+    assert(t3.qc == 15);  // clamped up
     tcfgMapPwr(&t3, false, 0, true, 1440);
-    assert(t3.qc == 240);
+    assert(t3.qc == 1440);
+    tcfgMapPwr(&t3, false, 0, true, 2880);
+    assert(t3.qc == 2880);
+    tcfgMapPwr(&t3, false, 0, true, 4000);
+    assert(t3.qc == 2880);  // clamped to TCFG_QC_MAX
     tcfgMapCsEn(&t3, 1); assert(tcfgDoHas(&t3, 's'));
     t3.cs = tcfgSnapCs(6); assert(t3.cs == 1);
     tcfgMapGpsAuto(&t3, 1); assert(tcfgDoHas(&t3, 'g'));
@@ -388,16 +394,16 @@ int main() {
   }
   {
     assert(tcfgCiSchedMin(0) == 1440 && tcfgCiSchedMin(360) == 360);
-    assert(tcfgTolSecs(180) == 1080 && tcfgTolSecs(5) == 60 && tcfgTolSecs(1440) == 8640);
+    assert(tcfgTolSecs(180) == 1080 && tcfgTolSecs(5) == 60 && tcfgTolSecs(1440) == 1800);
     int64_t now = 1000000;
     assert(tcfgIsDue(now, 0, 180));
     assert(tcfgIsDue(now, now, 180));
     assert(tcfgIsDue(now, now + 1080, 180));          // exactly 10% early
     assert(!tcfgIsDue(now, now + 1081, 180));
     assert(tcfgIsDue(now + 10, now, 180));
-    // silent Off uses 1440 for tolerance
-    assert(tcfgIsDue(now, now + 8640, 1440));
-    assert(!tcfgIsDue(now, now + 8641, 1440));
+    // silent Off / long intervals: 10% would be hours; cap at 30 min
+    assert(tcfgIsDue(now, now + 1800, 1440));
+    assert(!tcfgIsDue(now, now + 1801, 1440));
     // backoff 30/60/120.. capped at interval
     assert(tcfgBackoffSecs(0, 180) == 180 * 60);
     assert(tcfgBackoffSecs(1, 180) == 1800);
@@ -407,14 +413,14 @@ int main() {
     assert(tcfgBackoffSecs(5, 180) == 180 * 60);     // 480 min would exceed 180
     assert(tcfgBackoffSecs(1, 0) == 1800);           // ci=0: cap 1440 min, 30 min backoff
     assert(tcfgBackoffSecs(0, 0) == 1440 * 60);
-    // sleep timer: 24 h cap, floor 5, ext0 60, never 0
+    // sleep timer: 48 h ceiling, floor 5, ext0 60, never 0. ci=0 still 24 h.
     assert(tcfgSleepTimerSecs(true, now, now + 100, 180, false, 0, 0, false, 0) == 60);
     int64_t s = tcfgSleepTimerSecs(false, now, now + 360 * 60, 360, true, now + 30 * 60, 30, false, 0);
     assert(s == 30 * 60);
     s = tcfgSleepTimerSecs(false, now, now + 360 * 60, 360, false, 0, 0, false, 0);
     assert(s == 360 * 60);
     s = tcfgSleepTimerSecs(false, now, now + 20000 * 60, 20000, false, 0, 0, false, 0);
-    assert(s == 1440 * 60);  // 24 h cap
+    assert(s == 2880 * 60);  // 48 h sleep-timer ceiling (TCFG_SLEEP_MAX_MIN)
     s = tcfgSleepTimerSecs(false, now, now - 100, 180, false, 0, 0, false, 0);
     assert(s == 5);          // past due, floor
     s = tcfgSleepTimerSecs(false, now, now + 300, 180, false, 0, 0, true, now + 120);
@@ -554,5 +560,73 @@ int main() {
   assert(smsDiagJson(&execd, js182, sizeof(js182)) > 0);
   assert(strstr(js182, "\"tf\":1"));
   printf("v1.8.2 host tests OK (text executed flag)\n");
+
+  // 18) v1.8.3: quick local checks up to 2 days (qc 2880). Daily safety check unchanged.
+  {
+    Tcfg t; tcfgInit(&t);
+    bool rej = false;
+    int n = tcfgApply(&t, "qc=2880", &rej);
+    assert(n == 1 && !rej && t.qc == 2880);
+    n = tcfgApply(&t, "qc=2881", &rej);
+    assert(n == 0 && rej && t.qc == 2880);
+    n = tcfgApply(&t, "qc=15", &rej);
+    assert(n == 1 && !rej && t.qc == 15);
+    n = tcfgApply(&t, "qc=360", &rej);
+    assert(n == 1 && !rej && t.qc == 360);
+    assert(tcfgQcOk(0) && tcfgQcOk(15) && tcfgQcOk(240) && tcfgQcOk(2880));
+    assert(!tcfgQcOk(14) && !tcfgQcOk(2881));
+    assert(tcfgClampQc(5) == 15 && tcfgClampQc(2880) == 2880 && tcfgClampQc(4000) == 2880);
+
+    Tcfg tp; tcfgInit(&tp); tp.qc = 0; tp.q_[0] = 0;
+    tcfgMapPwr(&tp, true, 1, true, 2880);
+    assert(tcfgQHas(&tp, 'b') && tp.qc == 2880);
+
+    // 10% of 2880 min = 4.8 h; cap at 30 min so a 48 h check cannot run hours early
+    assert(tcfgTolSecs(2880) == 1800);
+    assert(tcfgTolSecs(240) == 1440);   // 10% of 4 h is 24 min, under the cap
+    int64_t t0 = 1000000;
+    assert(tcfgIsDue(t0, t0 + 1800, 2880));
+    assert(!tcfgIsDue(t0, t0 + 1801, 2880));
+
+    // ci=0, qc=2880: sleep is 24 h (safety), not 48 h
+    int64_t qc_due = t0 + (int64_t)2880 * 60;
+    int64_t ci_due = t0 + (int64_t)TCFG_SAFETY_MIN * 60;
+    int64_t sl = tcfgSleepTimerSecs(false, t0, ci_due, TCFG_SAFETY_MIN, true, qc_due, 2880, false, 0);
+    assert(sl == 86400);
+    assert(tcfgCiSchedMin(0) == 1440);
+
+    // After the 24 h safety wake, qc_due is preserved (not reset to now+48 h)
+    int64_t t1 = t0 + sl;
+    assert(tcfgIsDue(t1, ci_due, TCFG_SAFETY_MIN));
+    assert(!tcfgIsDue(t1, qc_due, 2880));
+    assert(qc_due - t1 == 86400);   // remaining qc wait ~24 h
+    int64_t ci_due2 = t1 + (int64_t)TCFG_SAFETY_MIN * 60;
+    sl = tcfgSleepTimerSecs(false, t1, ci_due2, TCFG_SAFETY_MIN, true, qc_due, 2880, false, 0);
+    assert(sl == 86400);
+
+    // Next wake: quick check fires at 48 h
+    int64_t t2 = t1 + sl;
+    assert(tcfgIsDue(t2, qc_due, 2880));
+    assert(t2 - t0 == (int64_t)2880 * 60);
+
+    // ci=360, qc=2880: sleep follows the 6 h check-in; qc still fires at 48 h
+    int64_t ci360 = t0 + (int64_t)360 * 60;
+    sl = tcfgSleepTimerSecs(false, t0, ci360, 360, true, qc_due, 2880, false, 0);
+    assert(sl == 360 * 60);
+    assert(!tcfgIsDue(t0 + (int64_t)1440 * 60, qc_due, 2880));
+    assert(tcfgIsDue(t0 + (int64_t)2880 * 60, qc_due, 2880));
+
+    // 2880 min in seconds overflows uint16_t (65535); the 64-bit sleep path does not
+    int64_t secs = (int64_t)2880 * 60;
+    assert(secs == 172800);
+    assert(secs > 65535);
+    uint64_t us = (uint64_t)secs * 1000000ULL;
+    assert(us == 172800000000ULL);
+    uint64_t cap_us = (uint64_t)TCFG_SLEEP_MAX_MIN * 60ULL * 1000000ULL;
+    assert(cap_us == 172800000000ULL);
+    uint64_t fallback = (uint64_t)1440 * 60;   // WD_MAX_MIN fallback in armWakeups
+    assert(fallback == 86400);
+  }
+  printf("v1.8.3 host tests OK (qc 2880, 24 h safety, qc_due preserved, no overflow)\n");
   return 0;
 }
